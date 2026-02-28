@@ -126,10 +126,28 @@ const runtime = createRouterRuntime({
   },
 });
 
-const listenHost = manifest.server.hostname === '0.0.0.0' || manifest.server.hostname === '::'
+const server = Bun.serve({
+  port: parseInt(process.env.PORT || '0', 10) || manifest.server.port,
+  hostname: manifest.server.hostname,
+  fetch(request) {
+    const url = new URL(request.url);
+    url.protocol = 'http:';
+    url.host = listenAuthority;
+    const headers = new Headers(request.headers);
+    headers.set('host', listenAuthority);
+    return runtime.handleRequest(new Request(url, {
+      method: request.method,
+      headers,
+      body: request.body,
+      signal: request.signal,
+    }));
+  },
+});
+
+const listenHost = server.hostname === '0.0.0.0' || server.hostname === '::'
   ? 'localhost'
-  : manifest.server.hostname;
-const listenAuthority = \`\${listenHost}:\${manifest.server.port}\`;
+  : server.hostname;
+const listenAuthority = \`\${listenHost}:\${server.port}\`;
 
 // Next.js res.revalidate() hardcodes https:// when trustHostHeader is true.
 // Intercept self-referencing HTTPS fetches and rewrite to HTTP so
@@ -153,24 +171,6 @@ globalThis.fetch = function patchedFetch(input, init) {
   }
   return nativeFetch(input, init);
 };
-
-const server = Bun.serve({
-  port: manifest.server.port,
-  hostname: manifest.server.hostname,
-  fetch(request) {
-    const url = new URL(request.url);
-    url.protocol = 'http:';
-    url.host = listenAuthority;
-    const headers = new Headers(request.headers);
-    headers.set('host', listenAuthority);
-    return runtime.handleRequest(new Request(url, {
-      method: request.method,
-      headers,
-      body: request.body,
-      signal: request.signal,
-    }));
-  },
-});
 
 console.log(
   \`\\n  Next.js (\\x1b[36m\${manifest.build.nextVersion}\\x1b[0m) \\x1b[2m|\\x1b[0m adapter-bun\\n\` +
