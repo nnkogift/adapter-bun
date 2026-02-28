@@ -1,0 +1,9 @@
+.next
+node_modules
+.cloudflare-adapter
+.wrangler
+worker-configuration.d.ts
+*.tsbuildinfo
+
+package-lock.json
+bun-dist

@@ -1,0 +1,23 @@
+{
+  "name": "fixture-verbose-mixed-router-bun",
+  "private": true,
+  "scripts": {
+    "build": "bun --bun next build",
+    "build:validate": "bun --bun next build && bun run scripts/validate-runtime.ts",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "validate:runtime": "bun run scripts/validate-runtime.ts"
+  },
+  "dependencies": {
+    "adapter-bun": "file:../..",
+    "next": "16.2.0-canary.35",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "typescript": "^5.8.2"
+  }
+}
