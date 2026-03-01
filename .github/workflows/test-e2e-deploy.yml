@@ -103,6 +103,7 @@ jobs:
         run:
           chmod +x adapter-bun/scripts/e2e-deploy.sh
           adapter-bun/scripts/e2e-logs.sh
+          adapter-bun/scripts/e2e-cleanup.sh
 
       - name: Run deploy tests
         working-directory: next.js
@@ -114,7 +115,10 @@ jobs:
             ${{ github.workspace }}/adapter-bun/scripts/e2e-deploy.sh
           NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH:
             ${{ github.workspace }}/adapter-bun/scripts/e2e-logs.sh
+          NEXT_TEST_CLEANUP_SCRIPT_PATH:
+            ${{ github.workspace }}/adapter-bun/scripts/e2e-cleanup.sh
           ADAPTER_BUN_DIR: ${{ github.workspace }}/adapter-bun
+          IS_TURBOPACK_TEST: 1
           NEXT_TEST_JOB: 1
           NEXT_TELEMETRY_DISABLED: 1
         run: node run-tests.js --timings -g ${{ matrix.group }} -c 2 --type e2e

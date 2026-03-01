@@ -98,8 +98,11 @@ export function createBunStaticHandler({
       });
     }
 
-    // Serve via Bun.file() zero-copy
-    return new Response(file, {
+    // Materialize bytes to avoid connection resets seen when a keep-alive
+    // socket is reused after Bun.file() streaming responses.
+    const body = await file.bytes();
+    headers.set('content-length', String(body.byteLength));
+    return new Response(body, {
       status: 200,
       headers,
     });

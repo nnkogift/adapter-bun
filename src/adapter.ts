@@ -54,6 +54,7 @@ import { createBunRevalidateQueue } from './runtime/revalidate.js';
 import { createSqliteCacheStores } from './runtime/sqlite-cache.js';
 import { createBunImageHandler } from './runtime/image.js';
 import { bridgeNextTagManifest } from './runtime/tag-manifest-bridge.js';
+import { createEdgeIncrementalCache } from './runtime/incremental-cache-bridge.js';
 
 const adapterDir = import.meta.dirname;
 const manifestPath = path.join(adapterDir, 'deployment-manifest.json');
@@ -62,12 +63,14 @@ const manifest = await Bun.file(manifestPath).json();
 const { prerenderCacheStore, imageCacheStore } = createSqliteCacheStores({
   adapterDir,
 });
+const edgeIncrementalCache = createEdgeIncrementalCache({ prerenderCacheStore });
 
 await bridgeNextTagManifest(prerenderCacheStore);
 
 const invokeFunction = createFunctionArtifactInvoker({
   manifest,
   adapterDir,
+  incrementalCache: edgeIncrementalCache,
 });
 
 const serveStatic = createBunStaticHandler({
@@ -89,6 +92,7 @@ const invokeImageFunction = createBunImageHandler({
 const invokeMiddleware = await createMiddlewareInvoker({
   manifest,
   adapterDir,
+  incrementalCache: edgeIncrementalCache,
 });
 
 const runtime = createRouterRuntime({
@@ -126,21 +130,47 @@ const runtime = createRouterRuntime({
   },
 });
 
+const NEXT_PATCH_SYMBOL = Symbol.for('next-patch');
+function ensureNextFetchPatchState() {
+  const currentFetch = globalThis.fetch;
+  if (currentFetch && currentFetch.__nextPatched === true) {
+    return;
+  }
+  globalThis[NEXT_PATCH_SYMBOL] = false;
+}
+
 const server = Bun.serve({
   port: parseInt(process.env.PORT || '0', 10) || manifest.server.port,
   hostname: manifest.server.hostname,
+  // Keep upstream keep-alive sockets stable across long e2e browser gaps.
+  idleTimeout: 120,
   fetch(request) {
+    ensureNextFetchPatchState();
     const url = new URL(request.url);
     url.protocol = 'http:';
     url.host = listenAuthority;
     const headers = new Headers(request.headers);
     headers.set('host', listenAuthority);
-    return runtime.handleRequest(new Request(url, {
+    const shouldCloseConnection =
+      headers.get('connection')?.toLowerCase() === 'close';
+    const runtimeRequest = new Request(url, {
       method: request.method,
       headers,
       body: request.body,
       signal: request.signal,
-    }));
+    });
+    return runtime.handleRequest(runtimeRequest).then((response) => {
+      if (!shouldCloseConnection) {
+        return response;
+      }
+      const responseHeaders = new Headers(response.headers);
+      responseHeaders.set('connection', 'close');
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+    });
   },
 });
 
@@ -155,7 +185,7 @@ const listenAuthority = \`\${listenHost}:\${server.port}\`;
 const httpsOrigin = \`https://\${listenAuthority}\`;
 const httpOrigin = \`http://\${listenAuthority}\`;
 const nativeFetch = globalThis.fetch;
-globalThis.fetch = function patchedFetch(input, init) {
+globalThis.fetch = Object.assign(function patchedFetch(input, init) {
   if (typeof input === 'string' && input.startsWith(httpsOrigin)) {
     input = httpOrigin + input.slice(httpsOrigin.length);
   } else if (input instanceof URL && input.origin === httpsOrigin) {
@@ -170,7 +200,7 @@ globalThis.fetch = function patchedFetch(input, init) {
     }
   }
   return nativeFetch(input, init);
-};
+}, nativeFetch);
 
 console.log(
   \`\\n  Next.js (\\x1b[36m\${manifest.build.nextVersion}\\x1b[0m) \\x1b[2m|\\x1b[0m adapter-bun\\n\` +
@@ -217,6 +247,7 @@ async function stageRuntimeModules(
     'revalidate.js',
     'sqlite-cache.js',
     'tag-manifest-bridge.js',
+    'incremental-cache-bridge.js',
   ];
 
   if (hasEdgeOutputs) {

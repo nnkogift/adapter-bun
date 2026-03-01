@@ -45,6 +45,17 @@ import type {
 
 const IMPLICIT_IMMUTABLE_CACHE_CONTROL = 'public,max-age=31536000,immutable';
 const DOCUMENT_RESPONSE_CACHE_CONTROL = 'public, max-age=0, must-revalidate';
+const DEFAULT_RSC_VARY_HEADER =
+  'rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch';
+const INTERNAL_MIDDLEWARE_REQUEST_HEADERS = new Set([
+  'rsc',
+  'next-router-state-tree',
+  'next-router-prefetch',
+  'next-hmr-refresh',
+  'next-router-segment-prefetch',
+]);
+const STATIC_FILE_EXTENSION_PATTERN =
+  /\.(?:avif|bmp|css|gif|ico|jpe?g|js|json|map|mjs|png|svg|txt|webmanifest|webp|woff2?|xml)$/i;
 
 function normalizeCacheControlValue(value: string): string {
   return value.replace(/\s+/g, '').toLowerCase();
@@ -57,12 +68,117 @@ function normalizeContentType(value: string | null): string {
   return value.split(';', 1)[0]?.trim().toLowerCase() ?? '';
 }
 
+function withDefaultRscVaryHeader(existingValue: string | null): string {
+  const requiredValues = DEFAULT_RSC_VARY_HEADER
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  if (!existingValue || existingValue.length === 0) {
+    return requiredValues.join(', ');
+  }
+
+  const existingValues = existingValue
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const existingLowercase = new Set(existingValues.map((item) => item.toLowerCase()));
+
+  const mergedValues = [...existingValues];
+  for (const required of requiredValues) {
+    const normalizedRequired = required.toLowerCase();
+    if (existingLowercase.has(normalizedRequired)) {
+      continue;
+    }
+    mergedValues.push(required);
+    existingLowercase.add(normalizedRequired);
+  }
+
+  return mergedValues.join(', ');
+}
+
 function isRscPathname(value: string): boolean {
   return value.endsWith('.rsc') || value.endsWith('.segment.rsc');
 }
 
 function isNextDataPathname(value: string): boolean {
   return value.startsWith('/_next/data/') && value.endsWith('.json');
+}
+
+function maybeResolveNextDataFallbackPathname({
+  requestPathname,
+  basePath,
+  buildId,
+  indexes,
+}: {
+  requestPathname: string;
+  basePath: string;
+  buildId: string;
+  indexes: ReturnType<typeof buildRouteIndexes>;
+}): string | null {
+  const pathnameWithoutBasePath =
+    basePath && requestPathname.startsWith(`${basePath}/`)
+      ? requestPathname.slice(basePath.length)
+      : requestPathname;
+  const prefix = `/_next/data/${buildId}/`;
+  if (
+    !pathnameWithoutBasePath.startsWith(prefix) ||
+    !pathnameWithoutBasePath.endsWith('.json')
+  ) {
+    return null;
+  }
+
+  const encodedPath = pathnameWithoutBasePath
+    .slice(prefix.length, -'.json'.length)
+    .replace(/\/+/g, '/')
+    .replace(/^\/+/, '');
+  const normalizedPath = encodedPath.length > 0 ? `/${encodedPath}` : '/';
+  const candidatePathnames = new Set<string>([normalizedPath]);
+
+  if (normalizedPath !== '/' && normalizedPath.endsWith('/index')) {
+    const withoutIndex = normalizedPath.slice(0, -'/index'.length);
+    candidatePathnames.add(withoutIndex.length > 0 ? withoutIndex : '/');
+  }
+  if (normalizedPath === '/') {
+    candidatePathnames.add('/index');
+  }
+
+  for (const candidatePathname of candidatePathnames) {
+    if (
+      indexes.staticByPathname.has(candidatePathname) ||
+      indexes.prerenderByPathname.has(candidatePathname) ||
+      indexes.functionByPathname.has(candidatePathname)
+    ) {
+      return candidatePathname;
+    }
+  }
+
+  return null;
+}
+
+function maybeResolveDirectPathnameFallback({
+  requestPathname,
+  indexes,
+}: {
+  requestPathname: string;
+  indexes: ReturnType<typeof buildRouteIndexes>;
+}): string | null {
+  const candidatePathnames = new Set<string>([requestPathname]);
+  if (requestPathname === '/') {
+    candidatePathnames.add('/index');
+  }
+
+  for (const candidatePathname of candidatePathnames) {
+    if (
+      indexes.staticByPathname.has(candidatePathname) ||
+      indexes.prerenderByPathname.has(candidatePathname) ||
+      indexes.functionByPathname.has(candidatePathname)
+    ) {
+      return candidatePathname;
+    }
+  }
+
+  return null;
 }
 
 function shouldForceDocumentResponseCacheControl({
@@ -103,6 +219,119 @@ function createEmptyBodyStream(): ReadableStream {
       controller.close();
     },
   });
+}
+
+function withMiddlewareRequestMutations({
+  request,
+  rewriteUrl,
+  requestHeaders,
+}: {
+  request: Request;
+  rewriteUrl: URL | null;
+  requestHeaders: Headers | null;
+}): Request {
+  if (!rewriteUrl && !requestHeaders) {
+    return request;
+  }
+
+  const method = request.method.toUpperCase();
+  const body =
+    method === 'GET' || method === 'HEAD' ? undefined : request.clone().body;
+
+  return new Request((rewriteUrl ?? new URL(request.url)).toString(), {
+    method: request.method,
+    headers: requestHeaders ?? request.headers,
+    body,
+  });
+}
+
+function resolveNextDataRewriteHeader({
+  request,
+  rewriteUrl,
+  basePath,
+  buildId,
+}: {
+  request: Request;
+  rewriteUrl: URL | null;
+  basePath: string;
+  buildId: string;
+}): string | null {
+  if (!rewriteUrl || request.headers.get('x-nextjs-data') !== '1') {
+    return null;
+  }
+
+  const requestUrl = new URL(request.url);
+  const requestPathnameWithoutBasePath =
+    basePath && requestUrl.pathname.startsWith(`${basePath}/`)
+      ? requestUrl.pathname.slice(basePath.length)
+      : requestUrl.pathname;
+  const nextDataPrefix = `/_next/data/${buildId}/`;
+  if (
+    !requestPathnameWithoutBasePath.startsWith(nextDataPrefix) ||
+    !requestPathnameWithoutBasePath.endsWith('.json')
+  ) {
+    return null;
+  }
+
+  if (rewriteUrl.origin !== requestUrl.origin) {
+    return null;
+  }
+
+  let rewritePathname = rewriteUrl.pathname;
+  if (basePath && rewritePathname.startsWith(`${basePath}/`)) {
+    rewritePathname = rewritePathname.slice(basePath.length);
+  }
+
+  if (rewritePathname.startsWith(`/_next/data/${buildId}/`)) {
+    return `${rewritePathname}${rewriteUrl.search}`;
+  }
+
+  if (!rewritePathname.startsWith('/')) {
+    rewritePathname = `/${rewritePathname}`;
+  }
+
+  const normalizedPathname = rewritePathname === '/' ? '/index' : rewritePathname;
+  const rewrittenNextDataPathname = `${nextDataPrefix}${normalizedPathname.slice(1)}.json`;
+  const nextDataPathnameWithBasePath = basePath
+    ? `${basePath}${rewrittenNextDataPathname}`
+    : rewrittenNextDataPathname;
+  return `${nextDataPathnameWithBasePath}${rewriteUrl.search}`;
+}
+
+function withResolvedHeader(
+  resolution: RouteResolutionResult,
+  key: string,
+  value: string
+): RouteResolutionResult {
+  const headers = new Headers(resolution.resolvedHeaders);
+  headers.set(key, value);
+  return {
+    ...resolution,
+    resolvedHeaders: headers,
+  };
+}
+
+function shouldAttemptAppNotFoundFunction({
+  requestPathname,
+  basePath,
+}: {
+  requestPathname: string;
+  basePath: string;
+}): boolean {
+  const pathnameWithoutBasePath =
+    basePath && requestPathname.startsWith(`${basePath}/`)
+      ? requestPathname.slice(basePath.length)
+      : requestPathname;
+
+  if (
+    pathnameWithoutBasePath.startsWith('/_next/') ||
+    pathnameWithoutBasePath.startsWith('/api/')
+  ) {
+    return false;
+  }
+
+  const lastSegment = pathnameWithoutBasePath.split('/').pop() ?? '';
+  return !STATIC_FILE_EXTENSION_PATTERN.test(lastSegment);
 }
 
 function stripMiddlewareResponse(
@@ -185,6 +414,11 @@ function applyResolutionToResponse(
     }
   }
 
+  const contentType = normalizeContentType(headers.get('content-type'));
+  if (contentType === 'text/html' || contentType === 'text/x-component') {
+    headers.set('vary', withDefaultRscVaryHeader(headers.get('vary')));
+  }
+
   return new Response(response.body, {
     status: explicitStatus ?? resolution.status ?? response.status,
     statusText: response.statusText,
@@ -240,7 +474,7 @@ function withRouteMetadata(
 }
 
 function notFoundResponse(status = 404): Response {
-  return new Response('Not Found', {
+  return new Response('This page could not be found', {
     status,
     headers: {
       'content-type': 'text/plain; charset=utf-8',
@@ -300,8 +534,18 @@ function maybeResolveRscMatchedPathname({
     }
   }
 
+  if (hasOutputPathname(matchedPathname)) {
+    return matchedPathname;
+  }
+  if (basePathname !== matchedPathname && hasOutputPathname(basePathname)) {
+    return basePathname;
+  }
+
   const rscCandidatePathname = `${basePathname}${rsc.suffix}`;
-  if (hasOutputPathname(rscCandidatePathname)) {
+  if (
+    hasOutputPathname(rscCandidatePathname) &&
+    indexes.functionByPathname.get(rscCandidatePathname)?.runtime !== 'edge'
+  ) {
     return rscCandidatePathname;
   }
 
@@ -1112,6 +1356,42 @@ function isGetOrHeadRequest(request: Request): boolean {
   return request.method === 'GET' || request.method === 'HEAD';
 }
 
+function stripInternalMiddlewareRequestHeaders(headers: Headers): Headers {
+  const sanitized = new Headers(headers);
+  for (const header of INTERNAL_MIDDLEWARE_REQUEST_HEADERS) {
+    sanitized.delete(header);
+  }
+  return sanitized;
+}
+
+function collectInternalMiddlewareRequestHeaders(headers: Headers): Headers {
+  const internal = new Headers();
+  for (const header of INTERNAL_MIDDLEWARE_REQUEST_HEADERS) {
+    const value = headers.get(header);
+    if (value !== null) {
+      internal.set(header, value);
+    }
+  }
+  return internal;
+}
+
+function restoreInternalMiddlewareRequestHeaders({
+  requestHeaders,
+  internalHeaders,
+}: {
+  requestHeaders: Headers;
+  internalHeaders: Headers;
+}): Headers {
+  const restored = new Headers(requestHeaders);
+  for (const header of INTERNAL_MIDDLEWARE_REQUEST_HEADERS) {
+    const value = internalHeaders.get(header);
+    if (value !== null) {
+      restored.set(header, value);
+    }
+  }
+  return restored;
+}
+
 async function refreshImageCache({
   options,
   request,
@@ -1183,6 +1463,10 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       }
 
       let middlewareResponse: Response | null = null;
+      let middlewareRewriteUrl: URL | null = null;
+      let middlewareRequestHeaders: Headers | null = null;
+      const internalMiddlewareRequestHeaders =
+        collectInternalMiddlewareRequestHeaders(request.headers);
 
       const unresolvedResolution = await resolveRoutes({
         url: new URL(request.url),
@@ -1194,9 +1478,22 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         i18n: toResolutionI18nConfig(manifest),
         routes: toResolutionRoutes(manifest),
         invokeMiddleware: async (ctx) => {
+          const middlewareCtx = {
+            ...ctx,
+            headers: stripInternalMiddlewareRequestHeaders(ctx.headers),
+          };
           const result: RouterMiddlewareResult | {} =
-            (await options.invokeMiddleware?.(ctx)) ?? {};
+            (await options.invokeMiddleware?.(middlewareCtx)) ?? {};
 
+          if ('rewrite' in result && result.rewrite instanceof URL) {
+            middlewareRewriteUrl = result.rewrite;
+          }
+          if ('requestHeaders' in result && result.requestHeaders instanceof Headers) {
+            middlewareRequestHeaders = restoreInternalMiddlewareRequestHeaders({
+              requestHeaders: result.requestHeaders,
+              internalHeaders: internalMiddlewareRequestHeaders,
+            });
+          }
           if ('response' in result && result.response) {
             middlewareResponse = result.response;
           }
@@ -1204,9 +1501,30 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         },
       });
 
-      const resolution = stripRequestHeaderEchoes({
+      let resolution = stripRequestHeaderEchoes({
         resolution: unresolvedResolution,
         requestHeaders: request.headers,
+      });
+      const nextDataRewriteHeader = resolveNextDataRewriteHeader({
+        request,
+        rewriteUrl: middlewareRewriteUrl,
+        basePath: manifest.build.basePath,
+        buildId: manifest.build.buildId,
+      });
+      if (
+        nextDataRewriteHeader &&
+        resolution.resolvedHeaders?.has('x-nextjs-rewrite') !== true
+      ) {
+        resolution = withResolvedHeader(
+          resolution,
+          'x-nextjs-rewrite',
+          nextDataRewriteHeader
+        );
+      }
+      const requestWithMiddlewareMutations = withMiddlewareRequestMutations({
+        request,
+        rewriteUrl: middlewareRewriteUrl,
+        requestHeaders: middlewareRequestHeaders,
       });
 
       if (resolution.redirect) {
@@ -1268,7 +1586,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         );
       }
 
-      const requestUrl = new URL(request.url);
+      const requestUrl = new URL(requestWithMiddlewareMutations.url);
       if (isImageOptimizationPath(requestUrl.pathname, manifest.build.basePath)) {
         if (!options.invokeImageFunction) {
           return withRouteMetadata(
@@ -1377,19 +1695,68 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         );
       }
 
-      const matchedPathname = resolution.matchedPathname;
+      let matchedPathname = resolution.matchedPathname;
       if (!matchedPathname) {
+        matchedPathname = maybeResolveDirectPathnameFallback({
+          requestPathname: requestUrl.pathname,
+          indexes,
+        }) ?? undefined;
+      }
+      if (!matchedPathname) {
+        matchedPathname = maybeResolveNextDataFallbackPathname({
+          requestPathname: requestUrl.pathname,
+          basePath: manifest.build.basePath,
+          buildId: manifest.build.buildId,
+          indexes,
+        }) ?? undefined;
+      }
+      if (!matchedPathname) {
+        const appNotFoundOutput = indexes.functionByPathname.get('/_not-found');
+        if (
+          appNotFoundOutput &&
+          shouldAttemptAppNotFoundFunction({
+            requestPathname: requestUrl.pathname,
+            basePath: manifest.build.basePath,
+          })
+        ) {
+          const appNotFoundResponse = await options.invokeFunction({
+            request: requestWithMiddlewareMutations,
+            matchedPathname: '/_not-found',
+            routeMatches: resolution.routeMatches,
+            resolution,
+            output: appNotFoundOutput,
+            source: 'function',
+            prerenderSeed: null,
+            cacheState: undefined,
+          });
+          return withRouteMetadata(
+            applyResolutionToResponse(appNotFoundResponse, resolution, 404),
+            {
+              kind: 'not-found',
+              id: appNotFoundOutput.id,
+            }
+          );
+        }
+
         const response = options.handleNotFound
-          ? await options.handleNotFound({ request, resolution })
+          ? await options.handleNotFound({
+            request: requestWithMiddlewareMutations,
+            resolution,
+          })
           : notFoundResponse(resolution.status ?? 404);
         return withRouteMetadata(applyResolutionToResponse(response, resolution), {
           kind: 'not-found',
         });
       }
 
+      // Normalize "/" to "/index" — Pages Router emits the root page as
+      // "/index" in the static assets and function maps.
+      const normalizedMatchedPathname =
+        matchedPathname === '/' ? '/index' : matchedPathname;
+
       const resolvedMatchedPathname = maybeResolveRscMatchedPathname({
         request,
-        matchedPathname,
+        matchedPathname: normalizedMatchedPathname,
         manifest,
         indexes,
       });
@@ -1511,7 +1878,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
 
           const invocationRequest = filterPrerenderRequestByAllowLists(
             prerenderSeed,
-            request
+            requestWithMiddlewareMutations
           );
           const generatedResponse = await options.invokeFunction({
             request: invocationRequest,
@@ -1673,10 +2040,14 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
                 prerenderSeed.parentOutputId
               );
               const resumeRequest = parentOutput
-                ? toPrerenderParentRequest({ request, seed: prerenderSeed })
-                : request;
+                ? toPrerenderParentRequest({
+                    request: requestWithMiddlewareMutations,
+                    seed: prerenderSeed,
+                  })
+                : requestWithMiddlewareMutations;
               const shouldAttemptInlineResume =
-                Boolean(parentOutput) && resumeRequest !== request;
+                Boolean(parentOutput) &&
+                resumeRequest !== requestWithMiddlewareMutations;
 
               if (parentOutput && shouldAttemptInlineResume) {
                 const resumeResponsePromise = Promise.resolve(
@@ -1758,7 +2129,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           }
 
           const invocationRequest = toPrerenderParentRequest({
-            request,
+            request: requestWithMiddlewareMutations,
             seed: prerenderSeed,
           });
           const generatedResponse = await options.invokeFunction({
@@ -1825,10 +2196,14 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
 
           const parentOutput = indexes.functionById.get(prerenderSeed.parentOutputId);
           const resumeRequest = parentOutput
-            ? toPrerenderParentRequest({ request, seed: prerenderSeed })
-            : request;
+            ? toPrerenderParentRequest({
+                request: requestWithMiddlewareMutations,
+                seed: prerenderSeed,
+              })
+            : requestWithMiddlewareMutations;
           const shouldAttemptInlineResume =
-            Boolean(parentOutput) && resumeRequest !== request;
+            Boolean(parentOutput) &&
+            resumeRequest !== requestWithMiddlewareMutations;
 
           if (parentOutput && shouldAttemptInlineResume) {
             const resumeResponsePromise = Promise.resolve(
@@ -1881,7 +2256,10 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         }
 
         const response = await options.invokeFunction({
-          request: toPrerenderParentRequest({ request, seed: prerenderSeed }),
+          request: toPrerenderParentRequest({
+            request: requestWithMiddlewareMutations,
+            seed: prerenderSeed,
+          }),
           matchedPathname: resolvedMatchedPathname,
           routeMatches: resolution.routeMatches,
           resolution,
@@ -1899,7 +2277,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       const output = indexes.functionByPathname.get(resolvedMatchedPathname);
       if (output) {
         const response = await options.invokeFunction({
-          request,
+          request: requestWithMiddlewareMutations,
           matchedPathname: resolvedMatchedPathname,
           routeMatches: resolution.routeMatches,
           resolution,
@@ -1915,7 +2293,10 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       }
 
       const response = options.handleNotFound
-        ? await options.handleNotFound({ request, resolution })
+        ? await options.handleNotFound({
+          request: requestWithMiddlewareMutations,
+          resolution,
+        })
         : notFoundResponse(resolution.status ?? 404);
       return withRouteMetadata(applyResolutionToResponse(response, resolution), {
         kind: 'not-found',

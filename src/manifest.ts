@@ -41,6 +41,13 @@ export function collectOutputPathnames(
     pathnames.add(outputs.middleware.pathname);
   }
 
+  // @next/routing resolves "/" by exact-matching against the pathnames list.
+  // Pages Router emits the root page as "/index", so we also add "/" so the
+  // route resolver can find it.
+  if (pathnames.has('/index') && !pathnames.has('/')) {
+    pathnames.add('/');
+  }
+
   return [...pathnames].sort((a, b) => a.localeCompare(b));
 }
 

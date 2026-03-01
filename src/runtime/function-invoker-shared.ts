@@ -17,6 +17,7 @@ export interface CreateFunctionArtifactInvokerOptions {
   manifest: BunDeploymentManifest;
   adapterDir: string;
   loadModule?: (entrypointPath: string) => Promise<LoadedModule>;
+  incrementalCache?: unknown;
 }
 
 export function resolveInside(baseDir: string, relativePath: string): string {

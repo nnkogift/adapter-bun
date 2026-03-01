@@ -458,9 +458,7 @@ export async function stageFunctionArtifacts({
       kind: 'entrypoint',
     });
 
-    for (const [relativePath, sourcePath] of Object.entries(output.assets).sort(
-      ([left], [right]) => left.localeCompare(right)
-    )) {
+    for (const [relativePath, sourcePath] of Object.entries(output.assets)) {
       const absoluteSourcePath = toAbsoluteSourcePath(repoRoot, sourcePath);
       const bundlePath = outputAssetPathToBundlePath({
         repoRoot,
@@ -479,9 +477,7 @@ export async function stageFunctionArtifacts({
       });
     }
 
-    for (const [wasmName, wasmPath] of Object.entries(output.wasmAssets ?? {}).sort(
-      ([left], [right]) => left.localeCompare(right)
-    )) {
+    for (const [wasmName, wasmPath] of Object.entries(output.wasmAssets ?? {})) {
       await addFunctionFile({
         seenFiles,
         files,
@@ -492,8 +488,6 @@ export async function stageFunctionArtifacts({
         kind: 'wasm',
       });
     }
-
-    files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
 
     artifacts.push({
       bundleId,

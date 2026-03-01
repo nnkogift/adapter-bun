@@ -1,13 +1,9 @@
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import * as AsyncHooksImplementation from 'node:async_hooks';
-import * as AssertImplementation from 'node:assert';
-import * as BufferImplementation from 'node:buffer';
-import * as EventsImplementation from 'node:events';
+import { createRequire } from 'node:module';
 import path from 'node:path';
-import * as UtilImplementation from 'node:util';
-import { runInContext } from 'node:vm';
-import { EdgeRuntime } from 'edge-runtime';
+import { runInThisContext } from 'node:vm';
 import type { MiddlewareContext } from '@next/routing';
 import { responseToMiddlewareResult } from '@next/routing';
 import type { BunDeploymentManifest, BunFunctionArtifact } from '../types.ts';
@@ -23,8 +19,6 @@ import {
   type CreateFunctionArtifactInvokerOptions,
   type LambdaLikeResult,
 } from './function-invoker-shared.ts';
-
-type EdgeRuntimeInstance = InstanceType<typeof EdgeRuntime>;
 
 type EdgeAssetBinding = {
   name: string;
@@ -45,6 +39,7 @@ type EdgeSandboxDefinition = {
   env: Record<string, string>;
   nextConfig: {
     basePath: string;
+    buildId: string;
     i18n: BunDeploymentManifest['build']['i18n'];
   };
 };
@@ -65,45 +60,64 @@ type EdgeResponseLike = {
   arrayBuffer: () => Promise<ArrayBuffer>;
 };
 
-type EdgeRuntimeExecutor = {
-  outputId: string;
-  entryKey: string;
-  nextConfig: EdgeSandboxDefinition['nextConfig'];
-  runtime: EdgeRuntimeInstance;
+type EdgeEntryHandler = (payload: unknown) => Promise<unknown> | unknown;
+
+type EdgeGlobalState = {
+  initialized: boolean;
+  activeOutputId: string | null;
+  inlineAssetByName: Map<string, string>;
+  compiledWasmByPath: Map<string, WebAssembly.Module>;
+  loadedWasmPaths: Set<string>;
+  loadingWasmByPath: Map<string, Promise<WebAssembly.Module>>;
+  loadedScriptPaths: Set<string>;
+  loadingScriptByPath: Map<string, Promise<void>>;
 };
 
-const EDGE_NATIVE_MODULES = new Map<string, unknown>([
-  ['async_hooks', AsyncHooksImplementation],
-  ['node:async_hooks', AsyncHooksImplementation],
-  ['assert', AssertImplementation],
-  ['node:assert', AssertImplementation],
-  ['buffer', BufferImplementation],
-  ['node:buffer', BufferImplementation],
-  ['events', EventsImplementation],
-  ['node:events', EventsImplementation],
-  ['util', UtilImplementation],
-  ['node:util', UtilImplementation],
+const FORBIDDEN_RESPONSE_HEADERS = new Set([
+  'content-length',
+  'content-encoding',
+  'transfer-encoding',
 ]);
+
+const EDGE_GLOBAL_STATE_SYMBOL = Symbol.for('adapter-bun.edge-global-state');
+const NEXT_PATCH_SYMBOL = Symbol.for('next-patch');
+const edgeRequire = createRequire(import.meta.url);
+let edgeInvocationLock: Promise<void> = Promise.resolve();
+
+function logEdgeDebug(message: string, details?: unknown): void {
+  if (process.env.ADAPTER_BUN_DEBUG_EDGE !== '1') {
+    return;
+  }
+  if (details === undefined) {
+    console.error(`[adapter-bun][edge] ${message}`);
+    return;
+  }
+  console.error(`[adapter-bun][edge] ${message}`, details);
+}
+
+function getEdgeGlobalState(): EdgeGlobalState {
+  const globalAny = globalThis as Record<PropertyKey, unknown>;
+  const existing = globalAny[EDGE_GLOBAL_STATE_SYMBOL] as EdgeGlobalState | undefined;
+  if (existing) {
+    return existing;
+  }
+
+  const created: EdgeGlobalState = {
+    initialized: false,
+    activeOutputId: null,
+    inlineAssetByName: new Map<string, string>(),
+    compiledWasmByPath: new Map<string, WebAssembly.Module>(),
+    loadedWasmPaths: new Set<string>(),
+    loadingWasmByPath: new Map<string, Promise<WebAssembly.Module>>(),
+    loadedScriptPaths: new Set<string>(),
+    loadingScriptByPath: new Map<string, Promise<void>>(),
+  };
+  globalAny[EDGE_GLOBAL_STATE_SYMBOL] = created;
+  return created;
+}
 
 function isScriptPath(filePath: string): boolean {
   return /\.(?:mjs|cjs|js)$/i.test(filePath);
-}
-
-function scriptPriority(filePath: string, entrypointPath: string): number {
-  const normalized = filePath.replace(/\\/g, '/');
-  if (normalized.includes('/edge-runtime-webpack')) {
-    return 0;
-  }
-  if (normalized.includes('/webpack-runtime')) {
-    return 1;
-  }
-  if (normalized.includes('/server/chunks/')) {
-    return 2;
-  }
-  if (normalized === entrypointPath.replace(/\\/g, '/')) {
-    return 4;
-  }
-  return 3;
 }
 
 function extractWasmBindingName(fileRelativePath: string): string {
@@ -120,11 +134,16 @@ function normalizeEdgeEnv(
   if (!value) {
     return {};
   }
+
   const env: Record<string, string> = {};
   for (const [key, current] of Object.entries(value)) {
     env[key] = String(current);
   }
   return env;
+}
+
+function toEdgeFunctionName(outputId: string): string {
+  return outputId.replace(/\.rsc$/, '');
 }
 
 function buildEdgeSandboxDefinition({
@@ -143,27 +162,37 @@ function buildEdgeSandboxDefinition({
     adapterDir,
     functionRoot
   );
+
   const scriptCandidates = output.files
     .filter((file) => file.kind !== 'wasm' && isScriptPath(file.relativePath))
-    .map((file) => resolveOutputFilePath(output, file.relativePath, adapterDir, functionRoot))
+    .map((file) =>
+      resolveOutputFilePath(output, file.relativePath, adapterDir, functionRoot)
+    )
     .filter((candidatePath) => existsSync(candidatePath));
 
-  const uniqueScripts = new Set<string>(scriptCandidates);
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  const pushPath = (candidatePath: string): void => {
+    if (seen.has(candidatePath)) {
+      return;
+    }
+    seen.add(candidatePath);
+    paths.push(candidatePath);
+  };
+
   if (existsSync(entrypointPath)) {
-    uniqueScripts.add(entrypointPath);
+    // The edge entrypoint frequently seeds globals (for example __RSC_MANIFEST)
+    // required by subsequently loaded chunks.
+    pushPath(entrypointPath);
   }
 
-  const paths = [...uniqueScripts].sort((left, right) => {
-    const priorityDelta =
-      scriptPriority(left, entrypointPath) - scriptPriority(right, entrypointPath);
-    if (priorityDelta !== 0) {
-      return priorityDelta;
-    }
-    return left.localeCompare(right);
-  });
+  for (const candidatePath of scriptCandidates) {
+    pushPath(candidatePath);
+  }
+
   if (paths.length === 0) {
     throw new Error(
-      `Edge function output "${output.id}" has no script files to evaluate in sandbox`
+      `Edge function output "${output.id}" has no script files to evaluate`
     );
   }
 
@@ -179,6 +208,7 @@ function buildEdgeSandboxDefinition({
       ),
     }))
     .filter((item) => existsSync(item.filePath));
+
   const wasm: EdgeWasmBinding[] = output.files
     .filter((file) => file.kind === 'wasm')
     .map((file) => ({
@@ -194,7 +224,7 @@ function buildEdgeSandboxDefinition({
 
   return {
     outputId: output.id,
-    name: output.id,
+    name: toEdgeFunctionName(output.id),
     paths,
     assets,
     wasm,
@@ -203,26 +233,18 @@ function buildEdgeSandboxDefinition({
   };
 }
 
-function toRequestHeadersRecord(headers: Headers): Record<string, string> {
+function toRequestHeadersRecord(
+  headers: Headers,
+  fallbackHost: string
+): Record<string, string> {
   const record: Record<string, string> = {};
   for (const [key, value] of headers.entries()) {
     record[key] = value;
   }
+  if (!record.host) {
+    record.host = fallbackHost;
+  }
   return record;
-}
-
-function buildEdgeProcessEnv(injected: Record<string, string>): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === 'string') {
-      env[key] = value;
-    }
-  }
-  for (const [key, value] of Object.entries(injected)) {
-    env[key] = value;
-  }
-  env.NEXT_RUNTIME = 'edge';
-  return env;
 }
 
 function responseInputToString(input: unknown): string {
@@ -240,31 +262,280 @@ function responseInputToString(input: unknown): string {
   return String(input);
 }
 
-async function maybeReadInlineAssetResponse({
-  input,
-  assetsByName,
-  context,
-}: {
-  input: unknown;
-  assetsByName: Map<string, string>;
-  context: EdgeRuntimeInstance['context'];
-}): Promise<Response | undefined> {
+function resolveInlineAssetPath(
+  input: unknown,
+  inlineAssetByName: Map<string, string>
+): string | null {
   const inputString = responseInputToString(input);
   if (!inputString.startsWith('blob:')) {
-    return undefined;
+    return null;
   }
 
   const name = inputString.slice('blob:'.length);
-  const assetPath =
-    assetsByName.get(name) ??
-    assetsByName.get(decodeURIComponent(name)) ??
-    assetsByName.get(name.replace(/^\/+/, ''));
-  if (!assetPath || !existsSync(assetPath)) {
+  return (
+    inlineAssetByName.get(name) ??
+    inlineAssetByName.get(decodeURIComponent(name)) ??
+    inlineAssetByName.get(name.replace(/^\/+/, '')) ??
+    null
+  );
+}
+
+function ensureEdgeGlobalsInitialized(): EdgeGlobalState {
+  const state = getEdgeGlobalState();
+  if (!state.initialized) {
+    const globalWithSelf = globalThis as unknown as { self?: typeof globalThis };
+    if (typeof globalWithSelf.self === 'undefined') {
+      globalWithSelf.self = globalThis;
+    }
+
+    if (typeof (globalThis as { require?: unknown }).require !== 'function') {
+      (globalThis as Record<string, unknown>).require = edgeRequire;
+    }
+
+    // Edge chunks snapshot AsyncLocalStorage availability at module eval time.
+    // Always force Node's implementation before loading any edge chunk.
+    (globalThis as { AsyncLocalStorage: unknown }).AsyncLocalStorage =
+      AsyncHooksImplementation.AsyncLocalStorage;
+    state.initialized = true;
+  }
+  return state;
+}
+
+async function withPatchedEdgeFetch<T>({
+  state: _state,
+  run,
+}: {
+  state: EdgeGlobalState;
+  run: () => Promise<T>;
+}): Promise<T> {
+  // Edge chunks can mutate process-global fetch state at eval time.
+  // Snapshot and restore around each edge invocation so node runtime
+  // fetch instrumentation (React dedupe/cache) remains stable.
+  const globalAny = globalThis as Record<PropertyKey, unknown>;
+  const originalFetch = globalThis.fetch;
+  const hadNextPatchSymbol = Object.prototype.hasOwnProperty.call(
+    globalAny,
+    NEXT_PATCH_SYMBOL
+  );
+  const originalNextPatchValue = globalAny[NEXT_PATCH_SYMBOL];
+
+  try {
+    return await run();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (hadNextPatchSymbol) {
+      globalAny[NEXT_PATCH_SYMBOL] = originalNextPatchValue;
+    } else {
+      delete globalAny[NEXT_PATCH_SYMBOL];
+    }
+  }
+}
+
+function registerInlineAssets(
+  state: EdgeGlobalState,
+  assets: EdgeAssetBinding[]
+): void {
+  for (const asset of assets) {
+    state.inlineAssetByName.set(asset.name, asset.filePath);
+    const normalized = asset.name.replace(/^\/+/, '');
+    state.inlineAssetByName.set(normalized, asset.filePath);
+  }
+}
+
+async function ensureWasmLoaded(
+  state: EdgeGlobalState,
+  wasmBinding: EdgeWasmBinding
+): Promise<WebAssembly.Module> {
+  const loaded = state.compiledWasmByPath.get(wasmBinding.filePath);
+  if (loaded) {
+    return loaded;
+  }
+
+  const pending = state.loadingWasmByPath.get(wasmBinding.filePath);
+  if (pending) {
+    return pending;
+  }
+
+  const loadPromise = (async () => {
+    const module = await WebAssembly.compile(await readFile(wasmBinding.filePath));
+    state.compiledWasmByPath.set(wasmBinding.filePath, module);
+    return module;
+  })();
+
+  state.loadingWasmByPath.set(wasmBinding.filePath, loadPromise);
+  try {
+    return await loadPromise;
+  } finally {
+    state.loadingWasmByPath.delete(wasmBinding.filePath);
+  }
+}
+
+function resetActiveEdgeOutput(state: EdgeGlobalState): void {
+  state.activeOutputId = null;
+  state.inlineAssetByName.clear();
+  state.loadedScriptPaths.clear();
+  state.loadedWasmPaths.clear();
+  state.loadingScriptByPath.clear();
+  state.loadingWasmByPath.clear();
+
+  const globalAny = globalThis as Record<string, unknown>;
+  delete globalAny._ENTRIES;
+  globalAny.TURBOPACK = [];
+  delete globalAny[Symbol.for('next.server.manifests') as unknown as string];
+  delete globalAny.__RSC_MANIFEST;
+  delete globalAny.__RSC_SERVER_MANIFEST;
+}
+
+async function ensureScriptLoaded(
+  state: EdgeGlobalState,
+  scriptPath: string
+): Promise<void> {
+  if (state.loadedScriptPaths.has(scriptPath)) {
+    return;
+  }
+
+  const pending = state.loadingScriptByPath.get(scriptPath);
+  if (pending) {
+    await pending;
+    return;
+  }
+
+  const loadPromise = (async () => {
+    const source = await readFile(scriptPath, 'utf8');
+    runInThisContext(source, {
+      filename: scriptPath,
+    });
+    state.loadedScriptPaths.add(scriptPath);
+  })();
+
+  state.loadingScriptByPath.set(scriptPath, loadPromise);
+  try {
+    await loadPromise;
+  } finally {
+    state.loadingScriptByPath.delete(scriptPath);
+  }
+}
+
+async function ensureEdgeOutputLoaded({
+  sandbox,
+}: {
+  sandbox: EdgeSandboxDefinition;
+}): Promise<void> {
+  const state = ensureEdgeGlobalsInitialized();
+
+  if (state.activeOutputId !== sandbox.outputId) {
+    resetActiveEdgeOutput(state);
+    state.activeOutputId = sandbox.outputId;
+    registerInlineAssets(state, sandbox.assets);
+  }
+
+  try {
+    for (const wasmBinding of sandbox.wasm) {
+      if (!state.loadedWasmPaths.has(wasmBinding.filePath)) {
+        const module = await ensureWasmLoaded(state, wasmBinding);
+        (globalThis as Record<string, unknown>)[wasmBinding.name] = module;
+        state.loadedWasmPaths.add(wasmBinding.filePath);
+      } else {
+        const module = state.compiledWasmByPath.get(wasmBinding.filePath);
+        if (module) {
+          (globalThis as Record<string, unknown>)[wasmBinding.name] = module;
+        }
+      }
+    }
+
+    for (const scriptPath of sandbox.paths) {
+      await ensureScriptLoaded(state, scriptPath);
+    }
+  } catch (error) {
+    logEdgeDebug('failed to load output', {
+      outputId: sandbox.outputId,
+      entryKey: `middleware_${sandbox.name}`,
+      paths: sandbox.paths,
+      error,
+    });
+    resetActiveEdgeOutput(state);
+    throw error;
+  }
+}
+
+async function withEdgeInvocationLock<T>(run: () => Promise<T>): Promise<T> {
+  const previousLock = edgeInvocationLock;
+  let releaseCurrentLock: (() => void) | undefined;
+  edgeInvocationLock = new Promise<void>((resolve) => {
+    releaseCurrentLock = resolve;
+  });
+
+  await previousLock;
+  try {
+    return await run();
+  } finally {
+    releaseCurrentLock?.();
+  }
+}
+
+function resolveEdgeEntryHandler({
+  outputId,
+  entryKey,
+}: {
+  outputId: string;
+  entryKey: string;
+}): EdgeEntryHandler {
+  const entries = (globalThis as Record<string, unknown>)._ENTRIES as
+    | Record<string, EdgeEntryModule>
+    | undefined;
+
+  if (!entries || typeof entries !== 'object') {
+    throw new Error(`Edge output "${outputId}" did not register global _ENTRIES`);
+  }
+
+  const entry = entries[entryKey];
+  if (!entry || typeof entry.default !== 'function') {
+    throw new Error(
+      `Edge output "${outputId}" is missing entry "${entryKey}"`
+    );
+  }
+
+  return entry.default;
+}
+
+function buildPagePayload({
+  pageName,
+  routeMatches,
+}: {
+  pageName?: string;
+  routeMatches?: Record<string, string>;
+}): { name?: string; params?: Record<string, string> } | undefined {
+  if (pageName === undefined) {
     return undefined;
   }
 
-  const content = await readFile(assetPath);
-  return new context.Response(content);
+  return {
+    name: pageName,
+    ...(routeMatches && Object.keys(routeMatches).length > 0
+      ? { params: routeMatches }
+      : {}),
+  };
+}
+
+async function toEdgeRuntimeRequestBody(
+  request: Request
+): Promise<ReadableStream<Uint8Array> | undefined> {
+  const method = request.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD') {
+    return undefined;
+  }
+
+  const bytes = Buffer.from(await request.arrayBuffer());
+  if (bytes.byteLength === 0) {
+    return undefined;
+  }
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(bytes));
+      controller.close();
+    },
+  });
 }
 
 function isEdgeFetchEventResultLike(value: unknown): value is EdgeFetchEventResultLike {
@@ -301,188 +572,135 @@ async function toHostResponse(response: Response | EdgeResponseLike): Promise<Re
   });
 }
 
-function resolveEdgeEntryHandler(
-  executor: EdgeRuntimeExecutor
-): (payload: unknown) => Promise<unknown> | unknown {
-  const entriesValue = (executor.runtime.context as Record<string, unknown>)._ENTRIES;
-  if (!entriesValue || typeof entriesValue !== 'object') {
-    throw new Error(
-      `Edge output "${executor.outputId}" did not register global _ENTRIES`
-    );
+function normalizeEdgeResponseHeaders(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const header of FORBIDDEN_RESPONSE_HEADERS) {
+    headers.delete(header);
   }
 
-  const entries = entriesValue as Record<string, EdgeEntryModule>;
-  const entry = entries[executor.entryKey];
-  if (!entry || typeof entry.default !== 'function') {
-    throw new Error(
-      `Edge output "${executor.outputId}" is missing entry "${executor.entryKey}"`
-    );
-  }
-
-  return entry.default;
-}
-
-async function toEdgeRuntimeRequestBody(
-  runtime: EdgeRuntimeInstance,
-  request: Request
-): Promise<ReadableStream<Uint8Array> | undefined> {
-  if (request.method === 'GET' || request.method === 'HEAD') {
-    return undefined;
-  }
-
-  const bytes = Buffer.from(await request.arrayBuffer());
-  if (bytes.byteLength === 0) {
-    return undefined;
-  }
-
-  const RuntimeUint8Array = runtime.evaluate<typeof Uint8Array>('Uint8Array');
-  return new runtime.context.ReadableStream({
-    start(controller) {
-      controller.enqueue(new RuntimeUint8Array(bytes));
-      controller.close();
-    },
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
-}
-
-async function createEdgeRuntimeExecutor(
-  sandbox: EdgeSandboxDefinition
-): Promise<EdgeRuntimeExecutor> {
-  const assetsByName = new Map<string, string>(
-    sandbox.assets.map((asset) => [asset.name, asset.filePath])
-  );
-  const edgeProcess = {
-    env: buildEdgeProcessEnv(sandbox.env),
-  };
-
-  const runtime = new EdgeRuntime({
-    extend(context) {
-      context.process = edgeProcess;
-
-      Object.defineProperty(context, 'require', {
-        enumerable: false,
-        value: (id: string) => {
-          const moduleValue = EDGE_NATIVE_MODULES.get(id);
-          if (!moduleValue) {
-            throw new TypeError(`Native module not found: ${id}`);
-          }
-          return moduleValue;
-        },
-      });
-
-      const originalFetch = context.fetch.bind(context);
-      context.fetch = async (input, init = {}) => {
-        const assetResponse = await maybeReadInlineAssetResponse({
-          input,
-          assetsByName,
-          context,
-        });
-        if (assetResponse) {
-          return assetResponse;
-        }
-        return originalFetch(input, init);
-      };
-
-      return context;
-    },
-  });
-
-  runtime.context.AsyncLocalStorage = AsyncHooksImplementation.AsyncLocalStorage;
-
-  for (const wasmBinding of sandbox.wasm) {
-    const module = await WebAssembly.compile(await readFile(wasmBinding.filePath));
-    runtime.context[wasmBinding.name] = module;
-  }
-
-  for (const scriptPath of sandbox.paths) {
-    const source = await readFile(scriptPath, 'utf8');
-    runInContext(source, runtime.context, {
-      filename: scriptPath,
-    });
-  }
-
-  return {
-    outputId: sandbox.outputId,
-    entryKey: `middleware_${sandbox.name}`,
-    nextConfig: sandbox.nextConfig,
-    runtime,
-  };
 }
 
 async function invokeEdgeRuntimeHandler({
-  executor,
-  context,
+  sandbox,
+  request,
+  pageName,
+  routeMatches,
+  requestMeta,
+  signal,
+  incrementalCache,
 }: {
-  executor: EdgeRuntimeExecutor;
-  context: FunctionRouteDispatchContext;
+  sandbox: EdgeSandboxDefinition;
+  request: Request;
+  pageName?: string;
+  routeMatches?: Record<string, string>;
+  requestMeta?: Record<string, unknown>;
+  signal: AbortSignal;
+  incrementalCache: unknown;
 }): Promise<Response> {
-  const handler = resolveEdgeEntryHandler(executor);
-  const requestBody = await toEdgeRuntimeRequestBody(executor.runtime, context.request);
-  const requestHeaders = toRequestHeadersRecord(context.request.headers);
-  const requestUrl = new URL(context.request.url);
-  if (!requestHeaders.host) {
-    requestHeaders.host = requestUrl.host;
-  }
+  return withEdgeInvocationLock(async () => {
+    try {
+      const edgeState = ensureEdgeGlobalsInitialized();
+      return await withPatchedEdgeFetch({
+        state: edgeState,
+        run: async () => {
+          await ensureEdgeOutputLoaded({
+            sandbox,
+          });
+          const edgeFunction = resolveEdgeEntryHandler({
+            outputId: sandbox.outputId,
+            entryKey: `middleware_${sandbox.name}`,
+          });
 
-  const waitUntilTasks: Promise<unknown>[] = [];
-  const result = await handler({
-    request: {
-      headers: requestHeaders,
-      method: context.request.method,
-      url: context.request.url,
-      body: requestBody,
-      signal: context.request.signal,
-      waitUntil(waitable: Promise<unknown>) {
-        waitUntilTasks.push(waitable);
-      },
-      page: {
-        name: context.output.sourcePage,
-        params: context.routeMatches ?? {},
-      },
-      nextConfig: {
-        basePath: executor.nextConfig.basePath,
-        i18n: executor.nextConfig.i18n,
-      },
-      requestMeta: {
-        initURL: context.request.url,
-      },
-    },
-  });
+          if (incrementalCache) {
+            const globalAny = globalThis as Record<string, unknown>;
+            globalAny.__incrementalCacheShared = true;
+            globalAny.__incrementalCache = incrementalCache;
+          }
 
-  let responseValue: unknown;
-  if (isEdgeFetchEventResultLike(result)) {
-    responseValue = result.response;
-    if (result.waitUntil) {
-      waitUntilTasks.push(result.waitUntil);
+          const requestUrl = new URL(request.url);
+          const requestBody = await toEdgeRuntimeRequestBody(request);
+          const requestHeaders = toRequestHeadersRecord(request.headers, requestUrl.host);
+
+          const waitUntilTasks: Promise<unknown>[] = [];
+          const invoke = (): Promise<unknown> | unknown =>
+            edgeFunction({
+              request: {
+                headers: requestHeaders,
+                method: request.method,
+                url: requestUrl.toString(),
+                body: requestBody,
+                signal,
+                waitUntil(waitable: Promise<unknown>) {
+                  waitUntilTasks.push(waitable);
+                },
+                page: buildPagePayload({
+                  pageName,
+                  routeMatches,
+                }),
+                nextConfig: {
+                  basePath: sandbox.nextConfig.basePath,
+                  i18n: sandbox.nextConfig.i18n,
+                },
+                requestMeta,
+              },
+            });
+
+          const result = await invoke();
+
+          let responseValue: unknown;
+          if (isEdgeFetchEventResultLike(result)) {
+            responseValue = result.response;
+            if (result.waitUntil) {
+              waitUntilTasks.push(result.waitUntil);
+            }
+          } else {
+            responseValue = result;
+          }
+
+          for (const waitable of waitUntilTasks) {
+            void waitable.catch(() => undefined);
+          }
+
+          let response: Response;
+          if (isEdgeResponseLike(responseValue)) {
+            response = await toHostResponse(responseValue);
+          } else if (responseValue instanceof Response) {
+            response = responseValue;
+          } else if (responseValue !== undefined && responseValue !== null) {
+            response = asResponse(responseValue as Response | LambdaLikeResult);
+          } else {
+            throw new Error(
+              `Edge function handler for output "${sandbox.outputId}" returned no response`
+            );
+          }
+
+          return normalizeEdgeResponseHeaders(response);
+        },
+      });
+    } catch (error) {
+      logEdgeDebug('invocation failed', {
+        outputId: sandbox.outputId,
+        requestUrl: request.url,
+        requestMethod: request.method,
+        error,
+      });
+      throw error;
     }
-  } else {
-    responseValue = result;
-  }
-
-  for (const waitable of waitUntilTasks) {
-    void waitable.catch(() => undefined);
-  }
-
-  if (isEdgeResponseLike(responseValue)) {
-    return toHostResponse(responseValue);
-  }
-  if (responseValue instanceof Response) {
-    return responseValue;
-  }
-  if (responseValue !== undefined && responseValue !== null) {
-    return asResponse(responseValue as Response | LambdaLikeResult);
-  }
-
-  throw new Error(
-    `Edge function handler for output "${context.output.id}" returned no response`
-  );
+  });
 }
 
 export function createEdgeFunctionArtifactInvoker({
   manifest,
   adapterDir,
+  incrementalCache,
 }: CreateFunctionArtifactInvokerOptions): RouterRuntimeHandlers['invokeFunction'] {
   const outputById = new Map<string, BunFunctionArtifact>();
-  const executorByOutputId = new Map<string, Promise<EdgeRuntimeExecutor>>();
+  const sandboxByOutputId = new Map<string, EdgeSandboxDefinition>();
 
   for (const output of manifest.functionMap) {
     if (output.runtime !== 'edge') {
@@ -497,30 +715,36 @@ export function createEdgeFunctionArtifactInvoker({
       throw new Error(`Unknown edge function output id "${ctx.output.id}"`);
     }
 
-    const cached = executorByOutputId.get(output.id);
-    const executorPromise =
-      cached ??
-      (async () => {
-        const sandbox = buildEdgeSandboxDefinition({
-          output,
-          adapterDir,
-          functionRoot: manifest.artifacts.functionRoot,
-          nextConfig: {
-            basePath: manifest.build.basePath,
-            i18n: manifest.build.i18n,
-          },
-        });
-        return createEdgeRuntimeExecutor(sandbox);
-      })();
-
-    if (!cached) {
-      executorByOutputId.set(output.id, executorPromise);
+    let sandbox = sandboxByOutputId.get(output.id);
+    if (!sandbox) {
+      sandbox = buildEdgeSandboxDefinition({
+        output,
+        adapterDir,
+        functionRoot: manifest.artifacts.functionRoot,
+        nextConfig: {
+          basePath: manifest.build.basePath,
+          buildId: manifest.build.buildId,
+          i18n: manifest.build.i18n,
+        },
+      });
+      sandboxByOutputId.set(output.id, sandbox);
     }
 
-    const executor = await executorPromise;
     return invokeEdgeRuntimeHandler({
-      executor,
-      context: ctx,
+      sandbox,
+      request: ctx.request,
+      pageName: output.sourcePage,
+      routeMatches: ctx.routeMatches ?? undefined,
+      requestMeta: {
+        outputId: output.id,
+        source: ctx.source,
+        matchedPathname: ctx.matchedPathname,
+        routeMatches: ctx.routeMatches ?? null,
+        cacheState: ctx.cacheState ?? null,
+        initURL: ctx.request.url,
+      },
+      signal: ctx.request.signal,
+      incrementalCache,
     });
   };
 }
@@ -528,6 +752,7 @@ export function createEdgeFunctionArtifactInvoker({
 export function createEdgeMiddlewareInvoker({
   manifest,
   adapterDir,
+  incrementalCache,
 }: CreateFunctionArtifactInvokerOptions): RouterRuntimeHandlers['invokeMiddleware'] | null {
   const middlewareOutputId = manifest.runtime?.middlewareOutputId;
   if (!middlewareOutputId) {
@@ -541,76 +766,32 @@ export function createEdgeMiddlewareInvoker({
     return null;
   }
 
-  let executorPromise: Promise<EdgeRuntimeExecutor> | undefined;
+  let sandbox: EdgeSandboxDefinition | undefined;
 
   return async (ctx: MiddlewareContext): Promise<RouterMiddlewareResult> => {
-    executorPromise ??= (async () => {
-      const sandbox = buildEdgeSandboxDefinition({
-        output,
-        adapterDir,
-        functionRoot: manifest.artifacts.functionRoot,
+    sandbox ??= buildEdgeSandboxDefinition({
+      output,
+      adapterDir,
+      functionRoot: manifest.artifacts.functionRoot,
         nextConfig: {
           basePath: manifest.build.basePath,
+          buildId: manifest.build.buildId,
           i18n: manifest.build.i18n,
         },
       });
-      return createEdgeRuntimeExecutor(sandbox);
-    })();
 
-    const executor = await executorPromise;
-    const handler = resolveEdgeEntryHandler(executor);
-
-    const requestHeaders = toRequestHeadersRecord(ctx.headers);
-    if (!requestHeaders.host) {
-      requestHeaders.host = ctx.url.host;
-    }
-
-    const waitUntilTasks: Promise<unknown>[] = [];
-    const result = await handler({
-      request: {
-        headers: requestHeaders,
+    const response = await invokeEdgeRuntimeHandler({
+      sandbox,
+      request: new Request(ctx.url.toString(), {
         method: 'GET',
-        url: ctx.url.toString(),
-        body: undefined,
-        waitUntil(waitable: Promise<unknown>) {
-          waitUntilTasks.push(waitable);
-        },
-        page: {
-          name: output.sourcePage,
-          params: {},
-        },
-        nextConfig: {
-          basePath: executor.nextConfig.basePath,
-          i18n: executor.nextConfig.i18n,
-        },
-        requestMeta: {
-          initURL: ctx.url.toString(),
-        },
+        headers: ctx.headers,
+      }),
+      requestMeta: {
+        initURL: ctx.url.toString(),
       },
+      signal: AbortSignal.timeout(30_000),
+      incrementalCache,
     });
-
-    for (const waitable of waitUntilTasks) {
-      void waitable.catch(() => undefined);
-    }
-
-    let responseValue: unknown;
-    if (isEdgeFetchEventResultLike(result)) {
-      responseValue = result.response;
-      if (result.waitUntil) {
-        waitUntilTasks.push(result.waitUntil);
-      }
-    } else {
-      responseValue = result;
-    }
-
-    let response: Response;
-    if (isEdgeResponseLike(responseValue)) {
-      response = await toHostResponse(responseValue);
-    } else if (responseValue instanceof Response) {
-      response = responseValue;
-    } else {
-      response = new Response(null, { status: 200 });
-    }
 
     const middlewareResult = responseToMiddlewareResult(
       response,
