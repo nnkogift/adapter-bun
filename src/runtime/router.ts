@@ -220,6 +220,10 @@ function maybeResolveDirectPathnameFallback({
   indexes: ReturnType<typeof buildRouteIndexes>;
 }): string | null {
   const candidatePathnames = new Set<string>([requestPathname]);
+  if (requestPathname !== '/' && requestPathname.endsWith('/')) {
+    const withoutTrailingSlash = requestPathname.slice(0, -1) || '/';
+    candidatePathnames.add(withoutTrailingSlash);
+  }
   if (requestPathname === '/') {
     candidatePathnames.add('/index');
   }
@@ -605,16 +609,86 @@ function notFoundResponse(status = 404): Response {
   });
 }
 
+type ResolutionRoute = {
+  status?: number;
+  destination?: string;
+  headers?: Record<string, string>;
+};
+
+function isRedirectStatusCode(status: number | undefined): boolean {
+  return typeof status === 'number' && status >= 300 && status < 400;
+}
+
+function readRouteHeader(
+  headers: Record<string, string> | undefined,
+  key: string
+): string | undefined {
+  if (!headers) {
+    return undefined;
+  }
+  const expectedKey = key.toLowerCase();
+  for (const [headerKey, value] of Object.entries(headers)) {
+    if (headerKey.toLowerCase() === expectedKey) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function withDerivedRedirectDestination<T extends ResolutionRoute>(route: T): T {
+  if (
+    typeof route.destination === 'string' &&
+    route.destination.length > 0
+  ) {
+    return route;
+  }
+  if (!isRedirectStatusCode(route.status)) {
+    return route;
+  }
+  const location = readRouteHeader(route.headers, 'location');
+  if (!location || location.length === 0) {
+    return route;
+  }
+  return {
+    ...route,
+    destination: location,
+  };
+}
+
+function withDerivedRedirectDestinations<T extends ResolutionRoute>(
+  routes: readonly T[]
+): T[] {
+  return routes.map((route) => withDerivedRedirectDestination(route));
+}
+
 function toResolutionRoutes(manifest: BunDeploymentManifest) {
   return {
-    beforeMiddleware: manifest.routeGraph.beforeMiddleware,
-    beforeFiles: manifest.routeGraph.beforeFiles,
-    afterFiles: manifest.routeGraph.afterFiles,
-    dynamicRoutes: manifest.routeGraph.dynamicRoutes,
-    onMatch: manifest.routeGraph.onMatch,
-    fallback: manifest.routeGraph.fallback,
+    beforeMiddleware: withDerivedRedirectDestinations(
+      manifest.routeGraph.beforeMiddleware
+    ),
+    beforeFiles: withDerivedRedirectDestinations(manifest.routeGraph.beforeFiles),
+    afterFiles: withDerivedRedirectDestinations(manifest.routeGraph.afterFiles),
+    dynamicRoutes: withDerivedRedirectDestinations(
+      manifest.routeGraph.dynamicRoutes
+    ),
+    onMatch: withDerivedRedirectDestinations(manifest.routeGraph.onMatch),
+    fallback: withDerivedRedirectDestinations(manifest.routeGraph.fallback),
     shouldNormalizeNextData: manifest.routeGraph.shouldNormalizeNextData,
     rsc: manifest.routeGraph.rsc,
+  };
+}
+
+function withoutResolvedLocationHeader(
+  resolution: RouteResolutionResult
+): RouteResolutionResult {
+  if (!resolution.resolvedHeaders?.has('location')) {
+    return resolution;
+  }
+  const headers = new Headers(resolution.resolvedHeaders);
+  headers.delete('location');
+  return {
+    ...resolution,
+    resolvedHeaders: headers,
   };
 }
 
@@ -1955,12 +2029,17 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         : resolution.routeMatches;
 
       if (resolution.redirect) {
+        const redirectResolution = withoutResolvedLocationHeader(resolution);
         const response = new Response(null, {
           status: resolution.redirect.status,
           headers: { location: resolution.redirect.url.toString() },
         });
         return withRouteMetadata(
-          applyResolutionToResponse(response, resolution, resolution.redirect.status),
+          applyResolutionToResponse(
+            response,
+            redirectResolution,
+            resolution.redirect.status
+          ),
           { kind: 'redirect' }
         );
       }
