@@ -76,19 +76,28 @@ export function createFunctionArtifactInvoker(
 export async function createMiddlewareInvoker(
   options: CreateFunctionArtifactInvokerOptions
 ): Promise<RouterRuntimeHandlers['invokeMiddleware'] | undefined> {
-  if (!options.manifest.runtime?.middlewareOutputId) {
+  const middlewareOutputId = options.manifest.runtime?.middlewareOutputId;
+  if (!middlewareOutputId) {
     return undefined;
   }
 
-  // Try edge middleware first (most common)
-  const mod = await loadEdgeModule();
-  const edgeMiddleware = mod.createEdgeMiddlewareInvoker(options);
-  if (edgeMiddleware) {
-    return edgeMiddleware;
+  const middlewareOutput = options.manifest.functionMap.find(
+    (output) => output.id === middlewareOutputId
+  );
+  if (!middlewareOutput) {
+    return undefined;
   }
 
-  // Fall back to Node.js middleware
-  return createNodeMiddlewareInvoker(options) ?? undefined;
+  if (middlewareOutput.runtime === 'nodejs') {
+    return createNodeMiddlewareInvoker(options) ?? undefined;
+  }
+
+  if (middlewareOutput.runtime === 'edge') {
+    const mod = await loadEdgeModule();
+    return mod.createEdgeMiddlewareInvoker(options) ?? undefined;
+  }
+
+  return undefined;
 }
 
 export type { CreateFunctionArtifactInvokerOptions } from './function-invoker-shared.ts';
