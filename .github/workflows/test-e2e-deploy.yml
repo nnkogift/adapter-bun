@@ -53,12 +53,13 @@ jobs:
           path: |
             next.js
             adapter-bun
+            ~/.cache/ms-playwright
           key: build-${{ github.sha }}-${{ github.run_id }}
 
   test:
     name: Tests (${{ matrix.group }})
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-cores
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -88,6 +89,7 @@ jobs:
           path: |
             next.js
             adapter-bun
+            ~/.cache/ms-playwright
           key: build-${{ github.sha }}-${{ github.run_id }}
 
       - uses: actions/setup-node@v4
@@ -98,6 +100,10 @@ jobs:
 
       - name: Setup pnpm
         run: npm i -g corepack@0.31 && corepack enable
+
+      - name: Ensure Playwright browser
+        working-directory: next.js
+        run: pnpm playwright install chromium
 
       - name: Make scripts executable
         run:
