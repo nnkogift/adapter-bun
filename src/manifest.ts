@@ -83,6 +83,7 @@ export function buildDeploymentManifest({
   routerManifestPath,
   port,
   hostname,
+  previewProps,
 }: {
   adapterName: string;
   adapterOutDir: string;
@@ -95,6 +96,11 @@ export function buildDeploymentManifest({
   routerManifestPath: string;
   port: number;
   hostname: string;
+  previewProps?: BunDeploymentManifest['runtime'] extends infer Runtime
+    ? Runtime extends { previewProps?: infer Preview }
+      ? Preview
+      : never
+    : never;
 }): BunDeploymentManifest {
   const nodeFunctions = functionMap.filter(
     (artifact) => artifact.runtime === 'nodejs'
@@ -134,6 +140,7 @@ export function buildDeploymentManifest({
     pathnames,
     runtime: {
       middlewareOutputId,
+      previewProps: previewProps ?? null,
     },
     functionMap,
     staticAssets,

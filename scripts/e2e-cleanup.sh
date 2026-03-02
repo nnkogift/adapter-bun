@@ -24,6 +24,8 @@ fi
 
 # 2. Output server logs
 if [ -f ".adapter-server.log" ]; then
+  PERSIST_SERVER_LOG_PATH="${ADAPTER_BUN_PERSIST_SERVER_LOG:-/tmp/adapter-bun-last-server.log}"
+  cp ".adapter-server.log" "$PERSIST_SERVER_LOG_PATH" 2>/dev/null || true
   echo "=== .adapter-server.log ==="
   cat ".adapter-server.log"
   echo ""

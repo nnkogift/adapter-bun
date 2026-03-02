@@ -609,17 +609,14 @@ export async function stagePrerenderSeeds({
     if (fallback?.filePath) {
       const sourcePath = toAbsoluteSourcePath(repoRoot, fallback.filePath);
       fallbackSourcePath = sourcePath;
+      const extension = path.extname(sourcePath) || '.payload';
+      fallbackStagedPath = path.posix.join(seedRoot, `fallback${extension}`);
 
-      if (isPPR) {
-        const extension = path.extname(sourcePath) || '.payload';
-        fallbackStagedPath = path.posix.join(seedRoot, `fallback${extension}`);
-
-        await copyToOutDir({
-          sourcePath,
-          outDir,
-          relativePath: fallbackStagedPath,
-        });
-      }
+      await copyToOutDir({
+        sourcePath,
+        outDir,
+        relativePath: fallbackStagedPath,
+      });
     }
 
     seeds.push({

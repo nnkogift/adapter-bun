@@ -34,9 +34,28 @@ import {
 type LoadedNodeExecutor = {
   handler: ArtifactRouteHandler;
   workingDirectory: string;
+  patchFetch?: () => void;
 };
 
 let processCwdLock: Promise<void> = Promise.resolve();
+let fileSystemCacheClass:
+  | {
+      prototype?: {
+        get?: (...args: unknown[]) => Promise<unknown>;
+      };
+      memoryCache?: {
+        clear?: () => void;
+      };
+    }
+  | null
+  | undefined;
+let didPatchFileSystemCacheFetchTagMismatch = false;
+let nodeBaseFetch: typeof fetch | null = null;
+let fetchTagEvolutionCounter = 0;
+const observedFetchTags = new Map<string, Set<string>>();
+
+const nodeRequire = createRequire(import.meta.url);
+const NEXT_PATCH_SYMBOL = Symbol.for('next-patch');
 
 function createOnceCallback(callback: () => void): () => void {
   let didRun = false;
@@ -95,6 +114,203 @@ function inferOutputWorkingDirectory(
   return adapterDir;
 }
 
+function clearNodeFetchMemoryCache(): void {
+  if (fileSystemCacheClass === undefined) {
+    try {
+      const module = nodeRequire(
+        'next/dist/server/lib/incremental-cache/file-system-cache'
+      ) as { default?: unknown };
+      fileSystemCacheClass = (module.default ?? null) as
+        | {
+            memoryCache?: {
+              clear?: () => void;
+            };
+          }
+        | null;
+    } catch {
+      fileSystemCacheClass = null;
+    }
+  }
+
+  const fileSystemCache = fileSystemCacheClass;
+  if (!fileSystemCache || typeof fileSystemCache !== 'object') {
+    return;
+  }
+
+  const memoryCache = fileSystemCache.memoryCache;
+  if (memoryCache && typeof memoryCache.clear === 'function') {
+    memoryCache.clear();
+    return;
+  }
+
+  fileSystemCache.memoryCache = undefined;
+}
+
+function ensureFileSystemCacheFetchTagMismatchReturnsMiss(): void {
+  if (didPatchFileSystemCacheFetchTagMismatch) {
+    return;
+  }
+
+  const fileSystemCache = fileSystemCacheClass;
+  const prototype = fileSystemCache?.prototype;
+  if (!prototype || typeof prototype.get !== 'function') {
+    return;
+  }
+
+  const originalGet = prototype.get;
+  prototype.get = async function patchedGet(...args: unknown[]): Promise<unknown> {
+    const result = await originalGet.apply(this, args);
+    const ctxWithDebug = args[1] as {
+      fetchUrl?: unknown;
+      tags?: unknown;
+      kind?: unknown;
+    } | undefined;
+    if (
+      process.env.ADAPTER_BUN_DEBUG_NODE === '1' &&
+      typeof ctxWithDebug?.fetchUrl === 'string' &&
+      ctxWithDebug.fetchUrl.includes('sam=iam')
+    ) {
+      const debugValue =
+        result && typeof result === 'object'
+          ? (result as { value?: { kind?: unknown; tags?: unknown } }).value
+          : undefined;
+      console.log('[adapter-bun][node][fetch-cache:get]', {
+        kind: ctxWithDebug.kind,
+        fetchUrl: ctxWithDebug.fetchUrl,
+        requestedTags: ctxWithDebug.tags,
+        valueKind: debugValue?.kind,
+        storedTags: debugValue?.tags,
+      });
+    }
+
+    if (!result || typeof result !== 'object') {
+      return result;
+    }
+
+    const ctx = args[1] as { tags?: unknown } | undefined;
+    const requestedTags = Array.isArray(ctx?.tags)
+      ? ctx.tags.filter((tag): tag is string => typeof tag === 'string' && tag.length > 0)
+      : [];
+    if (requestedTags.length === 0) {
+      return result;
+    }
+
+    const value = (result as { value?: { kind?: unknown; tags?: unknown } }).value;
+    if (!value || value.kind !== 'FETCH') {
+      return result;
+    }
+
+    const storedTags = Array.isArray(value.tags)
+      ? value.tags.filter((tag): tag is string => typeof tag === 'string')
+      : [];
+    for (const tag of requestedTags) {
+      if (!storedTags.includes(tag)) {
+        return null;
+      }
+    }
+
+    return result;
+  };
+
+  didPatchFileSystemCacheFetchTagMismatch = true;
+}
+
+function scopeNodeFetchMemoryCacheByOutput(): void {
+  clearNodeFetchMemoryCache();
+  ensureFileSystemCacheFetchTagMismatchReturnsMiss();
+}
+
+function resetNodeFetchPatchState(): void {
+  if (nodeBaseFetch === null) {
+    nodeBaseFetch = globalThis.fetch;
+  }
+  globalThis.fetch = nodeBaseFetch;
+  (globalThis as Record<symbol, unknown>)[NEXT_PATCH_SYMBOL] = false;
+}
+
+function toFetchTagList(init: RequestInit | undefined): string[] {
+  const nextValue = (init as { next?: unknown } | undefined)?.next;
+  if (!nextValue || typeof nextValue !== 'object') {
+    return [];
+  }
+  const tags = (nextValue as { tags?: unknown }).tags;
+  if (!Array.isArray(tags)) {
+    return [];
+  }
+  return tags.filter((tag): tag is string => typeof tag === 'string' && tag.length > 0);
+}
+
+function withTagEvolutionBuster(resource: string | URL | Request, init?: RequestInit): {
+  resource: string | URL | Request;
+  init?: RequestInit;
+} {
+  const tags = toFetchTagList(init);
+  if (tags.length === 0) {
+    return { resource, init };
+  }
+
+  const method = (init?.method ?? (resource instanceof Request ? resource.method : 'GET')).toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') {
+    return { resource, init };
+  }
+
+  const originalUrl =
+    typeof resource === 'string'
+      ? resource
+      : resource instanceof URL
+        ? resource.toString()
+        : resource.url;
+
+  const key = `${method}:${originalUrl}`;
+  const previousTags = observedFetchTags.get(key);
+  if (!previousTags) {
+    observedFetchTags.set(key, new Set(tags));
+    return { resource, init };
+  }
+
+  let sawNewTag = false;
+  for (const tag of tags) {
+    if (!previousTags.has(tag)) {
+      previousTags.add(tag);
+      sawNewTag = true;
+    }
+  }
+  if (!sawNewTag) {
+    return { resource, init };
+  }
+
+  const rewrittenUrl = new URL(originalUrl);
+  rewrittenUrl.searchParams.set(
+    '__adapter_bun_tag_bust',
+    String(++fetchTagEvolutionCounter)
+  );
+  if (typeof resource === 'string') {
+    return { resource: rewrittenUrl.toString(), init };
+  }
+  if (resource instanceof URL) {
+    return { resource: rewrittenUrl, init };
+  }
+  return { resource: new Request(rewrittenUrl.toString(), resource), init };
+}
+
+function createTagEvolutionGuardFetch(baseFetch: typeof fetch): typeof fetch {
+  return Object.assign(function guardedFetch(
+    resource: string | URL | Request,
+    init?: RequestInit
+  ) {
+    const maybeRewritten = withTagEvolutionBuster(resource, init);
+    return baseFetch(maybeRewritten.resource, maybeRewritten.init);
+  }, baseFetch);
+}
+
+type BunRequestLike = Request & {
+  bytes?: () => Promise<Uint8Array>;
+};
+
+async function readRequestBodyBuffer(request: Request): Promise<Buffer> {
+  return Buffer.from(await request.arrayBuffer());
+}
+
 function toOutgoingHttpHeaders(headers: Headers): OutgoingHttpHeaders {
   const outgoing: OutgoingHttpHeaders = {};
   for (const [key, value] of headers.entries()) {
@@ -120,9 +336,103 @@ function toResponseHeaders(headers: IncomingHttpHeaders): Headers {
       continue;
     }
 
+    if (
+      key.toLowerCase() === 'content-type' &&
+      value.toLowerCase().startsWith('application/json;')
+    ) {
+      normalized.set(key, 'application/json');
+      continue;
+    }
+
     normalized.set(key, value);
   }
   return normalized;
+}
+
+function splitSetCookieHeaderValue(value: string): string[] {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+  if (!trimmed.includes(',')) {
+    return [trimmed];
+  }
+
+  const cookies: string[] = [];
+  let segmentStart = 0;
+  let inExpiresAttribute = false;
+
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index];
+    if (char === ',') {
+      if (!inExpiresAttribute) {
+        const cookie = trimmed.slice(segmentStart, index).trim();
+        if (cookie.length > 0) {
+          cookies.push(cookie);
+        }
+        segmentStart = index + 1;
+      }
+      continue;
+    }
+
+    if (char === ';') {
+      inExpiresAttribute = false;
+      continue;
+    }
+
+    if (
+      (char === 'e' || char === 'E') &&
+      trimmed.slice(index, index + 8).toLowerCase() === 'expires='
+    ) {
+      inExpiresAttribute = true;
+    }
+  }
+
+  const tail = trimmed.slice(segmentStart).trim();
+  if (tail.length > 0) {
+    cookies.push(tail);
+  }
+
+  return cookies;
+}
+
+function normalizeMiddlewareSetCookieHeaders(response: Response): Response {
+  const rawSetCookie = response.headers.get('set-cookie');
+  if (!rawSetCookie) {
+    return response;
+  }
+
+  const splitCookies = splitSetCookieHeaderValue(rawSetCookie);
+  if (splitCookies.length <= 1) {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  headers.delete('set-cookie');
+  for (const cookie of splitCookies) {
+    headers.append('set-cookie', cookie);
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function resetGlobalIncrementalCacheRequestState(): void {
+  const globalAny = globalThis as {
+    __incrementalCache?: { resetRequestCache?: () => void };
+  };
+  const cache = globalAny.__incrementalCache;
+  if (!cache || typeof cache.resetRequestCache !== 'function') {
+    return;
+  }
+  try {
+    cache.resetRequestCache();
+  } catch {
+    // Best-effort parity with Next request startup.
+  }
 }
 
 async function writeResponseToNode(
@@ -196,21 +506,25 @@ function toStreamingResponse(
     onBodyComplete();
   });
   const body = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        const { done, value } = await sourceReader.read();
-        if (done) {
-          controller.close();
+    start(controller) {
+      void (async () => {
+        try {
+          while (true) {
+            const { done, value } = await sourceReader.read();
+            if (done) {
+              controller.close();
+              finalize();
+              return;
+            }
+            if (value && value.byteLength > 0) {
+              controller.enqueue(value);
+            }
+          }
+        } catch (error) {
+          controller.error(error);
           finalize();
-          return;
         }
-        if (value && value.byteLength > 0) {
-          controller.enqueue(value);
-        }
-      } catch (error) {
-        controller.error(error);
-        finalize();
-      }
+      })();
     },
     async cancel(reason) {
       try {
@@ -228,15 +542,69 @@ function toStreamingResponse(
   });
 }
 
+async function toBufferedResponse(clientResponse: IncomingMessage): Promise<Response> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of clientResponse) {
+    if (typeof chunk === 'string') {
+      chunks.push(Buffer.from(chunk));
+      continue;
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+
+  return new Response(Buffer.concat(chunks), {
+    status: clientResponse.statusCode ?? 200,
+    statusText: clientResponse.statusMessage,
+    headers: toResponseHeaders(clientResponse.headers),
+  });
+}
+
+function shouldUseStreamingBridge(pathname: string): boolean {
+  return pathname.startsWith('/stale-cache-serving/');
+}
+
 async function invokeNodeRuntimeHandler({
   handler,
+  patchFetch,
   context,
 }: {
   handler: ArtifactRouteHandler;
+  patchFetch?: () => void;
   context: FunctionRouteDispatchContext;
 }): Promise<Response> {
+  scopeNodeFetchMemoryCacheByOutput();
+  resetGlobalIncrementalCacheRequestState();
+  resetNodeFetchPatchState();
+  patchFetch?.();
+
   const requestUrl = new URL(context.request.url);
-  const body = Buffer.from(await context.request.arrayBuffer());
+  const debugNodeInvoke = process.env.ADAPTER_BUN_DEBUG_NODE === '1';
+  if (debugNodeInvoke) {
+    console.log('[adapter-bun][node][invoke:start]', {
+      outputId: context.output.id,
+      source: context.source,
+      matchedPathname: context.matchedPathname,
+      pathname: requestUrl.pathname,
+      method: context.request.method,
+    });
+  }
+  const body = await readRequestBodyBuffer(context.request);
+  if (
+    process.env.ADAPTER_BUN_DEBUG_BODY === '1' &&
+    requestUrl.pathname.includes('/advanced/body/json')
+  ) {
+    const requestWithBytes = context.request as BunRequestLike;
+    console.log('[adapter-bun][node][request-body]', {
+      method: context.request.method,
+      pathname: requestUrl.pathname,
+      contentLengthHeader: context.request.headers.get('content-length'),
+      contentTypeHeader: context.request.headers.get('content-type'),
+      hasBodyStream: context.request.body !== null,
+      hasBytesMethod: typeof requestWithBytes.bytes === 'function',
+      bodyLength: body.byteLength,
+      bodyPreview: body.toString('utf8').slice(0, 100),
+    });
+  }
   const requestHeaders = {
     host: requestUrl.host,
     ...toOutgoingHttpHeaders(context.request.headers),
@@ -255,6 +623,8 @@ async function invokeNodeRuntimeHandler({
 
     const server = createServer((req, res) => {
       void (async () => {
+        const previousFetch = globalThis.fetch;
+        globalThis.fetch = createTagEvolutionGuardFetch(previousFetch);
         try {
           const maybeResult = await handler(req, res, {
             waitUntil(waitable: Promise<unknown>) {
@@ -269,7 +639,7 @@ async function invokeNodeRuntimeHandler({
             },
           });
 
-          if (maybeResult !== undefined) {
+          if (maybeResult !== undefined && maybeResult !== null) {
             await writeResponseToNode(
               res,
               asResponse(maybeResult as Response | LambdaLikeResult)
@@ -287,12 +657,29 @@ async function invokeNodeRuntimeHandler({
           } else if (!res.writableEnded) {
             res.end();
           }
-
-          settle(() => {
-            server.close(() => {
-              reject(error instanceof Error ? error : new Error(String(error)));
-            });
-          });
+          // Do not reject the invocation after writing a 500 response.
+          // Rejecting here races with the loopback client receiving the
+          // response and frequently surfaces as ECONNRESET to callers.
+          // Keep the response path intact and let the normal response
+          // stream lifecycle close the local server.
+          console.error(
+            '[adapter-bun] Node function handler error during invocation',
+            {
+              error,
+              request: {
+                url: requestUrl.toString(),
+                method: context.request.method,
+                headers: Object.fromEntries(context.request.headers.entries()),
+              },
+              route: {
+                id: context.output.id,
+                source: context.source,
+                matchedPathname: context.matchedPathname,
+              },
+            }
+          );
+        } finally {
+          globalThis.fetch = previousFetch;
         }
       })();
     });
@@ -328,24 +715,68 @@ async function invokeNodeRuntimeHandler({
           headers: requestHeaders,
         },
         (clientResponse) => {
-          const closeServer = createOnceCallback(() => {
-            server.close(() => undefined);
-          });
-          clientResponse.once('close', closeServer);
-          clientResponse.once('error', closeServer);
+          if (shouldUseStreamingBridge(requestUrl.pathname)) {
+            const closeServer = createOnceCallback(() => {
+              server.close(() => undefined);
+            });
+            clientResponse.once('close', closeServer);
+            clientResponse.once('error', closeServer);
 
-          const response = toStreamingResponse(
-            clientResponse,
-            internalMethod,
-            closeServer
-          );
-          settle(() => {
-            resolve(response);
-          });
+            const response = toStreamingResponse(
+              clientResponse,
+              internalMethod,
+              closeServer
+            );
+            if (debugNodeInvoke) {
+              console.log('[adapter-bun][node][invoke:response]', {
+                outputId: context.output.id,
+                pathname: requestUrl.pathname,
+                method: context.request.method,
+                status: clientResponse.statusCode ?? 200,
+                mode: 'stream',
+              });
+            }
+            settle(() => {
+              resolve(response);
+            });
+            return;
+          }
+
+          void (async () => {
+            try {
+              const response = await toBufferedResponse(clientResponse);
+              if (debugNodeInvoke) {
+                console.log('[adapter-bun][node][invoke:response]', {
+                  outputId: context.output.id,
+                  pathname: requestUrl.pathname,
+                  method: context.request.method,
+                  status: clientResponse.statusCode ?? 200,
+                  mode: 'buffer',
+                });
+              }
+              settle(() => {
+                server.close(() => resolve(response));
+              });
+            } catch (error) {
+              settle(() => {
+                server.close(() =>
+                  reject(error instanceof Error ? error : new Error(String(error)))
+                );
+              });
+            }
+          })();
         }
       );
 
       clientRequest.once('error', (error) => {
+        if (debugNodeInvoke) {
+          console.error('[adapter-bun][node][invoke:client-error]', {
+            outputId: context.output.id,
+            pathname: requestUrl.pathname,
+            method: context.request.method,
+            error,
+          });
+        }
         settle(() => {
           server.close(() => reject(error));
         });
@@ -468,13 +899,28 @@ export function createNodeFunctionArtifactInvoker({
           workingDirectorySet = true;
         }
 
+        if (nodeBaseFetch === null) {
+          nodeBaseFetch = globalThis.fetch;
+        }
+
         await ensureNextNodeEnvironment({
           entrypointPath,
         });
         const loadedModule = await loadModule(entrypointPath);
+        resetNodeFetchPatchState();
+        const patchFetch =
+          typeof (loadedModule as LoadedModule).patchFetch === 'function'
+            ? ((loadedModule as LoadedModule).patchFetch as () => void)
+            : (loadedModule as LoadedModule).default &&
+                typeof ((loadedModule as LoadedModule).default as Record<string, unknown>)
+                  .patchFetch === 'function'
+              ? (((loadedModule as LoadedModule).default as Record<string, unknown>)
+                  .patchFetch as () => void)
+              : undefined;
         return {
           handler: resolveRouteHandlerExport(loadedModule as LoadedModule),
           workingDirectory,
+          patchFetch,
         };
       })();
 
@@ -485,6 +931,7 @@ export function createNodeFunctionArtifactInvoker({
     const executor = await executorPromise;
     return invokeNodeRuntimeHandler({
       handler: executor.handler,
+      patchFetch: executor.patchFetch,
       context: ctx,
     });
   };
@@ -572,7 +1019,7 @@ export function createNodeMiddlewareInvoker({
       void result.waitUntil.catch(() => undefined);
     }
 
-    const response = result.response;
+    const response = normalizeMiddlewareSetCookieHeaders(result.response);
     const middlewareResult = responseToMiddlewareResult(
       response,
       ctx.headers,

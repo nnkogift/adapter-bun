@@ -54,6 +54,15 @@ const INTERNAL_MIDDLEWARE_REQUEST_HEADERS = new Set([
   'next-hmr-refresh',
   'next-router-segment-prefetch',
 ]);
+const UNTRUSTED_MIDDLEWARE_REQUEST_HEADERS = new Set([
+  'x-middleware-set-cookie',
+  'x-middleware-override-headers',
+  'x-middleware-rewrite',
+  'x-middleware-next',
+  'x-middleware-redirect',
+  'x-middleware-refresh',
+]);
+const UNTRUSTED_MIDDLEWARE_REQUEST_HEADER_PREFIXES = ['x-middleware-request-'];
 const STATIC_FILE_EXTENSION_PATTERN =
   /\.(?:avif|bmp|css|gif|ico|jpe?g|js|json|map|mjs|png|svg|txt|webmanifest|webp|woff2?|xml)$/i;
 
@@ -66,6 +75,53 @@ function normalizeContentType(value: string | null): string {
     return '';
   }
   return value.split(';', 1)[0]?.trim().toLowerCase() ?? '';
+}
+
+function splitSetCookieHeaderValue(value: string): string[] {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+  if (!trimmed.includes(',')) {
+    return [trimmed];
+  }
+
+  const cookies: string[] = [];
+  let segmentStart = 0;
+  let inExpiresAttribute = false;
+
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index];
+    if (char === ',') {
+      if (!inExpiresAttribute) {
+        const cookie = trimmed.slice(segmentStart, index).trim();
+        if (cookie.length > 0) {
+          cookies.push(cookie);
+        }
+        segmentStart = index + 1;
+      }
+      continue;
+    }
+
+    if (char === ';') {
+      inExpiresAttribute = false;
+      continue;
+    }
+
+    if (
+      (char === 'e' || char === 'E') &&
+      trimmed.slice(index, index + 8).toLowerCase() === 'expires='
+    ) {
+      inExpiresAttribute = true;
+    }
+  }
+
+  const tail = trimmed.slice(segmentStart).trim();
+  if (tail.length > 0) {
+    cookies.push(tail);
+  }
+
+  return cookies;
 }
 
 function withDefaultRscVaryHeader(existingValue: string | null): string {
@@ -145,9 +201,9 @@ function maybeResolveNextDataFallbackPathname({
 
   for (const candidatePathname of candidatePathnames) {
     if (
-      indexes.staticByPathname.has(candidatePathname) ||
+      indexes.functionByPathname.has(candidatePathname) ||
       indexes.prerenderByPathname.has(candidatePathname) ||
-      indexes.functionByPathname.has(candidatePathname)
+      indexes.staticByPathname.has(candidatePathname)
     ) {
       return candidatePathname;
     }
@@ -298,6 +354,50 @@ function resolveNextDataRewriteHeader({
   return `${nextDataPathnameWithBasePath}${rewriteUrl.search}`;
 }
 
+function normalizeMiddlewareInvocationUrl({
+  url,
+  headers,
+  basePath,
+  buildId,
+}: {
+  url: URL;
+  headers: Headers;
+  basePath: string;
+  buildId: string;
+}): URL {
+  if (headers.get('x-nextjs-data') !== '1') {
+    return url;
+  }
+
+  const pathnameWithoutBasePath =
+    basePath && url.pathname.startsWith(`${basePath}/`)
+      ? url.pathname.slice(basePath.length)
+      : url.pathname;
+  const nextDataPrefix = `/_next/data/${buildId}/`;
+  if (
+    !pathnameWithoutBasePath.startsWith(nextDataPrefix) ||
+    !pathnameWithoutBasePath.endsWith('.json')
+  ) {
+    return url;
+  }
+
+  const encodedPath = pathnameWithoutBasePath
+    .slice(nextDataPrefix.length, -'.json'.length)
+    .replace(/\/+/g, '/')
+    .replace(/^\/+/, '');
+  let normalizedPath = encodedPath;
+  if (normalizedPath === 'index') {
+    normalizedPath = '';
+  } else if (normalizedPath.endsWith('/index')) {
+    normalizedPath = normalizedPath.slice(0, -'/index'.length);
+  }
+
+  const nextPathname = normalizedPath.length > 0 ? `/${normalizedPath}` : '/';
+  const normalizedUrl = new URL(url.toString());
+  normalizedUrl.pathname = basePath ? `${basePath}${nextPathname}` : nextPathname;
+  return normalizedUrl;
+}
+
 function withResolvedHeader(
   resolution: RouteResolutionResult,
   key: string,
@@ -397,7 +497,9 @@ function applyResolutionToResponse(
     for (const [key, value] of resolution.resolvedHeaders.entries()) {
       const normalizedKey = key.toLowerCase();
       if (normalizedKey === 'x-middleware-set-cookie') {
-        headers.append('set-cookie', value);
+        for (const cookie of splitSetCookieHeaderValue(value)) {
+          headers.append('set-cookie', cookie);
+        }
         continue;
       }
       if (normalizedKey === 'cache-control' && hasExplicitCacheControl) {
@@ -436,11 +538,32 @@ function withHeader(response: Response, key: string, value: string): Response {
   });
 }
 
+function withRscVaryForRequest(response: Response, request: Request): Response {
+  if (request.headers.get('rsc') !== '1') {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  headers.set('vary', withDefaultRscVaryHeader(headers.get('vary')));
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 function withCacheState(
   response: Response,
   cacheState: PrerenderCacheState
 ): Response {
-  return withHeader(response, 'x-bun-cache', cacheState);
+  const headers = new Headers(response.headers);
+  headers.set('x-bun-cache', cacheState);
+  headers.set('x-nextjs-cache', cacheState);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function withRouteMetadata(
@@ -534,19 +657,22 @@ function maybeResolveRscMatchedPathname({
     }
   }
 
-  if (hasOutputPathname(matchedPathname)) {
-    return matchedPathname;
-  }
-  if (basePathname !== matchedPathname && hasOutputPathname(basePathname)) {
-    return basePathname;
-  }
-
+  // For RSC document/data requests we must prefer the concrete `.rsc` seed
+  // path when available (e.g. `/blog/tim.rsc`) before the HTML seed path
+  // (`/blog/tim`) to avoid HTML/RSC prerender cache key collisions.
   const rscCandidatePathname = `${basePathname}${rsc.suffix}`;
   if (
     hasOutputPathname(rscCandidatePathname) &&
     indexes.functionByPathname.get(rscCandidatePathname)?.runtime !== 'edge'
   ) {
     return rscCandidatePathname;
+  }
+
+  if (hasOutputPathname(matchedPathname)) {
+    return matchedPathname;
+  }
+  if (basePathname !== matchedPathname && hasOutputPathname(basePathname)) {
+    return basePathname;
   }
 
   return matchedPathname;
@@ -603,7 +729,18 @@ const PRERENDER_CONTROL_HEADERS = [
   NEXT_CACHE_REVALIDATE_TAG_TOKEN_HEADER,
 ];
 
-function toPrerenderCacheKeyRequest(request: Request): Request {
+function toPrerenderCacheKeyRequest(
+  request: Request,
+  matchedPathname?: string
+): Request {
+  const sourceUrl = new URL(request.url);
+  const shouldRewritePathname =
+    typeof matchedPathname === 'string' &&
+    matchedPathname.length > 0 &&
+    !matchedPathname.includes('[') &&
+    (isRscPathname(matchedPathname) || isNextDataPathname(matchedPathname)) &&
+    sourceUrl.pathname !== matchedPathname;
+
   let needsStrip = false;
   for (const header of PRERENDER_CONTROL_HEADERS) {
     if (request.headers.has(header)) {
@@ -611,14 +748,21 @@ function toPrerenderCacheKeyRequest(request: Request): Request {
       break;
     }
   }
-  if (!needsStrip) {
+  if (!needsStrip && !shouldRewritePathname) {
     return request;
   }
+
   const headers = new Headers(request.headers);
   for (const header of PRERENDER_CONTROL_HEADERS) {
     headers.delete(header);
   }
-  return new Request(request.url, { method: request.method, headers });
+
+  const url = new URL(sourceUrl.toString());
+  if (shouldRewritePathname && typeof matchedPathname === 'string') {
+    url.pathname = matchedPathname;
+  }
+
+  return new Request(url.toString(), { method: request.method, headers });
 }
 
 function readSeedBypassToken(seed: BunPrerenderSeed): string | null {
@@ -1115,11 +1259,89 @@ function indexByPathname<T extends { pathname: string; id: string }>(
   return byPathname;
 }
 
+function splitPathname(pathname: string): string[] {
+  const trimmed = pathname.replace(/^\/+|\/+$/g, '');
+  if (!trimmed) {
+    return [];
+  }
+  return trimmed.split('/');
+}
+
+function isDynamicPathSegment(segment: string): boolean {
+  return (
+    /^\[[^\]]+\]$/.test(segment) ||
+    /^\[\.\.\.[^\]]+\]$/.test(segment) ||
+    /^\[\[\.\.\.[^\]]+\]\]$/.test(segment)
+  );
+}
+
+function isPathPatternAncestor({
+  ancestorPathname,
+  descendantPathname,
+}: {
+  ancestorPathname: string;
+  descendantPathname: string;
+}): boolean {
+  const ancestorSegments = splitPathname(ancestorPathname);
+  const descendantSegments = splitPathname(descendantPathname);
+  if (ancestorSegments.length > descendantSegments.length) {
+    return false;
+  }
+
+  for (let index = 0; index < ancestorSegments.length; index += 1) {
+    const ancestorSegment = ancestorSegments[index];
+    const descendantSegment = descendantSegments[index];
+    if (!ancestorSegment || !descendantSegment) {
+      return false;
+    }
+    if (isDynamicPathSegment(ancestorSegment)) {
+      continue;
+    }
+    if (ancestorSegment !== descendantSegment) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function deriveAncestorSeedPathname({
+  requestPathname,
+  ancestorPathname,
+}: {
+  requestPathname: string;
+  ancestorPathname: string;
+}): string | null {
+  const requestSegments = splitPathname(requestPathname);
+  const ancestorSegments = splitPathname(ancestorPathname);
+  if (requestSegments.length < ancestorSegments.length) {
+    return null;
+  }
+
+  for (let index = 0; index < ancestorSegments.length; index += 1) {
+    const ancestorSegment = ancestorSegments[index];
+    const requestSegment = requestSegments[index];
+    if (!ancestorSegment || !requestSegment) {
+      return null;
+    }
+    if (isDynamicPathSegment(ancestorSegment)) {
+      continue;
+    }
+    if (ancestorSegment !== requestSegment) {
+      return null;
+    }
+  }
+
+  const candidate = requestSegments.slice(0, ancestorSegments.length).join('/');
+  return candidate ? `/${candidate}` : '/';
+}
+
 type RouteIndexes = {
   staticByPathname: Map<string, BunStaticAsset>;
   functionByPathname: Map<string, BunFunctionArtifact>;
   functionById: Map<string, BunFunctionArtifact>;
   prerenderByPathname: Map<string, BunPrerenderSeed>;
+  strictDynamicAncestorSeedPaths: Map<string, Set<string>>;
 };
 
 function buildRouteIndexes(manifest: BunDeploymentManifest): RouteIndexes {
@@ -1141,12 +1363,44 @@ function buildRouteIndexes(manifest: BunDeploymentManifest): RouteIndexes {
     functionById.set(output.id, output);
   }
 
+  const strictDynamicAncestorSeedPaths = new Map<string, Set<string>>();
+  for (const seed of manifest.prerenderSeeds) {
+    if (seed.parentFallbackMode !== false) {
+      continue;
+    }
+    const parentOutput = functionById.get(seed.parentOutputId);
+    if (!parentOutput || !parentOutput.pathname.includes('[')) {
+      continue;
+    }
+    const existing = strictDynamicAncestorSeedPaths.get(parentOutput.pathname);
+    if (existing) {
+      existing.add(seed.pathname);
+      continue;
+    }
+    strictDynamicAncestorSeedPaths.set(
+      parentOutput.pathname,
+      new Set([seed.pathname])
+    );
+  }
+
   return {
     staticByPathname,
     functionByPathname,
     functionById,
     prerenderByPathname,
+    strictDynamicAncestorSeedPaths,
   };
+}
+
+function hasOutputPathname(
+  indexes: RouteIndexes,
+  pathname: string
+): boolean {
+  return (
+    indexes.staticByPathname.has(pathname) ||
+    indexes.prerenderByPathname.has(pathname) ||
+    indexes.functionByPathname.has(pathname)
+  );
 }
 
 function isRedirectResolution(resolution: RouteResolutionResult): boolean {
@@ -1260,6 +1514,33 @@ function toPrerenderParentRequest({
   });
 }
 
+function shouldBypassPrerenderAllowListFiltering(request: Request): boolean {
+  if (request.headers.get('rsc') === '1') {
+    return true;
+  }
+
+  const url = new URL(request.url);
+  if (url.searchParams.has('_rsc')) {
+    return true;
+  }
+
+  const pathname = url.pathname.toLowerCase();
+  return pathname.endsWith('.rsc') || pathname.includes('.segment.rsc');
+}
+
+function maybeFilterPrerenderRequestByAllowLists({
+  seed,
+  request,
+}: {
+  seed: BunPrerenderSeed;
+  request: Request;
+}): Request {
+  if (shouldBypassPrerenderAllowListFiltering(request)) {
+    return request;
+  }
+  return filterPrerenderRequestByAllowLists(seed, request);
+}
+
 function createFallbackBodyConcatenatedResponse({
   fallbackResponse,
   resumeResponse,
@@ -1364,6 +1645,33 @@ function stripInternalMiddlewareRequestHeaders(headers: Headers): Headers {
   return sanitized;
 }
 
+function sanitizeIncomingMiddlewareRequestHeaders(headers: Headers): {
+  headers: Headers;
+  didStrip: boolean;
+} {
+  const sanitized = new Headers(headers);
+  let didStrip = false;
+
+  for (const [key] of headers.entries()) {
+    const normalizedKey = key.toLowerCase();
+    const shouldStripByName = UNTRUSTED_MIDDLEWARE_REQUEST_HEADERS.has(normalizedKey);
+    const shouldStripByPrefix = UNTRUSTED_MIDDLEWARE_REQUEST_HEADER_PREFIXES.some(
+      (prefix) => normalizedKey.startsWith(prefix)
+    );
+    if (!shouldStripByName && !shouldStripByPrefix) {
+      continue;
+    }
+
+    didStrip = true;
+    sanitized.delete(key);
+  }
+
+  return {
+    headers: sanitized,
+    didStrip,
+  };
+}
+
 function collectInternalMiddlewareRequestHeaders(headers: Headers): Headers {
   const internal = new Headers();
   for (const header of INTERNAL_MIDDLEWARE_REQUEST_HEADERS) {
@@ -1442,6 +1750,28 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
   return {
     manifest,
     async handleRequest(request: Request): Promise<Response> {
+      if (
+        process.env.ADAPTER_BUN_DEBUG_BODY === '1' &&
+        request.method.toUpperCase() === 'OPTIONS'
+      ) {
+        const debugUrl = new URL(request.url);
+        if (debugUrl.pathname.includes('/advanced/body/json')) {
+          let ingressBodyLength = -1;
+          try {
+            ingressBodyLength = (await request.clone().arrayBuffer()).byteLength;
+          } catch {
+            ingressBodyLength = -2;
+          }
+          console.log('[adapter-bun][router][ingress-body]', {
+            method: request.method,
+            pathname: debugUrl.pathname,
+            contentLengthHeader: request.headers.get('content-length'),
+            contentTypeHeader: request.headers.get('content-type'),
+            hasBodyStream: request.body !== null,
+            ingressBodyLength,
+          });
+        }
+      }
       const onDemandRevalidate = parseOnDemandRevalidateRequest({
         request,
         revalidateAuthToken: options.revalidateAuthToken,
@@ -1465,49 +1795,123 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       let middlewareResponse: Response | null = null;
       let middlewareRewriteUrl: URL | null = null;
       let middlewareRequestHeaders: Headers | null = null;
+      const {
+        headers: incomingRequestHeaders,
+        didStrip: didStripIncomingMiddlewareHeaders,
+      } = sanitizeIncomingMiddlewareRequestHeaders(request.headers);
       const internalMiddlewareRequestHeaders =
-        collectInternalMiddlewareRequestHeaders(request.headers);
+        collectInternalMiddlewareRequestHeaders(incomingRequestHeaders);
+      const debugMiddleware =
+        process.env.ADAPTER_BUN_DEBUG_MW === '1' ||
+        process.env.ADAPTER_BUN_DEBUG_BODY === '1';
 
       const unresolvedResolution = await resolveRoutes({
         url: new URL(request.url),
         buildId: manifest.build.buildId,
         basePath: manifest.build.basePath,
         requestBody: request.body ?? createEmptyBodyStream(),
-        headers: new Headers(request.headers),
+        headers: new Headers(incomingRequestHeaders),
         pathnames: manifest.pathnames,
         i18n: toResolutionI18nConfig(manifest),
         routes: toResolutionRoutes(manifest),
         invokeMiddleware: async (ctx) => {
+          const normalizedMiddlewareUrl = normalizeMiddlewareInvocationUrl({
+            url: ctx.url,
+            headers: ctx.headers,
+            basePath: manifest.build.basePath,
+            buildId: manifest.build.buildId,
+          });
           const middlewareCtx = {
             ...ctx,
+            url: normalizedMiddlewareUrl,
             headers: stripInternalMiddlewareRequestHeaders(ctx.headers),
           };
           const result: RouterMiddlewareResult | {} =
             (await options.invokeMiddleware?.(middlewareCtx)) ?? {};
+          let restoredRequestHeaders: Headers | null = null;
 
           if ('rewrite' in result && result.rewrite instanceof URL) {
             middlewareRewriteUrl = result.rewrite;
           }
           if ('requestHeaders' in result && result.requestHeaders instanceof Headers) {
-            middlewareRequestHeaders = restoreInternalMiddlewareRequestHeaders({
+            restoredRequestHeaders = restoreInternalMiddlewareRequestHeaders({
               requestHeaders: result.requestHeaders,
               internalHeaders: internalMiddlewareRequestHeaders,
             });
+            middlewareRequestHeaders = restoredRequestHeaders;
           }
           if ('response' in result && result.response) {
             middlewareResponse = result.response;
           }
-          return stripMiddlewareResponse(result);
+          if (debugMiddleware) {
+            const debugUrl = new URL(ctx.url.toString());
+            if (
+              debugUrl.pathname.includes('/rewrite-to-app') ||
+              debugUrl.searchParams.has('draft')
+            ) {
+              const responseHeaders =
+                'response' in result && result.response
+                  ? Object.fromEntries(result.response.headers.entries())
+                  : null;
+              console.log('[adapter-bun][middleware][result]', {
+                url: debugUrl.toString(),
+                hasRewrite:
+                  'rewrite' in result && result.rewrite instanceof URL,
+                rewrite:
+                  'rewrite' in result && result.rewrite instanceof URL
+                    ? result.rewrite.toString()
+                    : null,
+                requestHeaders:
+                  'requestHeaders' in result && result.requestHeaders instanceof Headers
+                    ? Object.fromEntries(result.requestHeaders.entries())
+                    : null,
+                responseHeaders,
+              });
+            }
+          }
+          const middlewareResult = stripMiddlewareResponse(result);
+          if (restoredRequestHeaders) {
+            return {
+              ...middlewareResult,
+              requestHeaders: restoredRequestHeaders,
+            };
+          }
+          return middlewareResult;
         },
       });
 
       let resolution = stripRequestHeaderEchoes({
         resolution: unresolvedResolution,
-        requestHeaders: request.headers,
+        requestHeaders: incomingRequestHeaders,
       });
+      const resolvedMiddlewareRequestHeaders =
+        middlewareRequestHeaders as Headers | null;
+      const resolvedMiddlewareRewriteUrl =
+        middlewareRewriteUrl as URL | null;
+      if (debugMiddleware) {
+        const debugUrl = new URL(request.url);
+        if (
+          debugUrl.pathname.includes('/rewrite-to-app') ||
+          debugUrl.searchParams.has('draft')
+        ) {
+          console.log('[adapter-bun][middleware][resolution]', {
+            requestUrl: debugUrl.toString(),
+            matchedPathname: unresolvedResolution.matchedPathname ?? null,
+            routeMatches: unresolvedResolution.routeMatches ?? null,
+            middlewareRewriteUrl:
+              resolvedMiddlewareRewriteUrl?.toString() ?? null,
+            middlewareRequestHeaders: resolvedMiddlewareRequestHeaders
+              ? Object.fromEntries(resolvedMiddlewareRequestHeaders.entries())
+              : null,
+            resolvedHeaders: unresolvedResolution.resolvedHeaders
+              ? Object.fromEntries(unresolvedResolution.resolvedHeaders.entries())
+              : null,
+          });
+        }
+      }
       const nextDataRewriteHeader = resolveNextDataRewriteHeader({
         request,
-        rewriteUrl: middlewareRewriteUrl,
+        rewriteUrl: resolvedMiddlewareRewriteUrl,
         basePath: manifest.build.basePath,
         buildId: manifest.build.buildId,
       });
@@ -1521,11 +1925,34 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           nextDataRewriteHeader
         );
       }
+      if (
+        resolvedMiddlewareRequestHeaders &&
+        resolvedMiddlewareRequestHeaders.has('x-middleware-set-cookie') &&
+        resolution.resolvedHeaders?.has('x-middleware-set-cookie') !== true
+      ) {
+        resolution = withResolvedHeader(
+          resolution,
+          'x-middleware-set-cookie',
+          resolvedMiddlewareRequestHeaders.get('x-middleware-set-cookie') ?? ''
+        );
+      }
       const requestWithMiddlewareMutations = withMiddlewareRequestMutations({
         request,
-        rewriteUrl: middlewareRewriteUrl,
-        requestHeaders: middlewareRequestHeaders,
+        rewriteUrl: resolvedMiddlewareRewriteUrl,
+        requestHeaders:
+          resolvedMiddlewareRequestHeaders ??
+          (didStripIncomingMiddlewareHeaders ? incomingRequestHeaders : null),
       });
+      const originalRequestUrl = new URL(request.url);
+      const mutatedRequestUrl = new URL(requestWithMiddlewareMutations.url);
+      const didInternalMiddlewareRewrite =
+        resolvedMiddlewareRewriteUrl !== null &&
+        resolvedMiddlewareRewriteUrl.origin === originalRequestUrl.origin &&
+        (resolvedMiddlewareRewriteUrl.pathname !== originalRequestUrl.pathname ||
+          resolvedMiddlewareRewriteUrl.search !== originalRequestUrl.search);
+      const effectiveRouteMatches = didInternalMiddlewareRewrite
+        ? undefined
+        : resolution.routeMatches;
 
       if (resolution.redirect) {
         const response = new Response(null, {
@@ -1586,7 +2013,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         );
       }
 
-      const requestUrl = new URL(requestWithMiddlewareMutations.url);
+      const requestUrl = mutatedRequestUrl;
       if (isImageOptimizationPath(requestUrl.pathname, manifest.build.basePath)) {
         if (!options.invokeImageFunction) {
           return withRouteMetadata(
@@ -1605,7 +2032,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         const imageContext = {
           request,
           matchedPathname: toImageRoutePath(manifest.build.basePath),
-          routeMatches: resolution.routeMatches,
+          routeMatches: effectiveRouteMatches,
           resolution,
           source: 'image' as const,
         };
@@ -1696,6 +2123,9 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       }
 
       let matchedPathname = resolution.matchedPathname;
+      if (didInternalMiddlewareRewrite) {
+        matchedPathname = undefined;
+      }
       if (!matchedPathname) {
         matchedPathname = maybeResolveDirectPathnameFallback({
           requestPathname: requestUrl.pathname,
@@ -1722,7 +2152,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           const appNotFoundResponse = await options.invokeFunction({
             request: requestWithMiddlewareMutations,
             matchedPathname: '/_not-found',
-            routeMatches: resolution.routeMatches,
+            routeMatches: effectiveRouteMatches,
             resolution,
             output: appNotFoundOutput,
             source: 'function',
@@ -1749,10 +2179,15 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         });
       }
 
-      // Normalize "/" to "/index" — Pages Router emits the root page as
-      // "/index" in the static assets and function maps.
+      // Pages Router can emit root as "/index", while App Router commonly
+      // keeps it as "/". Prefer "/" when present and only fall back to
+      // "/index" when "/" has no output binding.
       const normalizedMatchedPathname =
-        matchedPathname === '/' ? '/index' : matchedPathname;
+        matchedPathname === '/'
+          ? !hasOutputPathname(indexes, '/') && hasOutputPathname(indexes, '/index')
+            ? '/index'
+            : '/'
+          : matchedPathname;
 
       const resolvedMatchedPathname = maybeResolveRscMatchedPathname({
         request,
@@ -1760,21 +2195,44 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         manifest,
         indexes,
       });
+      if (debugMiddleware) {
+        const debugUrl = new URL(request.url);
+        if (debugUrl.pathname.includes('/rewrite-to-app')) {
+          console.log('[adapter-bun][middleware][route-selection]', {
+            requestUrl: debugUrl.toString(),
+            mutatedRequestUrl: requestWithMiddlewareMutations.url,
+            didInternalMiddlewareRewrite,
+            initialMatchedPathname: resolution.matchedPathname ?? null,
+            fallbackMatchedPathname: matchedPathname ?? null,
+            normalizedMatchedPathname,
+            resolvedMatchedPathname,
+            hasStatic: indexes.staticByPathname.has(resolvedMatchedPathname),
+            hasPrerender: indexes.prerenderByPathname.has(resolvedMatchedPathname),
+            hasFunction: indexes.functionByPathname.has(resolvedMatchedPathname),
+          });
+        }
+      }
 
       const staticAsset = indexes.staticByPathname.get(resolvedMatchedPathname);
       if (staticAsset) {
         const response = await options.serveStatic({
           request,
           matchedPathname: resolvedMatchedPathname,
-          routeMatches: resolution.routeMatches,
+          routeMatches: effectiveRouteMatches,
           resolution,
           asset: staticAsset,
           source: 'static',
         });
-        return withRouteMetadata(applyResolutionToResponse(response, resolution), {
-          kind: 'static',
-          id: staticAsset.id,
-        });
+        return withRouteMetadata(
+          withRscVaryForRequest(
+            applyResolutionToResponse(response, resolution),
+            requestWithMiddlewareMutations
+          ),
+          {
+            kind: 'static',
+            id: staticAsset.id,
+          }
+        );
       }
 
       const prerenderSeed = indexes.prerenderByPathname.get(resolvedMatchedPathname);
@@ -1818,10 +2276,30 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           }
 
           const now = cacheConfig.now?.() ?? Date.now();
-          const cacheKeyRequest = toPrerenderCacheKeyRequest(request);
+          const cacheKeyRequest = toPrerenderCacheKeyRequest(
+            request,
+            resolvedMatchedPathname
+          );
           const cacheKey = createPrerenderCacheKey(prerenderSeed, cacheKeyRequest);
           const existingEntry = await cacheConfig.store.get(cacheKey.key);
           if (onDemandRevalidate.onlyGenerated && !existingEntry) {
+            return withRouteMetadata(
+              applyResolutionToResponse(
+                new Response('This page could not be found', {
+                  status: 404,
+                  headers: {
+                    'content-type': 'text/plain; charset=utf-8',
+                    'x-nextjs-cache': 'REVALIDATED',
+                  },
+                }),
+                resolution,
+                404
+              ),
+              { kind: 'prerender', id: prerenderSeed.id }
+            );
+          }
+
+          if (!existingEntry && prerenderSeed.parentFallbackMode === false) {
             return withRouteMetadata(
               applyResolutionToResponse(
                 new Response('This page could not be found', {
@@ -1876,14 +2354,14 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
             );
           }
 
-          const invocationRequest = filterPrerenderRequestByAllowLists(
-            prerenderSeed,
-            requestWithMiddlewareMutations
-          );
+          const invocationRequest = maybeFilterPrerenderRequestByAllowLists({
+            seed: prerenderSeed,
+            request: requestWithMiddlewareMutations,
+          });
           const generatedResponse = await options.invokeFunction({
             request: invocationRequest,
             matchedPathname: resolvedMatchedPathname,
-            routeMatches: resolution.routeMatches,
+            routeMatches: effectiveRouteMatches,
             resolution,
             output: parentOutput,
             source: 'prerender-parent',
@@ -1921,7 +2399,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           const response = await options.handlePrerender({
             request,
             matchedPathname: resolvedMatchedPathname,
-            routeMatches: resolution.routeMatches,
+            routeMatches: effectiveRouteMatches,
             resolution,
             seed: prerenderSeed,
             parentOutput:
@@ -1938,7 +2416,10 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
 
         if (cacheConfig) {
           const now = cacheConfig.now?.() ?? Date.now();
-          const cacheKeyRequest = toPrerenderCacheKeyRequest(request);
+          const cacheKeyRequest = toPrerenderCacheKeyRequest(
+            request,
+            resolvedMatchedPathname
+          );
           const cacheKey = createPrerenderCacheKey(prerenderSeed, cacheKeyRequest);
 
           if (!bypass) {
@@ -2016,7 +2497,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
               const fallbackResponse = await options.serveStatic({
                 request,
                 matchedPathname: resolvedMatchedPathname,
-                routeMatches: resolution.routeMatches,
+                routeMatches: effectiveRouteMatches,
                 resolution,
                 source: 'static',
                 cacheState: 'MISS',
@@ -2040,21 +2521,39 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
                 prerenderSeed.parentOutputId
               );
               const resumeRequest = parentOutput
-                ? toPrerenderParentRequest({
-                    request: requestWithMiddlewareMutations,
+                ? maybeFilterPrerenderRequestByAllowLists({
                     seed: prerenderSeed,
+                    request: toPrerenderParentRequest({
+                      request: requestWithMiddlewareMutations,
+                      seed: prerenderSeed,
+                    }),
                   })
                 : requestWithMiddlewareMutations;
+              const hasPostponedStatePath =
+                typeof prerenderSeed.fallback?.postponedStatePath === 'string' &&
+                prerenderSeed.fallback.postponedStatePath.length > 0;
+              const isFullyStaticPrerenderSeed =
+                prerenderSeed.fallback?.initialRevalidate === false;
+              const hasExplicitSeedTags = prerenderSeed.tags.some(
+                (tag) => !tag.startsWith('_N_T_/')
+              );
               const shouldAttemptInlineResume =
                 Boolean(parentOutput) &&
+                hasPostponedStatePath &&
                 resumeRequest !== requestWithMiddlewareMutations;
+              const shouldScheduleMissFallbackRevalidate =
+                prerenderSeed.parentFallbackMode !== false &&
+                (!isFullyStaticPrerenderSeed || hasExplicitSeedTags);
+              const missFallbackCacheState = isFullyStaticPrerenderSeed
+                ? 'HIT'
+                : 'MISS';
 
               if (parentOutput && shouldAttemptInlineResume) {
                 const resumeResponsePromise = Promise.resolve(
                   options.invokeFunction({
                     request: resumeRequest,
                     matchedPathname: resolvedMatchedPathname,
-                    routeMatches: resolution.routeMatches,
+                    routeMatches: effectiveRouteMatches,
                     resolution,
                     output: parentOutput,
                     source: 'prerender-parent',
@@ -2062,12 +2561,14 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
                     cacheState: 'MISS',
                   })
                 ).catch(async () => {
-                  await enqueueRevalidate({
-                    options,
-                    cacheKey: cacheKey.key,
-                    seed: prerenderSeed,
-                    reason: 'MISS_FALLBACK',
-                  });
+                  if (shouldScheduleMissFallbackRevalidate) {
+                    await enqueueRevalidate({
+                      options,
+                      cacheKey: cacheKey.key,
+                      seed: prerenderSeed,
+                      reason: 'MISS_FALLBACK',
+                    });
+                  }
                   return null;
                 });
                 const mergedResponse = createFallbackBodyConcatenatedResponse({
@@ -2077,23 +2578,25 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
                 return withRouteMetadata(
                   withCacheState(
                     applyResolutionToResponse(mergedResponse, resolution),
-                    'MISS'
+                    missFallbackCacheState
                   ),
                   { kind: 'prerender', id: prerenderSeed.id }
                 );
               }
 
-              await enqueueRevalidate({
-                options,
-                cacheKey: cacheKey.key,
-                seed: prerenderSeed,
-                reason: 'MISS_FALLBACK',
-              });
+              if (shouldScheduleMissFallbackRevalidate) {
+                await enqueueRevalidate({
+                  options,
+                  cacheKey: cacheKey.key,
+                  seed: prerenderSeed,
+                  reason: 'MISS_FALLBACK',
+                });
+              }
 
               return withRouteMetadata(
                 withCacheState(
                   applyResolutionToResponse(seededFallbackResponse, resolution),
-                  'MISS'
+                  missFallbackCacheState
                 ),
                 { kind: 'prerender', id: prerenderSeed.id }
               );
@@ -2128,14 +2631,20 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
             );
           }
 
-          const invocationRequest = toPrerenderParentRequest({
+          const prerenderParentRequest = toPrerenderParentRequest({
             request: requestWithMiddlewareMutations,
             seed: prerenderSeed,
           });
+          const invocationRequest = bypass
+            ? prerenderParentRequest
+            : maybeFilterPrerenderRequestByAllowLists({
+                seed: prerenderSeed,
+                request: prerenderParentRequest,
+              });
           const generatedResponse = await options.invokeFunction({
             request: invocationRequest,
             matchedPathname: resolvedMatchedPathname,
-            routeMatches: resolution.routeMatches,
+            routeMatches: effectiveRouteMatches,
             resolution,
             output: parentOutput,
             source: 'prerender-parent',
@@ -2174,7 +2683,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           const fallbackResponse = await options.serveStatic({
             request,
             matchedPathname: resolvedMatchedPathname,
-            routeMatches: resolution.routeMatches,
+            routeMatches: effectiveRouteMatches,
             resolution,
             source: 'static',
             cacheState: 'MISS',
@@ -2196,21 +2705,33 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
 
           const parentOutput = indexes.functionById.get(prerenderSeed.parentOutputId);
           const resumeRequest = parentOutput
-            ? toPrerenderParentRequest({
-                request: requestWithMiddlewareMutations,
+            ? maybeFilterPrerenderRequestByAllowLists({
                 seed: prerenderSeed,
+                request: toPrerenderParentRequest({
+                  request: requestWithMiddlewareMutations,
+                  seed: prerenderSeed,
+                }),
               })
             : requestWithMiddlewareMutations;
+          const hasPostponedStatePath =
+            typeof prerenderSeed.fallback?.postponedStatePath === 'string' &&
+            prerenderSeed.fallback.postponedStatePath.length > 0;
+          const isFullyStaticPrerenderSeed =
+            prerenderSeed.fallback?.initialRevalidate === false;
           const shouldAttemptInlineResume =
             Boolean(parentOutput) &&
+            hasPostponedStatePath &&
             resumeRequest !== requestWithMiddlewareMutations;
+          const missFallbackCacheState = isFullyStaticPrerenderSeed
+            ? 'HIT'
+            : 'MISS';
 
           if (parentOutput && shouldAttemptInlineResume) {
             const resumeResponsePromise = Promise.resolve(
               options.invokeFunction({
                 request: resumeRequest,
                 matchedPathname: resolvedMatchedPathname,
-                routeMatches: resolution.routeMatches,
+                routeMatches: effectiveRouteMatches,
                 resolution,
                 output: parentOutput,
                 source: 'prerender-parent',
@@ -2225,7 +2746,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
             return withRouteMetadata(
               withCacheState(
                 applyResolutionToResponse(mergedResponse, resolution),
-                'MISS'
+                missFallbackCacheState
               ),
               { kind: 'prerender', id: prerenderSeed.id }
             );
@@ -2234,7 +2755,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           return withRouteMetadata(
             withCacheState(
               applyResolutionToResponse(seededFallbackResponse, resolution),
-              'MISS'
+              missFallbackCacheState
             ),
             { kind: 'prerender', id: prerenderSeed.id }
           );
@@ -2256,12 +2777,15 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         }
 
         const response = await options.invokeFunction({
-          request: toPrerenderParentRequest({
-            request: requestWithMiddlewareMutations,
+          request: maybeFilterPrerenderRequestByAllowLists({
             seed: prerenderSeed,
+            request: toPrerenderParentRequest({
+              request: requestWithMiddlewareMutations,
+              seed: prerenderSeed,
+            }),
           }),
           matchedPathname: resolvedMatchedPathname,
-          routeMatches: resolution.routeMatches,
+          routeMatches: effectiveRouteMatches,
           resolution,
           output: parentOutput,
           source: 'prerender-parent',
@@ -2276,20 +2800,52 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
 
       const output = indexes.functionByPathname.get(resolvedMatchedPathname);
       if (output) {
+        for (const [ancestorPathname, allowedSeedPaths] of indexes.strictDynamicAncestorSeedPaths.entries()) {
+          if (
+            !isPathPatternAncestor({
+              ancestorPathname,
+              descendantPathname: output.pathname,
+            })
+          ) {
+            continue;
+          }
+
+          const ancestorSeedPathname = deriveAncestorSeedPathname({
+            requestPathname: requestUrl.pathname,
+            ancestorPathname,
+          });
+          if (!ancestorSeedPathname) {
+            continue;
+          }
+
+          if (!allowedSeedPaths.has(ancestorSeedPathname)) {
+            return withRouteMetadata(
+              applyResolutionToResponse(notFoundResponse(404), resolution, 404),
+              { kind: 'not-found' }
+            );
+          }
+        }
+
         const response = await options.invokeFunction({
           request: requestWithMiddlewareMutations,
           matchedPathname: resolvedMatchedPathname,
-          routeMatches: resolution.routeMatches,
+          routeMatches: effectiveRouteMatches,
           resolution,
           output,
           source: 'function',
           prerenderSeed: null,
           cacheState: undefined,
         });
-        return withRouteMetadata(applyResolutionToResponse(response, resolution), {
-          kind: 'function',
-          id: output.id,
-        });
+        return withRouteMetadata(
+          withRscVaryForRequest(
+            applyResolutionToResponse(response, resolution),
+            requestWithMiddlewareMutations
+          ),
+          {
+            kind: 'function',
+            id: output.id,
+          }
+        );
       }
 
       const response = options.handleNotFound

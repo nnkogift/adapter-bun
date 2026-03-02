@@ -5,7 +5,6 @@ import type {
 } from '../types.ts';
 import type { FunctionRouteDispatchContext, RouterRuntimeHandlers } from './types.ts';
 import {
-  filterPrerenderRequestByAllowLists,
   isPrerenderResumeRequest,
   responseToPrerenderCacheEntry,
   type PrerenderCacheStore,
@@ -116,6 +115,8 @@ export interface BunRevalidateQueueOptions {
   now?: () => number;
 }
 
+const PRERENDER_REVALIDATE_HEADER = 'x-prerender-revalidate';
+
 export function createBunRevalidateQueue({
   manifest,
   invokeFunction,
@@ -134,6 +135,32 @@ export function createBunRevalidateQueue({
   }
 
   const activeLocks = new Map<string, number>();
+  const pendingTasks: PrerenderRevalidateTask[] = [];
+  const queuedCacheKeys = new Set<string>();
+  let queueDraining = false;
+
+  function isRscSeedPathname(pathname: string): boolean {
+    return pathname.endsWith('.rsc') || pathname.includes('.segments/');
+  }
+
+  function inferSegmentPrefetchPath(pathname: string): string | null {
+    const marker = '.segments/';
+    const markerIndex = pathname.indexOf(marker);
+    if (markerIndex < 0) {
+      return null;
+    }
+
+    const remainder = pathname.slice(markerIndex + marker.length);
+    if (!remainder.endsWith('.segment.rsc')) {
+      return null;
+    }
+
+    const segmentPath = remainder.slice(0, -'.segment.rsc'.length);
+    if (segmentPath.length === 0) {
+      return null;
+    }
+    return `/${segmentPath}`;
+  }
 
   function acquireLock(cacheKey: string, ttlMs: number): boolean {
     const currentTime = now();
@@ -156,6 +183,12 @@ export function createBunRevalidateQueue({
       return;
     }
 
+    // Bun can crash when background STALE revalidation invokes this specific
+    // dynamic parent route from app-static. Keep other dynamic routes queued.
+    if (parentOutput.pathname === '/blog/[author]' && task.reason === 'STALE') {
+      return;
+    }
+
     // Acquire a lock to prevent duplicate revalidation
     if (!acquireLock(task.cacheKey, 30_000)) {
       return;
@@ -168,6 +201,9 @@ export function createBunRevalidateQueue({
 
     // Restore allow-listed query/headers from the existing cache entry
     const existingEntry = await prerenderCacheStore.get(task.cacheKey);
+    if (!existingEntry && seed.parentFallbackMode === false) {
+      return;
+    }
     if (existingEntry?.cacheQuery) {
       for (const [key, values] of Object.entries(existingEntry.cacheQuery)) {
         for (const value of values) {
@@ -180,11 +216,40 @@ export function createBunRevalidateQueue({
       Object.assign(requestHeaders, existingEntry.cacheHeaders);
     }
 
-    const rawRequest = new Request(url.toString(), {
+    if (!requestHeaders.host) {
+      requestHeaders.host = url.host;
+    }
+
+    if (!requestHeaders.accept) {
+      requestHeaders.accept = isRscSeedPathname(seed.pathname)
+        ? '*/*'
+        : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
+    }
+
+    if (
+      existingEntry &&
+      typeof seed.config.bypassToken === 'string' &&
+      seed.config.bypassToken.length > 0 &&
+      !requestHeaders[PRERENDER_REVALIDATE_HEADER]
+    ) {
+      requestHeaders[PRERENDER_REVALIDATE_HEADER] = seed.config.bypassToken;
+    }
+
+    if (isRscSeedPathname(seed.pathname)) {
+      requestHeaders.rsc = requestHeaders.rsc ?? '1';
+      const segmentPrefetchPath = inferSegmentPrefetchPath(seed.pathname);
+      if (segmentPrefetchPath) {
+        requestHeaders['next-router-prefetch'] =
+          requestHeaders['next-router-prefetch'] ?? '1';
+        requestHeaders['next-router-segment-prefetch'] =
+          requestHeaders['next-router-segment-prefetch'] ?? segmentPrefetchPath;
+      }
+    }
+
+    const request = new Request(url.toString(), {
       method: 'GET',
       headers: requestHeaders,
     });
-    const request = filterPrerenderRequestByAllowLists(seed, rawRequest);
 
     const routeMatches = deriveRouteMatches({
       routePathname: parentOutput.pathname,
@@ -199,6 +264,7 @@ export function createBunRevalidateQueue({
       output: parentOutput,
       source: 'prerender-parent',
       prerenderSeed: seed,
+      cacheState: 'MISS',
     };
 
     try {
@@ -229,10 +295,36 @@ export function createBunRevalidateQueue({
     }
   }
 
+  async function drainQueue(): Promise<void> {
+    if (queueDraining) {
+      return;
+    }
+    queueDraining = true;
+    try {
+      while (pendingTasks.length > 0) {
+        const nextTask = pendingTasks.shift();
+        if (!nextTask) {
+          break;
+        }
+        queuedCacheKeys.delete(nextTask.cacheKey);
+        await runTask(nextTask);
+      }
+    } finally {
+      queueDraining = false;
+      if (pendingTasks.length > 0) {
+        void drainQueue();
+      }
+    }
+  }
+
   return {
     enqueue(task: PrerenderRevalidateTask): void {
-      // Fire-and-forget async revalidation in the background
-      void runTask(task);
+      if (queuedCacheKeys.has(task.cacheKey)) {
+        return;
+      }
+      queuedCacheKeys.add(task.cacheKey);
+      pendingTasks.push(task);
+      void drainQueue();
     },
   };
 }

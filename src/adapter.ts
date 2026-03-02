@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Database } from 'bun:sqlite';
@@ -16,12 +16,22 @@ import {
   stageStaticAssets,
   writeJsonFile,
 } from './staging.ts';
-import type { BunAdapterOptions, BunFunctionArtifact, BunPrerenderSeed, BuildCompleteContext } from './types.ts';
+import type {
+  BunAdapterOptions,
+  BunDeploymentManifest,
+  BunFunctionArtifact,
+  BunPrerenderSeed,
+  BuildCompleteContext,
+} from './types.ts';
 
 export const ADAPTER_NAME = 'bun';
 export const DEFAULT_BUN_ADAPTER_OUT_DIR = 'bun-dist';
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = '0.0.0.0';
+
+type PreviewProps = NonNullable<
+  NonNullable<BunDeploymentManifest['runtime']>['previewProps']
+>;
 
 function normalizeDeploymentHost(value: string | undefined): string | null {
   if (typeof value !== 'string') {
@@ -46,6 +56,44 @@ function resolveOutDir(projectDir: string, configuredOutDir: string): string {
   return path.join(projectDir, configuredOutDir);
 }
 
+async function readPreviewProps(
+  ctx: BuildCompleteContext
+): Promise<PreviewProps | null> {
+  const distDir = path.isAbsolute(ctx.distDir)
+    ? ctx.distDir
+    : path.join(ctx.projectDir, ctx.distDir);
+  const prerenderManifestPath = path.join(distDir, 'prerender-manifest.json');
+
+  try {
+    const parsed = JSON.parse(await readFile(prerenderManifestPath, 'utf8')) as {
+      preview?: Record<string, unknown>;
+    };
+    const preview = parsed.preview;
+    if (!preview || typeof preview !== 'object') {
+      return null;
+    }
+
+    const previewModeId = preview.previewModeId;
+    const previewModeSigningKey = preview.previewModeSigningKey;
+    const previewModeEncryptionKey = preview.previewModeEncryptionKey;
+    if (
+      typeof previewModeId !== 'string' ||
+      typeof previewModeSigningKey !== 'string' ||
+      typeof previewModeEncryptionKey !== 'string'
+    ) {
+      return null;
+    }
+
+    return {
+      previewModeId,
+      previewModeSigningKey,
+      previewModeEncryptionKey,
+    };
+  } catch {
+    return null;
+  }
+}
+
 const SERVER_ENTRY_TEMPLATE = `import path from 'node:path';
 import { createRouterRuntime } from './runtime/router.js';
 import { createFunctionArtifactInvoker, createMiddlewareInvoker } from './runtime/function-invoker.js';
@@ -59,6 +107,13 @@ import { createEdgeIncrementalCache } from './runtime/incremental-cache-bridge.j
 const adapterDir = import.meta.dirname;
 const manifestPath = path.join(adapterDir, 'deployment-manifest.json');
 const manifest = await Bun.file(manifestPath).json();
+const previewProps = manifest.runtime?.previewProps;
+if (previewProps) {
+  process.env.__NEXT_PREVIEW_MODE_ID ??= previewProps.previewModeId;
+  process.env.__NEXT_PREVIEW_MODE_SIGNING_KEY ??= previewProps.previewModeSigningKey;
+  process.env.__NEXT_PREVIEW_MODE_ENCRYPTION_KEY ??=
+    previewProps.previewModeEncryptionKey;
+}
 
 const { prerenderCacheStore, imageCacheStore } = createSqliteCacheStores({
   adapterDir,
@@ -82,6 +137,8 @@ const revalidateQueue = createBunRevalidateQueue({
   manifest,
   invokeFunction,
   prerenderCacheStore,
+  requestOrigin: process.env.BUN_ADAPTER_REVALIDATE_ORIGIN ??
+    \`http://localhost:\${process.env.PORT || manifest.server.port}\`,
 });
 
 const invokeImageFunction = createBunImageHandler({
@@ -131,11 +188,35 @@ const runtime = createRouterRuntime({
 });
 
 const NEXT_PATCH_SYMBOL = Symbol.for('next-patch');
-function ensureNextFetchPatchState() {
-  const currentFetch = globalThis.fetch;
-  if (currentFetch && currentFetch.__nextPatched === true) {
-    return;
+const nativeFetch = globalThis.fetch;
+let listenAuthority = '';
+
+// Next.js res.revalidate() hardcodes https:// when trustHostHeader is true.
+// Intercept self-referencing HTTPS fetches and rewrite to HTTP so on-demand
+// ISR works without TLS.
+const adapterBaseFetch = Object.assign(function adapterBaseFetch(input, init) {
+  if (listenAuthority.length > 0) {
+    const httpsOrigin = \`https://\${listenAuthority}\`;
+    const httpOrigin = \`http://\${listenAuthority}\`;
+    if (typeof input === 'string' && input.startsWith(httpsOrigin)) {
+      input = httpOrigin + input.slice(httpsOrigin.length);
+    } else if (input instanceof URL && input.origin === httpsOrigin) {
+      const rewritten = new URL(input);
+      rewritten.protocol = 'http:';
+      input = rewritten;
+    } else if (input instanceof Request) {
+      const u = new URL(input.url);
+      if (u.origin === httpsOrigin) {
+        u.protocol = 'http:';
+        input = new Request(u, input);
+      }
+    }
   }
+  return nativeFetch(input, init);
+}, nativeFetch);
+
+function resetNextFetchPatchState() {
+  globalThis.fetch = adapterBaseFetch;
   globalThis[NEXT_PATCH_SYMBOL] = false;
 }
 
@@ -145,62 +226,98 @@ const server = Bun.serve({
   // Keep upstream keep-alive sockets stable across long e2e browser gaps.
   idleTimeout: 120,
   fetch(request) {
-    ensureNextFetchPatchState();
+    resetNextFetchPatchState();
     const url = new URL(request.url);
     url.protocol = 'http:';
     url.host = listenAuthority;
     const headers = new Headers(request.headers);
     headers.set('host', listenAuthority);
-    const shouldCloseConnection =
-      headers.get('connection')?.toLowerCase() === 'close';
     const runtimeRequest = new Request(url, {
       method: request.method,
       headers,
       body: request.body,
       signal: request.signal,
     });
-    return runtime.handleRequest(runtimeRequest).then((response) => {
-      if (!shouldCloseConnection) {
-        return response;
-      }
-      const responseHeaders = new Headers(response.headers);
-      responseHeaders.set('connection', 'close');
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders,
+    const debugBlogNav =
+      process.env.ADAPTER_BUN_DEBUG_BLOG_NAV === '1' &&
+      url.pathname.startsWith('/blog/');
+    const debugRequests = process.env.ADAPTER_BUN_DEBUG_REQUESTS === '1';
+    if (debugRequests) {
+      console.log('[adapter-bun][request:start]', {
+        method: request.method,
+        pathname: url.pathname,
+        search: url.search,
       });
-    });
+    }
+    if (debugBlogNav) {
+      console.log('[adapter-bun][blog-nav][request]', {
+        method: request.method,
+        url: url.toString(),
+        rsc: headers.get('rsc'),
+        nextRouterStateTree: headers.get('next-router-state-tree'),
+        nextRouterPrefetch: headers.get('next-router-prefetch'),
+        nextRouterSegmentPrefetch: headers.get('next-router-segment-prefetch'),
+        accept: headers.get('accept'),
+      });
+    }
+    return runtime.handleRequest(runtimeRequest)
+      .then((response) => {
+        if (debugBlogNav) {
+          console.log('[adapter-bun][blog-nav][response]', {
+            method: request.method,
+            url: url.toString(),
+            status: response.status,
+            contentType: response.headers.get('content-type'),
+            vary: response.headers.get('vary'),
+            routeKind: response.headers.get('x-bun-route-kind'),
+            routeId: response.headers.get('x-bun-route-id'),
+            bunCache: response.headers.get('x-bun-cache'),
+            nextjsCache: response.headers.get('x-nextjs-cache'),
+          });
+        }
+        if (debugRequests) {
+          console.log('[adapter-bun][request:response]', {
+            method: request.method,
+            pathname: url.pathname,
+            search: url.search,
+            status: response.status,
+            contentType: response.headers.get('content-type'),
+          });
+        }
+        const responseHeaders = new Headers(response.headers);
+        responseHeaders.set('connection', 'close');
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: responseHeaders,
+        });
+      })
+      .catch((error) => {
+        console.error('[adapter-bun] request handler error', {
+          error,
+          request: {
+            method: request.method,
+            url: url.toString(),
+          },
+        });
+        if (debugRequests) {
+          console.log('[adapter-bun][request:response]', {
+            method: request.method,
+            pathname: url.pathname,
+            search: url.search,
+            status: 500,
+            contentType: 'text/plain;charset=UTF-8',
+          });
+        }
+        return new Response('Internal Server Error', { status: 500 });
+      });
   },
 });
 
 const listenHost = server.hostname === '0.0.0.0' || server.hostname === '::'
   ? 'localhost'
   : server.hostname;
-const listenAuthority = \`\${listenHost}:\${server.port}\`;
-
-// Next.js res.revalidate() hardcodes https:// when trustHostHeader is true.
-// Intercept self-referencing HTTPS fetches and rewrite to HTTP so
-// on-demand ISR works without TLS.
-const httpsOrigin = \`https://\${listenAuthority}\`;
-const httpOrigin = \`http://\${listenAuthority}\`;
-const nativeFetch = globalThis.fetch;
-globalThis.fetch = Object.assign(function patchedFetch(input, init) {
-  if (typeof input === 'string' && input.startsWith(httpsOrigin)) {
-    input = httpOrigin + input.slice(httpsOrigin.length);
-  } else if (input instanceof URL && input.origin === httpsOrigin) {
-    const rewritten = new URL(input);
-    rewritten.protocol = 'http:';
-    input = rewritten;
-  } else if (input instanceof Request) {
-    const u = new URL(input.url);
-    if (u.origin === httpsOrigin) {
-      u.protocol = 'http:';
-      input = new Request(u, input);
-    }
-  }
-  return nativeFetch(input, init);
-}, nativeFetch);
+listenAuthority = \`\${listenHost}:\${server.port}\`;
 
 console.log(
   \`\\n  Next.js (\\x1b[36m\${manifest.build.nextVersion}\\x1b[0m) \\x1b[2m|\\x1b[0m adapter-bun\\n\` +
@@ -241,6 +358,7 @@ async function stageRuntimeModules(
     'function-invoker.js',
     'function-invoker-node.js',
     'function-invoker-shared.js',
+    'invocation-coordinator.js',
     'static.js',
     'isr.js',
     'image.js',
@@ -302,7 +420,12 @@ async function stageTracedDependencies({
   await Promise.all([...traced.entries()].map(async ([relativePath, sourcePath]) => {
     const destPath = path.join(outDir, relativePath);
     await mkdir(path.dirname(destPath), { recursive: true });
-    await copyFile(sourcePath, destPath);
+    await cp(sourcePath, destPath, {
+      recursive: true,
+      dereference: false,
+      force: true,
+      errorOnExist: false,
+    });
   }));
 }
 
@@ -531,6 +654,7 @@ async function onBuildComplete(
 
   const port = options.port ?? DEFAULT_PORT;
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
+  const previewProps = await readPreviewProps(ctx);
 
   const deploymentManifest = buildDeploymentManifest({
     adapterName: ADAPTER_NAME,
@@ -544,6 +668,7 @@ async function onBuildComplete(
     routerManifestPath,
     port,
     hostname,
+    previewProps,
   });
 
   await writeJsonFile(

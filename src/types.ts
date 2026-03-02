@@ -144,6 +144,11 @@ export interface BunDeploymentManifest {
   pathnames: string[];
   runtime?: {
     middlewareOutputId?: string | null;
+    previewProps?: {
+      previewModeId: string;
+      previewModeSigningKey: string;
+      previewModeEncryptionKey: string;
+    } | null;
   };
   functionMap: BunFunctionArtifact[];
   staticAssets: BunStaticAsset[];

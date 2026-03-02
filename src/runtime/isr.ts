@@ -479,6 +479,12 @@ export function createPrerenderCacheKey(
   for (const headerKey of [...(seed.config.allowHeader ?? [])].sort((a, b) =>
     a.localeCompare(b)
   )) {
+    // `host` is unstable across environments (random deploy/test ports) while
+    // build-time prerender cache seeding is host-agnostic. Excluding it keeps
+    // seeded entries addressable at runtime.
+    if (headerKey.toLowerCase() === 'host') {
+      continue;
+    }
     const value = request.headers.get(headerKey);
     if (value !== null) {
       headers[headerKey.toLowerCase()] = value;
@@ -607,6 +613,33 @@ function toRevalidateAt(
   return null;
 }
 
+function parseRevalidateSecondsFromCacheControl(
+  cacheControl: string | undefined
+): number | null {
+  if (typeof cacheControl !== 'string' || cacheControl.length === 0) {
+    return null;
+  }
+
+  const normalized = cacheControl.toLowerCase();
+  const sMaxAgeMatch = normalized.match(/(?:^|,)\s*s-maxage=(\d+)/);
+  if (sMaxAgeMatch?.[1]) {
+    const parsed = Number.parseInt(sMaxAgeMatch[1], 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  const maxAgeMatch = normalized.match(/(?:^|,)\s*max-age=(\d+)/);
+  if (maxAgeMatch?.[1]) {
+    const parsed = Number.parseInt(maxAgeMatch[1], 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
 function toExpiresAt(
   now: number,
   expirationSeconds: number | null | undefined
@@ -639,6 +672,11 @@ export async function responseToPrerenderCacheEntry({
     headers: toResponseHeadersRecord(response.headers),
     seed,
   });
+  const responseRevalidateSeconds = parseRevalidateSecondsFromCacheControl(
+    headers['cache-control']
+  );
+  const revalidateSource =
+    seed.fallback?.initialRevalidate ?? responseRevalidateSeconds ?? null;
 
   return {
     cacheKey,
@@ -649,7 +687,7 @@ export async function responseToPrerenderCacheEntry({
     body: bodyBuffer.toString('base64'),
     bodyEncoding: 'base64',
     createdAt: now,
-    revalidateAt: toRevalidateAt(now, seed.fallback?.initialRevalidate ?? null),
+    revalidateAt: toRevalidateAt(now, revalidateSource),
     expiresAt: toExpiresAt(now, seed.fallback?.initialExpiration),
     cacheQuery,
     cacheHeaders,

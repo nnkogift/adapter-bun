@@ -1,9 +1,7 @@
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import * as AsyncHooksImplementation from 'node:async_hooks';
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import { runInThisContext } from 'node:vm';
 import type { MiddlewareContext } from '@next/routing';
 import { responseToMiddlewareResult } from '@next/routing';
 import type { BunDeploymentManifest, BunFunctionArtifact } from '../types.ts';
@@ -14,7 +12,6 @@ import type {
 } from './types.ts';
 import {
   asResponse,
-  resolveOutputEntrypointPath,
   resolveOutputFilePath,
   type CreateFunctionArtifactInvokerOptions,
   type LambdaLikeResult,
@@ -39,13 +36,8 @@ type EdgeSandboxDefinition = {
   env: Record<string, string>;
   nextConfig: {
     basePath: string;
-    buildId: string;
     i18n: BunDeploymentManifest['build']['i18n'];
   };
-};
-
-type EdgeEntryModule = {
-  default?: (payload: unknown) => Promise<unknown> | unknown;
 };
 
 type EdgeFetchEventResultLike = {
@@ -60,17 +52,44 @@ type EdgeResponseLike = {
   arrayBuffer: () => Promise<ArrayBuffer>;
 };
 
-type EdgeEntryHandler = (payload: unknown) => Promise<unknown> | unknown;
+type EdgeHostHandler = (params: {
+  request: {
+    headers: Record<string, string>;
+    method: string;
+    nextConfig: {
+      basePath: string;
+      i18n: BunDeploymentManifest['build']['i18n'];
+      trailingSlash?: boolean;
+    };
+    url: string;
+    page?: { name?: string; params?: Record<string, string> };
+    body?: ReadableStream<Uint8Array>;
+    signal: AbortSignal;
+    waitUntil?: (promise: Promise<unknown>) => void;
+  };
+}) => Promise<unknown> | unknown;
 
-type EdgeGlobalState = {
-  initialized: boolean;
-  activeOutputId: string | null;
-  inlineAssetByName: Map<string, string>;
-  compiledWasmByPath: Map<string, WebAssembly.Module>;
-  loadedWasmPaths: Set<string>;
-  loadingWasmByPath: Map<string, Promise<WebAssembly.Module>>;
-  loadedScriptPaths: Set<string>;
-  loadingScriptByPath: Map<string, Promise<void>>;
+type EdgeHostGlobals = typeof globalThis & {
+  _ENTRIES?: Record<string, { default?: EdgeHostHandler }>;
+  __incrementalCacheShared?: boolean;
+  __incrementalCache?: unknown;
+  NEXT_CLIENT_ASSET_SUFFIX?: string;
+  TURBOPACK?: unknown;
+  __RSC_MANIFEST?: Record<string, unknown>;
+  __RSC_SERVER_MANIFEST?: unknown;
+};
+
+type EdgeHostGlobalSnapshot = {
+  hasEntries: boolean;
+  entries: EdgeHostGlobals['_ENTRIES'];
+  hasTurbopack: boolean;
+  turbopack: unknown;
+  hasServerManifests: boolean;
+  serverManifests: unknown;
+  hasRscManifest: boolean;
+  rscManifest: EdgeHostGlobals['__RSC_MANIFEST'];
+  hasRscServerManifest: boolean;
+  rscServerManifest: unknown;
 };
 
 const FORBIDDEN_RESPONSE_HEADERS = new Set([
@@ -79,41 +98,257 @@ const FORBIDDEN_RESPONSE_HEADERS = new Set([
   'transfer-encoding',
 ]);
 
-const EDGE_GLOBAL_STATE_SYMBOL = Symbol.for('adapter-bun.edge-global-state');
-const NEXT_PATCH_SYMBOL = Symbol.for('next-patch');
+const NEXT_SERVER_MANIFESTS_SYMBOL = Symbol.for('next.server.manifests');
 const edgeRequire = createRequire(import.meta.url);
+let activeHostEdgeOutputId: string | null = null;
 let edgeInvocationLock: Promise<void> = Promise.resolve();
+const hostEdgeHandlerByOutputId = new Map<string, EdgeHostHandler>();
+const hostEdgeGlobalsByOutputId = new Map<string, EdgeHostGlobalSnapshot>();
 
-function logEdgeDebug(message: string, details?: unknown): void {
-  if (process.env.ADAPTER_BUN_DEBUG_EDGE !== '1') {
-    return;
+function splitSetCookieHeaderValue(value: string): string[] {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return [];
   }
-  if (details === undefined) {
-    console.error(`[adapter-bun][edge] ${message}`);
-    return;
+  if (!trimmed.includes(',')) {
+    return [trimmed];
   }
-  console.error(`[adapter-bun][edge] ${message}`, details);
+
+  const cookies: string[] = [];
+  let segmentStart = 0;
+  let inExpiresAttribute = false;
+
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index];
+    if (char === ',') {
+      if (!inExpiresAttribute) {
+        const cookie = trimmed.slice(segmentStart, index).trim();
+        if (cookie.length > 0) {
+          cookies.push(cookie);
+        }
+        segmentStart = index + 1;
+      }
+      continue;
+    }
+
+    if (char === ';') {
+      inExpiresAttribute = false;
+      continue;
+    }
+
+    if (
+      (char === 'e' || char === 'E') &&
+      trimmed.slice(index, index + 8).toLowerCase() === 'expires='
+    ) {
+      inExpiresAttribute = true;
+    }
+  }
+
+  const tail = trimmed.slice(segmentStart).trim();
+  if (tail.length > 0) {
+    cookies.push(tail);
+  }
+
+  return cookies;
 }
 
-function getEdgeGlobalState(): EdgeGlobalState {
-  const globalAny = globalThis as Record<PropertyKey, unknown>;
-  const existing = globalAny[EDGE_GLOBAL_STATE_SYMBOL] as EdgeGlobalState | undefined;
-  if (existing) {
-    return existing;
+function normalizeMiddlewareSetCookieHeaders(response: Response): Response {
+  const rawSetCookie = response.headers.get('set-cookie');
+  if (!rawSetCookie) {
+    return response;
   }
 
-  const created: EdgeGlobalState = {
-    initialized: false,
-    activeOutputId: null,
-    inlineAssetByName: new Map<string, string>(),
-    compiledWasmByPath: new Map<string, WebAssembly.Module>(),
-    loadedWasmPaths: new Set<string>(),
-    loadingWasmByPath: new Map<string, Promise<WebAssembly.Module>>(),
-    loadedScriptPaths: new Set<string>(),
-    loadingScriptByPath: new Map<string, Promise<void>>(),
+  const splitCookies = splitSetCookieHeaderValue(rawSetCookie);
+  if (splitCookies.length <= 1) {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  headers.delete('set-cookie');
+  for (const cookie of splitCookies) {
+    headers.append('set-cookie', cookie);
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function ensureHostAsyncLocalStorage(): void {
+  const globalWithAls = globalThis as { AsyncLocalStorage?: unknown };
+  // Next's edge runtime chunks rely on global AsyncLocalStorage.
+  globalWithAls.AsyncLocalStorage = AsyncHooksImplementation.AsyncLocalStorage;
+}
+
+function clearHostRequireCache(scriptPath: string): void {
+  try {
+    const resolvedPath = edgeRequire.resolve(scriptPath);
+    if (edgeRequire.cache && resolvedPath in edgeRequire.cache) {
+      delete edgeRequire.cache[resolvedPath];
+    }
+  } catch {
+    // Best-effort cache eviction.
+  }
+}
+
+function resetHostEdgeGlobals(): void {
+  const hostGlobals = globalThis as EdgeHostGlobals;
+  delete hostGlobals._ENTRIES;
+
+  hostGlobals.TURBOPACK = [];
+
+  const globalRecord = globalThis as Record<string | symbol, unknown>;
+  delete globalRecord[NEXT_SERVER_MANIFESTS_SYMBOL];
+  delete globalRecord.__RSC_MANIFEST;
+  delete globalRecord.__RSC_SERVER_MANIFEST;
+}
+
+function captureHostEdgeGlobals(): EdgeHostGlobalSnapshot {
+  const hostGlobals = globalThis as EdgeHostGlobals;
+  const hostRecord = globalThis as Record<string | symbol, unknown>;
+  const hasEntries = Object.prototype.hasOwnProperty.call(hostGlobals, '_ENTRIES');
+  const hasTurbopack = Object.prototype.hasOwnProperty.call(hostGlobals, 'TURBOPACK');
+  const hasServerManifests = Object.prototype.hasOwnProperty.call(
+    hostRecord,
+    NEXT_SERVER_MANIFESTS_SYMBOL
+  );
+  const hasRscManifest = Object.prototype.hasOwnProperty.call(
+    hostGlobals,
+    '__RSC_MANIFEST'
+  );
+  const hasRscServerManifest = Object.prototype.hasOwnProperty.call(
+    hostGlobals,
+    '__RSC_SERVER_MANIFEST'
+  );
+
+  return {
+    hasEntries,
+    entries: hasEntries ? hostGlobals._ENTRIES : undefined,
+    hasTurbopack,
+    turbopack: hasTurbopack ? hostGlobals.TURBOPACK : undefined,
+    hasServerManifests,
+    serverManifests: hasServerManifests
+      ? hostRecord[NEXT_SERVER_MANIFESTS_SYMBOL]
+      : undefined,
+    hasRscManifest,
+    rscManifest: hasRscManifest ? hostGlobals.__RSC_MANIFEST : undefined,
+    hasRscServerManifest,
+    rscServerManifest: hasRscServerManifest
+      ? hostGlobals.__RSC_SERVER_MANIFEST
+      : undefined,
   };
-  globalAny[EDGE_GLOBAL_STATE_SYMBOL] = created;
-  return created;
+}
+
+function applyHostEdgeGlobals(snapshot: EdgeHostGlobalSnapshot): void {
+  const hostGlobals = globalThis as EdgeHostGlobals;
+  const hostRecord = globalThis as Record<string | symbol, unknown>;
+
+  if (snapshot.hasEntries) {
+    hostGlobals._ENTRIES = snapshot.entries;
+  } else {
+    delete hostGlobals._ENTRIES;
+  }
+
+  if (snapshot.hasTurbopack) {
+    hostGlobals.TURBOPACK = snapshot.turbopack;
+  } else {
+    delete hostGlobals.TURBOPACK;
+  }
+
+  if (snapshot.hasServerManifests) {
+    hostRecord[NEXT_SERVER_MANIFESTS_SYMBOL] = snapshot.serverManifests;
+  } else {
+    delete hostRecord[NEXT_SERVER_MANIFESTS_SYMBOL];
+  }
+
+  if (snapshot.hasRscManifest) {
+    hostGlobals.__RSC_MANIFEST = snapshot.rscManifest;
+  } else {
+    delete hostGlobals.__RSC_MANIFEST;
+  }
+
+  if (snapshot.hasRscServerManifest) {
+    hostGlobals.__RSC_SERVER_MANIFEST = snapshot.rscServerManifest;
+  } else {
+    delete hostGlobals.__RSC_SERVER_MANIFEST;
+  }
+}
+
+async function withEdgeInvocationLock<T>(run: () => Promise<T>): Promise<T> {
+  const previousLock = edgeInvocationLock;
+  let releaseCurrentLock: (() => void) | undefined;
+  edgeInvocationLock = new Promise<void>((resolve) => {
+    releaseCurrentLock = resolve;
+  });
+
+  await previousLock;
+  try {
+    return await run();
+  } finally {
+    releaseCurrentLock?.();
+  }
+}
+
+async function ensureHostEdgeHandlerLoaded({
+  outputId,
+  name,
+  paths,
+}: {
+  outputId: string;
+  name: string;
+  paths: string[];
+}): Promise<EdgeHostHandler> {
+  ensureHostAsyncLocalStorage();
+
+  const cachedHandler = hostEdgeHandlerByOutputId.get(outputId);
+  if (cachedHandler && hostEdgeGlobalsByOutputId.has(outputId)) {
+    return cachedHandler;
+  }
+
+  if (activeHostEdgeOutputId !== outputId || !cachedHandler) {
+    resetHostEdgeGlobals();
+    try {
+      for (const scriptPath of paths) {
+        clearHostRequireCache(scriptPath);
+      }
+      for (const scriptPath of paths) {
+        edgeRequire(scriptPath);
+      }
+      activeHostEdgeOutputId = outputId;
+    } catch (error) {
+      activeHostEdgeOutputId = null;
+      hostEdgeHandlerByOutputId.delete(outputId);
+      hostEdgeGlobalsByOutputId.delete(outputId);
+      throw error;
+    }
+  }
+
+  const entryKey = `middleware_${name}`;
+  const hostGlobals = globalThis as EdgeHostGlobals;
+  const entry = hostGlobals._ENTRIES?.[entryKey];
+  if (!entry) {
+    throw new Error(`Failed to resolve edge handler "${entryKey}"`);
+  }
+
+  // Resolve the entry module once so module-level globals (including
+  // manifests singleton wiring) are initialized before we snapshot globals.
+  const resolvedEntry = await Promise.resolve(entry);
+  const handler =
+    typeof (resolvedEntry as { default?: unknown }).default === 'function'
+      ? ((resolvedEntry as { default: EdgeHostHandler }).default as EdgeHostHandler)
+      : typeof (entry as { default?: unknown }).default === 'function'
+        ? ((entry as { default: EdgeHostHandler }).default as EdgeHostHandler)
+        : undefined;
+
+  if (typeof handler !== 'function') {
+    throw new Error(`Failed to resolve edge handler "${entryKey}"`);
+  }
+
+  hostEdgeHandlerByOutputId.set(outputId, handler);
+  hostEdgeGlobalsByOutputId.set(outputId, captureHostEdgeGlobals());
+  return handler;
 }
 
 function isScriptPath(filePath: string): boolean {
@@ -157,37 +392,25 @@ function buildEdgeSandboxDefinition({
   functionRoot: string;
   nextConfig: EdgeSandboxDefinition['nextConfig'];
 }): EdgeSandboxDefinition {
-  const entrypointPath = resolveOutputEntrypointPath(
-    output,
-    adapterDir,
-    functionRoot
-  );
-
-  const scriptCandidates = output.files
-    .filter((file) => file.kind !== 'wasm' && isScriptPath(file.relativePath))
-    .map((file) =>
-      resolveOutputFilePath(output, file.relativePath, adapterDir, functionRoot)
-    )
-    .filter((candidatePath) => existsSync(candidatePath));
-
   const paths: string[] = [];
-  const seen = new Set<string>();
-  const pushPath = (candidatePath: string): void => {
-    if (seen.has(candidatePath)) {
-      return;
+  const seenPaths = new Set<string>();
+  for (const file of output.files) {
+    if (file.kind === 'wasm' || !isScriptPath(file.relativePath)) {
+      continue;
     }
-    seen.add(candidatePath);
+
+    const candidatePath = resolveOutputFilePath(
+      output,
+      file.relativePath,
+      adapterDir,
+      functionRoot
+    );
+    if (!existsSync(candidatePath) || seenPaths.has(candidatePath)) {
+      continue;
+    }
+
+    seenPaths.add(candidatePath);
     paths.push(candidatePath);
-  };
-
-  if (existsSync(entrypointPath)) {
-    // The edge entrypoint frequently seeds globals (for example __RSC_MANIFEST)
-    // required by subsequently loaded chunks.
-    pushPath(entrypointPath);
-  }
-
-  for (const candidatePath of scriptCandidates) {
-    pushPath(candidatePath);
   }
 
   if (paths.length === 0) {
@@ -197,7 +420,11 @@ function buildEdgeSandboxDefinition({
   }
 
   const assets: EdgeAssetBinding[] = output.files
-    .filter((file) => file.kind === 'asset')
+    .filter(
+      (file) =>
+        file.kind === 'asset' &&
+        !isScriptPath(file.relativePath)
+    )
     .map((file) => ({
       name: file.relativePath,
       filePath: resolveOutputFilePath(
@@ -247,257 +474,6 @@ function toRequestHeadersRecord(
   return record;
 }
 
-function responseInputToString(input: unknown): string {
-  if (typeof input === 'string') {
-    return input;
-  }
-
-  if (input && typeof input === 'object' && 'url' in input) {
-    const withUrl = input as { url?: unknown };
-    if (typeof withUrl.url === 'string') {
-      return withUrl.url;
-    }
-  }
-
-  return String(input);
-}
-
-function resolveInlineAssetPath(
-  input: unknown,
-  inlineAssetByName: Map<string, string>
-): string | null {
-  const inputString = responseInputToString(input);
-  if (!inputString.startsWith('blob:')) {
-    return null;
-  }
-
-  const name = inputString.slice('blob:'.length);
-  return (
-    inlineAssetByName.get(name) ??
-    inlineAssetByName.get(decodeURIComponent(name)) ??
-    inlineAssetByName.get(name.replace(/^\/+/, '')) ??
-    null
-  );
-}
-
-function ensureEdgeGlobalsInitialized(): EdgeGlobalState {
-  const state = getEdgeGlobalState();
-  if (!state.initialized) {
-    const globalWithSelf = globalThis as unknown as { self?: typeof globalThis };
-    if (typeof globalWithSelf.self === 'undefined') {
-      globalWithSelf.self = globalThis;
-    }
-
-    if (typeof (globalThis as { require?: unknown }).require !== 'function') {
-      (globalThis as Record<string, unknown>).require = edgeRequire;
-    }
-
-    // Edge chunks snapshot AsyncLocalStorage availability at module eval time.
-    // Always force Node's implementation before loading any edge chunk.
-    (globalThis as { AsyncLocalStorage: unknown }).AsyncLocalStorage =
-      AsyncHooksImplementation.AsyncLocalStorage;
-    state.initialized = true;
-  }
-  return state;
-}
-
-async function withPatchedEdgeFetch<T>({
-  state: _state,
-  run,
-}: {
-  state: EdgeGlobalState;
-  run: () => Promise<T>;
-}): Promise<T> {
-  // Edge chunks can mutate process-global fetch state at eval time.
-  // Snapshot and restore around each edge invocation so node runtime
-  // fetch instrumentation (React dedupe/cache) remains stable.
-  const globalAny = globalThis as Record<PropertyKey, unknown>;
-  const originalFetch = globalThis.fetch;
-  const hadNextPatchSymbol = Object.prototype.hasOwnProperty.call(
-    globalAny,
-    NEXT_PATCH_SYMBOL
-  );
-  const originalNextPatchValue = globalAny[NEXT_PATCH_SYMBOL];
-
-  try {
-    return await run();
-  } finally {
-    globalThis.fetch = originalFetch;
-    if (hadNextPatchSymbol) {
-      globalAny[NEXT_PATCH_SYMBOL] = originalNextPatchValue;
-    } else {
-      delete globalAny[NEXT_PATCH_SYMBOL];
-    }
-  }
-}
-
-function registerInlineAssets(
-  state: EdgeGlobalState,
-  assets: EdgeAssetBinding[]
-): void {
-  for (const asset of assets) {
-    state.inlineAssetByName.set(asset.name, asset.filePath);
-    const normalized = asset.name.replace(/^\/+/, '');
-    state.inlineAssetByName.set(normalized, asset.filePath);
-  }
-}
-
-async function ensureWasmLoaded(
-  state: EdgeGlobalState,
-  wasmBinding: EdgeWasmBinding
-): Promise<WebAssembly.Module> {
-  const loaded = state.compiledWasmByPath.get(wasmBinding.filePath);
-  if (loaded) {
-    return loaded;
-  }
-
-  const pending = state.loadingWasmByPath.get(wasmBinding.filePath);
-  if (pending) {
-    return pending;
-  }
-
-  const loadPromise = (async () => {
-    const module = await WebAssembly.compile(await readFile(wasmBinding.filePath));
-    state.compiledWasmByPath.set(wasmBinding.filePath, module);
-    return module;
-  })();
-
-  state.loadingWasmByPath.set(wasmBinding.filePath, loadPromise);
-  try {
-    return await loadPromise;
-  } finally {
-    state.loadingWasmByPath.delete(wasmBinding.filePath);
-  }
-}
-
-function resetActiveEdgeOutput(state: EdgeGlobalState): void {
-  state.activeOutputId = null;
-  state.inlineAssetByName.clear();
-  state.loadedScriptPaths.clear();
-  state.loadedWasmPaths.clear();
-  state.loadingScriptByPath.clear();
-  state.loadingWasmByPath.clear();
-
-  const globalAny = globalThis as Record<string, unknown>;
-  delete globalAny._ENTRIES;
-  globalAny.TURBOPACK = [];
-  delete globalAny[Symbol.for('next.server.manifests') as unknown as string];
-  delete globalAny.__RSC_MANIFEST;
-  delete globalAny.__RSC_SERVER_MANIFEST;
-}
-
-async function ensureScriptLoaded(
-  state: EdgeGlobalState,
-  scriptPath: string
-): Promise<void> {
-  if (state.loadedScriptPaths.has(scriptPath)) {
-    return;
-  }
-
-  const pending = state.loadingScriptByPath.get(scriptPath);
-  if (pending) {
-    await pending;
-    return;
-  }
-
-  const loadPromise = (async () => {
-    const source = await readFile(scriptPath, 'utf8');
-    runInThisContext(source, {
-      filename: scriptPath,
-    });
-    state.loadedScriptPaths.add(scriptPath);
-  })();
-
-  state.loadingScriptByPath.set(scriptPath, loadPromise);
-  try {
-    await loadPromise;
-  } finally {
-    state.loadingScriptByPath.delete(scriptPath);
-  }
-}
-
-async function ensureEdgeOutputLoaded({
-  sandbox,
-}: {
-  sandbox: EdgeSandboxDefinition;
-}): Promise<void> {
-  const state = ensureEdgeGlobalsInitialized();
-
-  if (state.activeOutputId !== sandbox.outputId) {
-    resetActiveEdgeOutput(state);
-    state.activeOutputId = sandbox.outputId;
-    registerInlineAssets(state, sandbox.assets);
-  }
-
-  try {
-    for (const wasmBinding of sandbox.wasm) {
-      if (!state.loadedWasmPaths.has(wasmBinding.filePath)) {
-        const module = await ensureWasmLoaded(state, wasmBinding);
-        (globalThis as Record<string, unknown>)[wasmBinding.name] = module;
-        state.loadedWasmPaths.add(wasmBinding.filePath);
-      } else {
-        const module = state.compiledWasmByPath.get(wasmBinding.filePath);
-        if (module) {
-          (globalThis as Record<string, unknown>)[wasmBinding.name] = module;
-        }
-      }
-    }
-
-    for (const scriptPath of sandbox.paths) {
-      await ensureScriptLoaded(state, scriptPath);
-    }
-  } catch (error) {
-    logEdgeDebug('failed to load output', {
-      outputId: sandbox.outputId,
-      entryKey: `middleware_${sandbox.name}`,
-      paths: sandbox.paths,
-      error,
-    });
-    resetActiveEdgeOutput(state);
-    throw error;
-  }
-}
-
-async function withEdgeInvocationLock<T>(run: () => Promise<T>): Promise<T> {
-  const previousLock = edgeInvocationLock;
-  let releaseCurrentLock: (() => void) | undefined;
-  edgeInvocationLock = new Promise<void>((resolve) => {
-    releaseCurrentLock = resolve;
-  });
-
-  await previousLock;
-  try {
-    return await run();
-  } finally {
-    releaseCurrentLock?.();
-  }
-}
-
-function resolveEdgeEntryHandler({
-  outputId,
-  entryKey,
-}: {
-  outputId: string;
-  entryKey: string;
-}): EdgeEntryHandler {
-  const entries = (globalThis as Record<string, unknown>)._ENTRIES as
-    | Record<string, EdgeEntryModule>
-    | undefined;
-
-  if (!entries || typeof entries !== 'object') {
-    throw new Error(`Edge output "${outputId}" did not register global _ENTRIES`);
-  }
-
-  const entry = entries[entryKey];
-  if (!entry || typeof entry.default !== 'function') {
-    throw new Error(
-      `Edge output "${outputId}" is missing entry "${entryKey}"`
-    );
-  }
-
-  return entry.default;
-}
-
 function buildPagePayload({
   pageName,
   routeMatches,
@@ -517,34 +493,14 @@ function buildPagePayload({
   };
 }
 
-async function toEdgeRuntimeRequestBody(
+function toEdgeRequestBody(
   request: Request
-): Promise<ReadableStream<Uint8Array> | undefined> {
+): ReadableStream<Uint8Array> | undefined {
   const method = request.method.toUpperCase();
   if (method === 'GET' || method === 'HEAD') {
     return undefined;
   }
-
-  const bytes = Buffer.from(await request.arrayBuffer());
-  if (bytes.byteLength === 0) {
-    return undefined;
-  }
-
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(new Uint8Array(bytes));
-      controller.close();
-    },
-  });
-}
-
-function isEdgeFetchEventResultLike(value: unknown): value is EdgeFetchEventResultLike {
-  return Boolean(
-    value &&
-      typeof value === 'object' &&
-      'response' in value &&
-      (value as { response?: unknown }).response
-  );
+  return request.body ?? undefined;
 }
 
 function isEdgeResponseLike(value: unknown): value is EdgeResponseLike {
@@ -585,12 +541,31 @@ function normalizeEdgeResponseHeaders(response: Response): Response {
   });
 }
 
+function resolveClientAssetSuffix(): string {
+  const token =
+    process.env.NEXT_DEPLOYMENT_ID ??
+    process.env.IMMUTABLE_ASSET_TOKEN ??
+    null;
+
+  if (typeof token === 'string' && token.length > 0) {
+    return `?dpl=${token}`;
+  }
+
+  if (
+    typeof process.env.NEXT_CLIENT_ASSET_SUFFIX === 'string' &&
+    process.env.NEXT_CLIENT_ASSET_SUFFIX.length > 0
+  ) {
+    return process.env.NEXT_CLIENT_ASSET_SUFFIX;
+  }
+
+  return '';
+}
+
 async function invokeEdgeRuntimeHandler({
   sandbox,
   request,
   pageName,
   routeMatches,
-  requestMeta,
   signal,
   incrementalCache,
 }: {
@@ -598,98 +573,131 @@ async function invokeEdgeRuntimeHandler({
   request: Request;
   pageName?: string;
   routeMatches?: Record<string, string>;
-  requestMeta?: Record<string, unknown>;
   signal: AbortSignal;
   incrementalCache: unknown;
 }): Promise<Response> {
   return withEdgeInvocationLock(async () => {
+    const hostGlobals = globalThis as EdgeHostGlobals;
+    const hostSnapshot = captureHostEdgeGlobals();
     try {
-      const edgeState = ensureEdgeGlobalsInitialized();
-      return await withPatchedEdgeFetch({
-        state: edgeState,
-        run: async () => {
-          await ensureEdgeOutputLoaded({
-            sandbox,
-          });
-          const edgeFunction = resolveEdgeEntryHandler({
-            outputId: sandbox.outputId,
-            entryKey: `middleware_${sandbox.name}`,
-          });
-
-          if (incrementalCache) {
-            const globalAny = globalThis as Record<string, unknown>;
-            globalAny.__incrementalCacheShared = true;
-            globalAny.__incrementalCache = incrementalCache;
-          }
-
-          const requestUrl = new URL(request.url);
-          const requestBody = await toEdgeRuntimeRequestBody(request);
-          const requestHeaders = toRequestHeadersRecord(request.headers, requestUrl.host);
-
-          const waitUntilTasks: Promise<unknown>[] = [];
-          const invoke = (): Promise<unknown> | unknown =>
-            edgeFunction({
-              request: {
-                headers: requestHeaders,
-                method: request.method,
-                url: requestUrl.toString(),
-                body: requestBody,
-                signal,
-                waitUntil(waitable: Promise<unknown>) {
-                  waitUntilTasks.push(waitable);
-                },
-                page: buildPagePayload({
-                  pageName,
-                  routeMatches,
-                }),
-                nextConfig: {
-                  basePath: sandbox.nextConfig.basePath,
-                  i18n: sandbox.nextConfig.i18n,
-                },
-                requestMeta,
-              },
-            });
-
-          const result = await invoke();
-
-          let responseValue: unknown;
-          if (isEdgeFetchEventResultLike(result)) {
-            responseValue = result.response;
-            if (result.waitUntil) {
-              waitUntilTasks.push(result.waitUntil);
-            }
-          } else {
-            responseValue = result;
-          }
-
-          for (const waitable of waitUntilTasks) {
-            void waitable.catch(() => undefined);
-          }
-
-          let response: Response;
-          if (isEdgeResponseLike(responseValue)) {
-            response = await toHostResponse(responseValue);
-          } else if (responseValue instanceof Response) {
-            response = responseValue;
-          } else if (responseValue !== undefined && responseValue !== null) {
-            response = asResponse(responseValue as Response | LambdaLikeResult);
-          } else {
-            throw new Error(
-              `Edge function handler for output "${sandbox.outputId}" returned no response`
-            );
-          }
-
-          return normalizeEdgeResponseHeaders(response);
-        },
-      });
-    } catch (error) {
-      logEdgeDebug('invocation failed', {
+      const edgeHandler = await ensureHostEdgeHandlerLoaded({
         outputId: sandbox.outputId,
-        requestUrl: request.url,
-        requestMethod: request.method,
-        error,
+        name: sandbox.name,
+        paths: sandbox.paths,
       });
-      throw error;
+
+      const edgeSnapshot = hostEdgeGlobalsByOutputId.get(sandbox.outputId);
+      if (edgeSnapshot) {
+        applyHostEdgeGlobals(edgeSnapshot);
+      }
+
+      const hadAssetSuffix = Object.prototype.hasOwnProperty.call(
+        hostGlobals,
+        'NEXT_CLIENT_ASSET_SUFFIX'
+      );
+      const previousAssetSuffix = hostGlobals.NEXT_CLIENT_ASSET_SUFFIX;
+      const hadIncrementalCache = Object.prototype.hasOwnProperty.call(
+        hostGlobals,
+        '__incrementalCache'
+      );
+      const previousIncrementalCache = hostGlobals.__incrementalCache;
+      const hadIncrementalCacheShared = Object.prototype.hasOwnProperty.call(
+        hostGlobals,
+        '__incrementalCacheShared'
+      );
+      const previousIncrementalCacheShared = hostGlobals.__incrementalCacheShared;
+
+      const requestUrl = new URL(request.url);
+      const requestHeaders = toRequestHeadersRecord(request.headers, requestUrl.host);
+      const requestBody = toEdgeRequestBody(request);
+      const waitUntilTasks: Promise<unknown>[] = [];
+
+      let invocationResult: unknown;
+      try {
+        hostGlobals.NEXT_CLIENT_ASSET_SUFFIX = resolveClientAssetSuffix();
+
+        if (incrementalCache !== undefined) {
+          hostGlobals.__incrementalCacheShared = true;
+          hostGlobals.__incrementalCache = incrementalCache;
+        }
+
+        const registerWaitUntil = (waitable: Promise<unknown>) => {
+          waitUntilTasks.push(waitable);
+        };
+        invocationResult = await edgeHandler({
+          request: {
+            headers: requestHeaders,
+            method: request.method,
+            nextConfig: {
+              basePath: sandbox.nextConfig.basePath,
+              i18n: sandbox.nextConfig.i18n,
+              trailingSlash: false,
+            },
+            url: requestUrl.toString(),
+            page: buildPagePayload({
+              pageName,
+              routeMatches,
+            }),
+            body: requestBody,
+            signal,
+            waitUntil(waitable: Promise<unknown>) {
+              registerWaitUntil(waitable);
+            },
+          },
+        });
+      } finally {
+        if (hadAssetSuffix) {
+          hostGlobals.NEXT_CLIENT_ASSET_SUFFIX = previousAssetSuffix;
+        } else {
+          delete hostGlobals.NEXT_CLIENT_ASSET_SUFFIX;
+        }
+
+        if (hadIncrementalCache) {
+          hostGlobals.__incrementalCache = previousIncrementalCache;
+        } else {
+          delete hostGlobals.__incrementalCache;
+        }
+
+        if (hadIncrementalCacheShared) {
+          hostGlobals.__incrementalCacheShared = previousIncrementalCacheShared;
+        } else {
+          delete hostGlobals.__incrementalCacheShared;
+        }
+      }
+
+      let rawResponse = invocationResult;
+      if (
+        invocationResult &&
+        typeof invocationResult === 'object' &&
+        'response' in invocationResult
+      ) {
+        const fetchEventResult = invocationResult as EdgeFetchEventResultLike;
+        rawResponse = fetchEventResult.response;
+        if (fetchEventResult.waitUntil) {
+          waitUntilTasks.push(fetchEventResult.waitUntil);
+        }
+      }
+
+      for (const waitable of waitUntilTasks) {
+        void waitable.catch(() => undefined);
+      }
+
+      let response: Response;
+      if (isEdgeResponseLike(rawResponse)) {
+        response = await toHostResponse(rawResponse);
+      } else if (rawResponse instanceof Response) {
+        response = rawResponse;
+      } else if (rawResponse !== undefined && rawResponse !== null) {
+        response = asResponse(rawResponse as Response | LambdaLikeResult);
+      } else {
+        throw new Error(
+          `Edge function handler for output "${sandbox.outputId}" returned no response`
+        );
+      }
+
+      return normalizeEdgeResponseHeaders(response);
+    } finally {
+      applyHostEdgeGlobals(hostSnapshot);
     }
   });
 }
@@ -707,6 +715,17 @@ export function createEdgeFunctionArtifactInvoker({
       continue;
     }
     outputById.set(output.id, output);
+
+    const sandbox = buildEdgeSandboxDefinition({
+      output,
+      adapterDir,
+      functionRoot: manifest.artifacts.functionRoot,
+      nextConfig: {
+        basePath: manifest.build.basePath,
+        i18n: manifest.build.i18n,
+      },
+    });
+    sandboxByOutputId.set(output.id, sandbox);
   }
 
   return async (ctx: FunctionRouteDispatchContext): Promise<Response> => {
@@ -715,19 +734,9 @@ export function createEdgeFunctionArtifactInvoker({
       throw new Error(`Unknown edge function output id "${ctx.output.id}"`);
     }
 
-    let sandbox = sandboxByOutputId.get(output.id);
+    const sandbox = sandboxByOutputId.get(output.id);
     if (!sandbox) {
-      sandbox = buildEdgeSandboxDefinition({
-        output,
-        adapterDir,
-        functionRoot: manifest.artifacts.functionRoot,
-        nextConfig: {
-          basePath: manifest.build.basePath,
-          buildId: manifest.build.buildId,
-          i18n: manifest.build.i18n,
-        },
-      });
-      sandboxByOutputId.set(output.id, sandbox);
+      throw new Error(`Missing edge sandbox definition for output "${output.id}"`);
     }
 
     return invokeEdgeRuntimeHandler({
@@ -735,14 +744,6 @@ export function createEdgeFunctionArtifactInvoker({
       request: ctx.request,
       pageName: output.sourcePage,
       routeMatches: ctx.routeMatches ?? undefined,
-      requestMeta: {
-        outputId: output.id,
-        source: ctx.source,
-        matchedPathname: ctx.matchedPathname,
-        routeMatches: ctx.routeMatches ?? null,
-        cacheState: ctx.cacheState ?? null,
-        initURL: ctx.request.url,
-      },
       signal: ctx.request.signal,
       incrementalCache,
     });
@@ -773,12 +774,11 @@ export function createEdgeMiddlewareInvoker({
       output,
       adapterDir,
       functionRoot: manifest.artifacts.functionRoot,
-        nextConfig: {
-          basePath: manifest.build.basePath,
-          buildId: manifest.build.buildId,
-          i18n: manifest.build.i18n,
-        },
-      });
+      nextConfig: {
+        basePath: manifest.build.basePath,
+        i18n: manifest.build.i18n,
+      },
+    });
 
     const response = await invokeEdgeRuntimeHandler({
       sandbox,
@@ -786,22 +786,20 @@ export function createEdgeMiddlewareInvoker({
         method: 'GET',
         headers: ctx.headers,
       }),
-      requestMeta: {
-        initURL: ctx.url.toString(),
-      },
       signal: AbortSignal.timeout(30_000),
-      incrementalCache,
+      incrementalCache: undefined,
     });
+    const normalizedResponse = normalizeMiddlewareSetCookieHeaders(response);
 
     const middlewareResult = responseToMiddlewareResult(
-      response,
+      normalizedResponse,
       ctx.headers,
       ctx.url
     );
 
     return {
       ...middlewareResult,
-      response: middlewareResult.bodySent ? response : undefined,
+      response: middlewareResult.bodySent ? normalizedResponse : undefined,
     };
   };
 }
