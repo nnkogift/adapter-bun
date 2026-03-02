@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readdir, stat, writeFile } from 'node:fs/promises';
+import { copyFile, cp, lstat, mkdir, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { AdapterOutput } from 'next';
 import type {
@@ -160,7 +160,31 @@ async function copyToOutDir({
   const normalizedRelativePath = normalizeRelativePath(relativePath);
   const destinationPath = resolveInside(outDir, normalizedRelativePath);
   await mkdir(path.dirname(destinationPath), { recursive: true });
-  await copyFile(sourcePath, destinationPath);
+
+  const sourceLStat = await lstat(sourcePath);
+  let sourceCopyPath = sourcePath;
+  let sourceStat = sourceLStat;
+
+  if (sourceLStat.isSymbolicLink()) {
+    sourceCopyPath = await realpath(sourcePath);
+    sourceStat = await stat(sourceCopyPath);
+  }
+
+  if (sourceStat.isDirectory()) {
+    await cp(sourceCopyPath, destinationPath, {
+      recursive: true,
+      force: true,
+    });
+    return;
+  }
+
+  if (!sourceStat.isFile()) {
+    throw new Error(
+      `Unsupported asset type for "${sourcePath}" while staging "${relativePath}"`
+    );
+  }
+
+  await copyFile(sourceCopyPath, destinationPath);
 }
 
 async function findFilesRecursively(rootDir: string): Promise<string[]> {

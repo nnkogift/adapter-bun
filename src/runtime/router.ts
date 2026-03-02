@@ -422,20 +422,92 @@ function shouldAttemptAppNotFoundFunction({
   requestPathname: string;
   basePath: string;
 }): boolean {
-  const pathnameWithoutBasePath =
-    basePath && requestPathname.startsWith(`${basePath}/`)
-      ? requestPathname.slice(basePath.length)
-      : requestPathname;
+  const requestInfo = analyzeNotFoundRequest({
+    requestPathname,
+    basePath,
+  });
 
-  if (
-    pathnameWithoutBasePath.startsWith('/_next/') ||
-    pathnameWithoutBasePath.startsWith('/api/')
-  ) {
+  if (requestInfo.isNextInternalPath || requestInfo.isApiPath) {
     return false;
   }
 
+  return !requestInfo.isAssetPath;
+}
+
+type NotFoundRequestInfo = {
+  isWithinBasePath: boolean;
+  startsWithBasePathPrefix: boolean;
+  pathnameWithoutBasePath: string;
+  isNextInternalPath: boolean;
+  isApiPath: boolean;
+  isAssetPath: boolean;
+};
+
+function analyzeNotFoundRequest({
+  requestPathname,
+  basePath,
+}: {
+  requestPathname: string;
+  basePath: string;
+}): NotFoundRequestInfo {
+  const startsWithBasePathPrefix =
+    basePath.length > 0 && requestPathname.startsWith(basePath);
+  const isWithinBasePath =
+    basePath.length === 0 ||
+    requestPathname === basePath ||
+    requestPathname.startsWith(`${basePath}/`);
+
+  const pathnameWithoutBasePath =
+    isWithinBasePath && basePath
+      ? requestPathname.slice(basePath.length)
+      : requestPathname;
+  const isNextInternalPath =
+    pathnameWithoutBasePath.startsWith('/_next/') ||
+    pathnameWithoutBasePath.includes('/_next/');
+  const isApiPath = pathnameWithoutBasePath.startsWith('/api/');
   const lastSegment = pathnameWithoutBasePath.split('/').pop() ?? '';
-  return !STATIC_FILE_EXTENSION_PATTERN.test(lastSegment);
+  const isAssetPath = STATIC_FILE_EXTENSION_PATTERN.test(lastSegment);
+
+  return {
+    isWithinBasePath,
+    startsWithBasePathPrefix,
+    pathnameWithoutBasePath,
+    isNextInternalPath,
+    isApiPath,
+    isAssetPath,
+  };
+}
+
+function shouldAttemptPagesNotFoundRoute(
+  requestInfo: NotFoundRequestInfo
+): boolean {
+  return (
+    requestInfo.isWithinBasePath &&
+    !requestInfo.isNextInternalPath &&
+    !requestInfo.isApiPath &&
+    !requestInfo.isAssetPath
+  );
+}
+
+function resolveDefaultNotFoundBody({
+  requestInfo,
+  hasBasePath,
+}: {
+  requestInfo: NotFoundRequestInfo;
+  hasBasePath: boolean;
+}): string {
+  if (requestInfo.isAssetPath || requestInfo.isNextInternalPath) {
+    return 'Not Found';
+  }
+
+  if (hasBasePath && !requestInfo.isWithinBasePath) {
+    if (requestInfo.startsWithBasePathPrefix) {
+      return '404: This page could not be found';
+    }
+    return 'NOT_FOUND';
+  }
+
+  return 'This page could not be found';
 }
 
 function stripMiddlewareResponse(
@@ -600,8 +672,14 @@ function withRouteMetadata(
   });
 }
 
-function notFoundResponse(status = 404): Response {
-  return new Response('This page could not be found', {
+function notFoundResponse({
+  status = 404,
+  body = 'This page could not be found',
+}: {
+  status?: number;
+  body?: string;
+} = {}): Response {
+  return new Response(body, {
     status,
     headers: {
       'content-type': 'text/plain; charset=utf-8',
@@ -1477,6 +1555,211 @@ function hasOutputPathname(
   );
 }
 
+async function maybeServeAppNotFound({
+  request,
+  resolution,
+  indexes,
+  options,
+  routeMatches,
+}: {
+  request: Request;
+  resolution: RouteResolutionResult;
+  indexes: RouteIndexes;
+  options: RouterRuntimeOptions;
+  routeMatches: Record<string, string | string[]> | undefined;
+}): Promise<Response | null> {
+  const appNotFoundPathname = '/_not-found';
+  const appNotFoundStaticAsset =
+    indexes.staticByPathname.get(appNotFoundPathname);
+  if (appNotFoundStaticAsset) {
+    const appNotFoundResponse = await options.serveStatic({
+      request,
+      matchedPathname: appNotFoundPathname,
+      routeMatches: undefined,
+      resolution,
+      asset: appNotFoundStaticAsset,
+      source: 'static',
+    });
+    return withRouteMetadata(
+      withRscVaryForRequest(
+        applyResolutionToResponse(appNotFoundResponse, resolution, 404),
+        request
+      ),
+      {
+        kind: 'not-found',
+        id: appNotFoundStaticAsset.id,
+      }
+    );
+  }
+
+  const appNotFoundPrerender = indexes.prerenderByPathname.get(appNotFoundPathname);
+  if (appNotFoundPrerender) {
+    const appNotFoundParentOutput = indexes.functionById.get(
+      appNotFoundPrerender.parentOutputId
+    );
+    if (appNotFoundParentOutput) {
+      const appNotFoundResponse = await options.invokeFunction({
+        request,
+        matchedPathname: appNotFoundPathname,
+        routeMatches: undefined,
+        resolution,
+        output: appNotFoundParentOutput,
+        source: 'prerender-parent',
+        prerenderSeed: appNotFoundPrerender,
+        cacheState: undefined,
+      });
+      return withRouteMetadata(
+        withRscVaryForRequest(
+          applyResolutionToResponse(appNotFoundResponse, resolution, 404),
+          request
+        ),
+        {
+          kind: 'not-found',
+          id: appNotFoundPrerender.id,
+        }
+      );
+    }
+  }
+
+  const appNotFoundOutput = indexes.functionByPathname.get(appNotFoundPathname);
+  if (appNotFoundOutput) {
+    const appNotFoundResponse = await options.invokeFunction({
+      request,
+      matchedPathname: appNotFoundPathname,
+      routeMatches,
+      resolution,
+      output: appNotFoundOutput,
+      source: 'function',
+      prerenderSeed: null,
+      cacheState: undefined,
+    });
+    return withRouteMetadata(
+      applyResolutionToResponse(appNotFoundResponse, resolution, 404),
+      {
+        kind: 'not-found',
+        id: appNotFoundOutput.id,
+      }
+    );
+  }
+
+  return null;
+}
+
+function decodeURIComponentSafe(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+type DynamicSegmentDescriptor = {
+  name: string;
+  catchAll: boolean;
+  optionalCatchAll: boolean;
+};
+
+function parseDynamicSegmentDescriptor(
+  segment: string
+): DynamicSegmentDescriptor | null {
+  const optionalCatchAllMatch = segment.match(/^\[\[\.\.\.(.+)\]\]$/);
+  if (optionalCatchAllMatch?.[1]) {
+    return {
+      name: optionalCatchAllMatch[1],
+      catchAll: true,
+      optionalCatchAll: true,
+    };
+  }
+
+  const catchAllMatch = segment.match(/^\[\.\.\.(.+)\]$/);
+  if (catchAllMatch?.[1]) {
+    return {
+      name: catchAllMatch[1],
+      catchAll: true,
+      optionalCatchAll: false,
+    };
+  }
+
+  const singleMatch = segment.match(/^\[(.+)\]$/);
+  if (singleMatch?.[1]) {
+    return {
+      name: singleMatch[1],
+      catchAll: false,
+      optionalCatchAll: false,
+    };
+  }
+
+  return null;
+}
+
+function normalizeRouteMatchesForPathname({
+  matchedPathname,
+  routeMatches,
+}: {
+  matchedPathname: string;
+  routeMatches: Record<string, string> | undefined;
+}): Record<string, string | string[]> | undefined {
+  if (!routeMatches || Object.keys(routeMatches).length === 0) {
+    return undefined;
+  }
+
+  const dynamicSegments = matchedPathname
+    .split('/')
+    .filter(Boolean)
+    .map(parseDynamicSegmentDescriptor)
+    .filter((value): value is DynamicSegmentDescriptor => value !== null);
+  if (dynamicSegments.length === 0) {
+    return undefined;
+  }
+
+  const normalized: Record<string, string | string[]> = {};
+  const numericValues = Object.entries(routeMatches)
+    .filter(([key]) => /^\d+$/.test(key))
+    .sort((left, right) => Number(left[0]) - Number(right[0]))
+    .map(([, value]) => value);
+  let numericIndex = 0;
+
+  for (const [key, value] of Object.entries(routeMatches)) {
+    if (/^\d+$/.test(key)) {
+      continue;
+    }
+    if (key.startsWith('nxtP')) {
+      continue;
+    }
+    normalized[key] = value;
+  }
+
+  for (const segment of dynamicSegments) {
+    const fallbackValue = numericValues[numericIndex];
+    let rawValue = normalized[segment.name];
+    if (typeof rawValue !== 'string' && typeof fallbackValue === 'string') {
+      rawValue = fallbackValue;
+      numericIndex += 1;
+    }
+
+    if (typeof rawValue !== 'string') {
+      continue;
+    }
+
+    if (segment.catchAll) {
+      const parts = rawValue
+        .split('/')
+        .filter((part) => part.length > 0)
+        .map((part) => decodeURIComponentSafe(part));
+      if (parts.length === 0 && segment.optionalCatchAll) {
+        delete normalized[segment.name];
+      } else {
+        normalized[segment.name] = parts;
+      }
+      continue;
+    }
+
+    normalized[segment.name] = decodeURIComponentSafe(rawValue);
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
 function isRedirectResolution(resolution: RouteResolutionResult): boolean {
   if (!resolution.status) return false;
   if (resolution.status < 300 || resolution.status >= 400) return false;
@@ -2024,9 +2307,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         resolvedMiddlewareRewriteUrl.origin === originalRequestUrl.origin &&
         (resolvedMiddlewareRewriteUrl.pathname !== originalRequestUrl.pathname ||
           resolvedMiddlewareRewriteUrl.search !== originalRequestUrl.search);
-      const effectiveRouteMatches = didInternalMiddlewareRewrite
-        ? undefined
-        : resolution.routeMatches;
+      const effectiveRouteMatches = resolution.routeMatches;
 
       if (resolution.redirect) {
         const redirectResolution = withoutResolvedLocationHeader(resolution);
@@ -2202,9 +2483,6 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       }
 
       let matchedPathname = resolution.matchedPathname;
-      if (didInternalMiddlewareRewrite) {
-        matchedPathname = undefined;
-      }
       if (!matchedPathname) {
         matchedPathname = maybeResolveDirectPathnameFallback({
           requestPathname: requestUrl.pathname,
@@ -2220,39 +2498,132 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         }) ?? undefined;
       }
       if (!matchedPathname) {
-        const appNotFoundOutput = indexes.functionByPathname.get('/_not-found');
+        const notFoundRequestInfo = analyzeNotFoundRequest({
+          requestPathname: requestUrl.pathname,
+          basePath: manifest.build.basePath,
+        });
         if (
-          appNotFoundOutput &&
           shouldAttemptAppNotFoundFunction({
             requestPathname: requestUrl.pathname,
             basePath: manifest.build.basePath,
           })
         ) {
-          const appNotFoundResponse = await options.invokeFunction({
+          const appNotFoundResponse = await maybeServeAppNotFound({
             request: requestWithMiddlewareMutations,
-            matchedPathname: '/_not-found',
-            routeMatches: effectiveRouteMatches,
             resolution,
-            output: appNotFoundOutput,
-            source: 'function',
-            prerenderSeed: null,
-            cacheState: undefined,
+            indexes,
+            options,
+            routeMatches: effectiveRouteMatches,
           });
-          return withRouteMetadata(
-            applyResolutionToResponse(appNotFoundResponse, resolution, 404),
-            {
-              kind: 'not-found',
-              id: appNotFoundOutput.id,
-            }
-          );
+          if (appNotFoundResponse) {
+            return appNotFoundResponse;
+          }
         }
 
+        if (shouldAttemptPagesNotFoundRoute(notFoundRequestInfo)) {
+          const pages404Pathname = '/404';
+          const pagesNotFoundStaticAsset =
+            indexes.staticByPathname.get(pages404Pathname);
+          if (pagesNotFoundStaticAsset) {
+            const pagesNotFoundResponse = await options.serveStatic({
+              request: requestWithMiddlewareMutations,
+              matchedPathname: pages404Pathname,
+              routeMatches: undefined,
+              resolution,
+              asset: pagesNotFoundStaticAsset,
+              source: 'static',
+            });
+            return withRouteMetadata(
+              withRscVaryForRequest(
+                applyResolutionToResponse(
+                  pagesNotFoundResponse,
+                  resolution,
+                  resolution.status ?? 404
+                ),
+                requestWithMiddlewareMutations
+              ),
+              {
+                kind: 'not-found',
+                id: pagesNotFoundStaticAsset.id,
+              }
+            );
+          }
+
+          const pagesNotFoundPrerender = indexes.prerenderByPathname.get(pages404Pathname);
+          if (pagesNotFoundPrerender) {
+            const pagesNotFoundParentOutput = indexes.functionById.get(
+              pagesNotFoundPrerender.parentOutputId
+            );
+            if (pagesNotFoundParentOutput) {
+              const pagesNotFoundResponse = await options.invokeFunction({
+                request: requestWithMiddlewareMutations,
+                matchedPathname: pages404Pathname,
+                routeMatches: undefined,
+                resolution,
+                output: pagesNotFoundParentOutput,
+                source: 'prerender-parent',
+                prerenderSeed: pagesNotFoundPrerender,
+                cacheState: undefined,
+              });
+              return withRouteMetadata(
+                withRscVaryForRequest(
+                  applyResolutionToResponse(
+                    pagesNotFoundResponse,
+                    resolution,
+                    resolution.status ?? 404
+                  ),
+                  requestWithMiddlewareMutations
+                ),
+                {
+                  kind: 'not-found',
+                  id: pagesNotFoundPrerender.id,
+                }
+              );
+            }
+          }
+
+          const pagesNotFoundOutput = indexes.functionByPathname.get(pages404Pathname);
+          if (pagesNotFoundOutput) {
+            const pagesNotFoundResponse = await options.invokeFunction({
+              request: requestWithMiddlewareMutations,
+              matchedPathname: pages404Pathname,
+              routeMatches: undefined,
+              resolution,
+              output: pagesNotFoundOutput,
+              source: 'function',
+              prerenderSeed: null,
+              cacheState: undefined,
+            });
+            return withRouteMetadata(
+              withRscVaryForRequest(
+                applyResolutionToResponse(
+                  pagesNotFoundResponse,
+                  resolution,
+                  resolution.status ?? 404
+                ),
+                requestWithMiddlewareMutations
+              ),
+              {
+                kind: 'not-found',
+                id: pagesNotFoundOutput.id,
+              }
+            );
+          }
+        }
+
+        const notFoundBody = resolveDefaultNotFoundBody({
+          requestInfo: notFoundRequestInfo,
+          hasBasePath: manifest.build.basePath.length > 0,
+        });
         const response = options.handleNotFound
           ? await options.handleNotFound({
             request: requestWithMiddlewareMutations,
             resolution,
           })
-          : notFoundResponse(resolution.status ?? 404);
+          : notFoundResponse({
+            status: resolution.status ?? 404,
+            body: notFoundBody,
+          });
         return withRouteMetadata(applyResolutionToResponse(response, resolution), {
           kind: 'not-found',
         });
@@ -2273,6 +2644,10 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         matchedPathname: normalizedMatchedPathname,
         manifest,
         indexes,
+      });
+      const resolvedRouteMatches = normalizeRouteMatchesForPathname({
+        matchedPathname: resolvedMatchedPathname,
+        routeMatches: effectiveRouteMatches,
       });
       if (debugMiddleware) {
         const debugUrl = new URL(request.url);
@@ -2297,7 +2672,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         const response = await options.serveStatic({
           request,
           matchedPathname: resolvedMatchedPathname,
-          routeMatches: effectiveRouteMatches,
+          routeMatches: resolvedRouteMatches,
           resolution,
           asset: staticAsset,
           source: 'static',
@@ -2440,7 +2815,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           const generatedResponse = await options.invokeFunction({
             request: invocationRequest,
             matchedPathname: resolvedMatchedPathname,
-            routeMatches: effectiveRouteMatches,
+            routeMatches: resolvedRouteMatches,
             resolution,
             output: parentOutput,
             source: 'prerender-parent',
@@ -2478,7 +2853,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           const response = await options.handlePrerender({
             request,
             matchedPathname: resolvedMatchedPathname,
-            routeMatches: effectiveRouteMatches,
+            routeMatches: resolvedRouteMatches,
             resolution,
             seed: prerenderSeed,
             parentOutput:
@@ -2576,7 +2951,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
               const fallbackResponse = await options.serveStatic({
                 request,
                 matchedPathname: resolvedMatchedPathname,
-                routeMatches: effectiveRouteMatches,
+                routeMatches: resolvedRouteMatches,
                 resolution,
                 source: 'static',
                 cacheState: 'MISS',
@@ -2632,7 +3007,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
                   options.invokeFunction({
                     request: resumeRequest,
                     matchedPathname: resolvedMatchedPathname,
-                    routeMatches: effectiveRouteMatches,
+                    routeMatches: resolvedRouteMatches,
                     resolution,
                     output: parentOutput,
                     source: 'prerender-parent',
@@ -2682,9 +3057,26 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
             }
 
             if (!hadExistingEntry && prerenderSeed.parentFallbackMode === false) {
+              const appNotFoundResponse = await maybeServeAppNotFound({
+                request: requestWithMiddlewareMutations,
+                resolution,
+                indexes,
+                options,
+                routeMatches: resolvedRouteMatches,
+              });
+              if (appNotFoundResponse) {
+                return withRouteMetadata(
+                  withCacheState(applyResolutionToResponse(appNotFoundResponse, resolution, 404), 'MISS'),
+                  { kind: 'prerender', id: prerenderSeed.id }
+                );
+              }
               return withRouteMetadata(
                 withCacheState(
-                  applyResolutionToResponse(notFoundResponse(404), resolution, 404),
+                  applyResolutionToResponse(
+                    notFoundResponse({ status: 404 }),
+                    resolution,
+                    404
+                  ),
                   'MISS'
                 ),
                 { kind: 'prerender', id: prerenderSeed.id }
@@ -2723,13 +3115,33 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           const generatedResponse = await options.invokeFunction({
             request: invocationRequest,
             matchedPathname: resolvedMatchedPathname,
-            routeMatches: effectiveRouteMatches,
+            routeMatches: resolvedRouteMatches,
             resolution,
             output: parentOutput,
             source: 'prerender-parent',
             prerenderSeed,
             cacheState: bypass ? 'BYPASS' : 'MISS',
           });
+
+          if (
+            generatedResponse.status === 404 &&
+            parentOutput.type === 'PAGES' &&
+            shouldAttemptAppNotFoundFunction({
+              requestPathname: requestUrl.pathname,
+              basePath: manifest.build.basePath,
+            })
+          ) {
+            const appNotFoundResponse = await maybeServeAppNotFound({
+              request: requestWithMiddlewareMutations,
+              resolution,
+              indexes,
+              options,
+              routeMatches: resolvedRouteMatches,
+            });
+            if (appNotFoundResponse) {
+              return withCacheState(appNotFoundResponse, bypass ? 'BYPASS' : 'MISS');
+            }
+          }
 
           if (!bypass) {
             const shouldCache =
@@ -2762,7 +3174,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           const fallbackResponse = await options.serveStatic({
             request,
             matchedPathname: resolvedMatchedPathname,
-            routeMatches: effectiveRouteMatches,
+            routeMatches: resolvedRouteMatches,
             resolution,
             source: 'static',
             cacheState: 'MISS',
@@ -2810,7 +3222,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
               options.invokeFunction({
                 request: resumeRequest,
                 matchedPathname: resolvedMatchedPathname,
-                routeMatches: effectiveRouteMatches,
+                routeMatches: resolvedRouteMatches,
                 resolution,
                 output: parentOutput,
                 source: 'prerender-parent',
@@ -2864,7 +3276,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
             }),
           }),
           matchedPathname: resolvedMatchedPathname,
-          routeMatches: effectiveRouteMatches,
+          routeMatches: resolvedRouteMatches,
           resolution,
           output: parentOutput,
           source: 'prerender-parent',
@@ -2898,8 +3310,22 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           }
 
           if (!allowedSeedPaths.has(ancestorSeedPathname)) {
+            const appNotFoundResponse = await maybeServeAppNotFound({
+              request: requestWithMiddlewareMutations,
+              resolution,
+              indexes,
+              options,
+              routeMatches: resolvedRouteMatches,
+            });
+            if (appNotFoundResponse) {
+              return appNotFoundResponse;
+            }
             return withRouteMetadata(
-              applyResolutionToResponse(notFoundResponse(404), resolution, 404),
+              applyResolutionToResponse(
+                notFoundResponse({ status: 404 }),
+                resolution,
+                404
+              ),
               { kind: 'not-found' }
             );
           }
@@ -2908,13 +3334,32 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         const response = await options.invokeFunction({
           request: requestWithMiddlewareMutations,
           matchedPathname: resolvedMatchedPathname,
-          routeMatches: effectiveRouteMatches,
+          routeMatches: resolvedRouteMatches,
           resolution,
           output,
           source: 'function',
           prerenderSeed: null,
           cacheState: undefined,
         });
+        if (
+          output.type === 'PAGES' &&
+          response.status === 404 &&
+          shouldAttemptAppNotFoundFunction({
+            requestPathname: requestUrl.pathname,
+            basePath: manifest.build.basePath,
+          })
+        ) {
+          const appNotFoundResponse = await maybeServeAppNotFound({
+            request: requestWithMiddlewareMutations,
+            resolution,
+            indexes,
+            options,
+            routeMatches: resolvedRouteMatches,
+          });
+          if (appNotFoundResponse) {
+            return appNotFoundResponse;
+          }
+        }
         return withRouteMetadata(
           withRscVaryForRequest(
             applyResolutionToResponse(response, resolution),
@@ -2927,12 +3372,41 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         );
       }
 
+      if (
+        resolvedMatchedPathname !== '/_not-found' &&
+        shouldAttemptAppNotFoundFunction({
+          requestPathname: requestUrl.pathname,
+          basePath: manifest.build.basePath,
+        })
+      ) {
+        const appNotFoundResponse = await maybeServeAppNotFound({
+          request: requestWithMiddlewareMutations,
+          resolution,
+          indexes,
+          options,
+          routeMatches: resolvedRouteMatches,
+        });
+        if (appNotFoundResponse) {
+          return appNotFoundResponse;
+        }
+      }
+
+      const notFoundBody = resolveDefaultNotFoundBody({
+        requestInfo: analyzeNotFoundRequest({
+          requestPathname: requestUrl.pathname,
+          basePath: manifest.build.basePath,
+        }),
+        hasBasePath: manifest.build.basePath.length > 0,
+      });
       const response = options.handleNotFound
         ? await options.handleNotFound({
           request: requestWithMiddlewareMutations,
           resolution,
         })
-        : notFoundResponse(resolution.status ?? 404);
+        : notFoundResponse({
+          status: resolution.status ?? 404,
+          body: notFoundBody,
+        });
       return withRouteMetadata(applyResolutionToResponse(response, resolution), {
         kind: 'not-found',
       });

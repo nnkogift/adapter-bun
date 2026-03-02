@@ -8,6 +8,7 @@ import {
   buildDeploymentManifest,
   buildRouterManifest,
   collectOutputPathnames,
+  mergePathnamesWithStaticAssets,
 } from './manifest.ts';
 import { SCHEMA_SQL } from './runtime/sqlite-cache.ts';
 import {
@@ -225,17 +226,42 @@ const server = Bun.serve({
   hostname: manifest.server.hostname,
   // Keep upstream keep-alive sockets stable across long e2e browser gaps.
   idleTimeout: 120,
-  fetch(request) {
+  async fetch(request) {
     resetNextFetchPatchState();
     const url = new URL(request.url);
     url.protocol = 'http:';
-    url.host = listenAuthority;
+    const incomingHost = request.headers.get('host');
+    const requestAuthority =
+      typeof incomingHost === 'string' && incomingHost.length > 0
+        ? incomingHost
+        : listenAuthority;
+    url.host = requestAuthority;
     const headers = new Headers(request.headers);
-    headers.set('host', listenAuthority);
+    headers.set('host', requestAuthority);
+    const originalMethod = headers.get('x-adapter-original-method');
+    let runtimeBody = request.body;
+    if (
+      runtimeBody === null &&
+      request.method !== 'GET' &&
+      request.method !== 'HEAD' &&
+      request.headers.get('content-length') !== null
+    ) {
+      const requestWithBytes = request;
+      if (typeof requestWithBytes.bytes === 'function') {
+        try {
+          const bytes = await requestWithBytes.bytes();
+          if (bytes.byteLength > 0) {
+            runtimeBody = bytes;
+          }
+        } catch {
+          // Fall back to the original body stream.
+        }
+      }
+    }
     const runtimeRequest = new Request(url, {
       method: request.method,
       headers,
-      body: request.body,
+      body: runtimeBody,
       signal: request.signal,
     });
     const debugBlogNav =
@@ -247,6 +273,7 @@ const server = Bun.serve({
         method: request.method,
         pathname: url.pathname,
         search: url.search,
+        originalMethodHeader: originalMethod,
       });
     }
     if (debugBlogNav) {
@@ -260,57 +287,66 @@ const server = Bun.serve({
         accept: headers.get('accept'),
       });
     }
-    return runtime.handleRequest(runtimeRequest)
-      .then((response) => {
-        if (debugBlogNav) {
-          console.log('[adapter-bun][blog-nav][response]', {
-            method: request.method,
-            url: url.toString(),
-            status: response.status,
-            contentType: response.headers.get('content-type'),
-            vary: response.headers.get('vary'),
-            routeKind: response.headers.get('x-bun-route-kind'),
-            routeId: response.headers.get('x-bun-route-id'),
-            bunCache: response.headers.get('x-bun-cache'),
-            nextjsCache: response.headers.get('x-nextjs-cache'),
-          });
-        }
-        if (debugRequests) {
-          console.log('[adapter-bun][request:response]', {
-            method: request.method,
-            pathname: url.pathname,
-            search: url.search,
-            status: response.status,
-            contentType: response.headers.get('content-type'),
-          });
-        }
-        const responseHeaders = new Headers(response.headers);
-        responseHeaders.set('connection', 'close');
-        return new Response(response.body, {
+    try {
+      const response = await runtime.handleRequest(runtimeRequest);
+      if (debugBlogNav) {
+        console.log('[adapter-bun][blog-nav][response]', {
+          method: request.method,
+          url: url.toString(),
           status: response.status,
-          statusText: response.statusText,
-          headers: responseHeaders,
+          contentType: response.headers.get('content-type'),
+          vary: response.headers.get('vary'),
+          routeKind: response.headers.get('x-bun-route-kind'),
+          routeId: response.headers.get('x-bun-route-id'),
+          bunCache: response.headers.get('x-bun-cache'),
+          nextjsCache: response.headers.get('x-nextjs-cache'),
         });
-      })
-      .catch((error) => {
-        console.error('[adapter-bun] request handler error', {
-          error,
-          request: {
-            method: request.method,
-            url: url.toString(),
-          },
+      }
+      if (debugRequests) {
+        console.log('[adapter-bun][request:response]', {
+          method: request.method,
+          pathname: url.pathname,
+          search: url.search,
+          status: response.status,
+          contentType: response.headers.get('content-type'),
         });
-        if (debugRequests) {
-          console.log('[adapter-bun][request:response]', {
-            method: request.method,
-            pathname: url.pathname,
-            search: url.search,
-            status: 500,
-            contentType: 'text/plain;charset=UTF-8',
-          });
-        }
-        return new Response('Internal Server Error', { status: 500 });
+      }
+      const responseHeaders = new Headers(response.headers);
+      if (
+        url.pathname.startsWith(\`/_next/data/\${manifest.build.buildId}/\`) &&
+        url.pathname.endsWith('.json') &&
+        !responseHeaders.has('x-nextjs-deployment-id')
+      ) {
+        responseHeaders.set(
+          'x-nextjs-deployment-id',
+          process.env.NEXT_DEPLOYMENT_ID || \`bun-adapter-\${manifest.build.buildId}\`
+        );
+      }
+      responseHeaders.set('connection', 'close');
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
       });
+    } catch (error) {
+      console.error('[adapter-bun] request handler error', {
+        error,
+        request: {
+          method: request.method,
+          url: url.toString(),
+        },
+      });
+      if (debugRequests) {
+        console.log('[adapter-bun][request:response]', {
+          method: request.method,
+          pathname: url.pathname,
+          search: url.search,
+          status: 500,
+          contentType: 'text/plain;charset=UTF-8',
+        });
+      }
+      return new Response('Internal Server Error', { status: 500 });
+    }
   },
 });
 
@@ -622,7 +658,7 @@ async function onBuildComplete(
   await mkdir(outDir, { recursive: true });
 
   const generatedAt = new Date().toISOString();
-  const pathnames = collectOutputPathnames(ctx.outputs);
+  const outputPathnames = collectOutputPathnames(ctx.outputs);
 
   const [staticAssets, functionMap, prerenderSeeds] = await Promise.all([
     stageStaticAssets({
@@ -642,6 +678,7 @@ async function onBuildComplete(
       outDir,
     }),
   ]);
+  const pathnames = mergePathnamesWithStaticAssets(outputPathnames, staticAssets);
 
   const routerManifestPath = 'router-manifest.json';
   const routerManifest = buildRouterManifest({

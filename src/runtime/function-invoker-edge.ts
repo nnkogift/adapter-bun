@@ -7,12 +7,14 @@ import { responseToMiddlewareResult } from '@next/routing';
 import type { BunDeploymentManifest, BunFunctionArtifact } from '../types.ts';
 import type {
   FunctionRouteDispatchContext,
+  RouteMatches,
   RouterMiddlewareResult,
   RouterRuntimeHandlers,
 } from './types.ts';
 import {
   asResponse,
   resolveOutputFilePath,
+  shouldInvokeMiddlewareForRequest,
   type CreateFunctionArtifactInvokerOptions,
   type LambdaLikeResult,
 } from './function-invoker-shared.ts';
@@ -62,7 +64,7 @@ type EdgeHostHandler = (params: {
       trailingSlash?: boolean;
     };
     url: string;
-    page?: { name?: string; params?: Record<string, string> };
+    page?: { name?: string; params?: RouteMatches };
     body?: ReadableStream<Uint8Array>;
     signal: AbortSignal;
     waitUntil?: (promise: Promise<unknown>) => void;
@@ -479,8 +481,8 @@ function buildPagePayload({
   routeMatches,
 }: {
   pageName?: string;
-  routeMatches?: Record<string, string>;
-}): { name?: string; params?: Record<string, string> } | undefined {
+  routeMatches?: RouteMatches;
+}): { name?: string; params?: RouteMatches } | undefined {
   if (pageName === undefined) {
     return undefined;
   }
@@ -572,7 +574,7 @@ async function invokeEdgeRuntimeHandler({
   sandbox: EdgeSandboxDefinition;
   request: Request;
   pageName?: string;
-  routeMatches?: Record<string, string>;
+  routeMatches?: RouteMatches;
   signal: AbortSignal;
   incrementalCache: unknown;
 }): Promise<Response> {
@@ -608,9 +610,29 @@ async function invokeEdgeRuntimeHandler({
       const previousIncrementalCacheShared = hostGlobals.__incrementalCacheShared;
 
       const requestUrl = new URL(request.url);
-      const requestHeaders = toRequestHeadersRecord(request.headers, requestUrl.host);
+      const requestUrlWithParams = new URL(requestUrl.toString());
+      if (routeMatches) {
+        for (const [key, value] of Object.entries(routeMatches)) {
+          requestUrlWithParams.searchParams.delete(key);
+          if (Array.isArray(value)) {
+            for (const item of value) {
+              requestUrlWithParams.searchParams.append(key, item);
+            }
+          } else {
+            requestUrlWithParams.searchParams.set(key, value);
+          }
+        }
+      }
+      const requestHeaders = toRequestHeadersRecord(
+        request.headers,
+        requestUrlWithParams.host
+      );
       const requestBody = toEdgeRequestBody(request);
       const waitUntilTasks: Promise<unknown>[] = [];
+      const pagePayload = buildPagePayload({
+        pageName,
+        routeMatches,
+      });
 
       let invocationResult: unknown;
       try {
@@ -633,11 +655,8 @@ async function invokeEdgeRuntimeHandler({
               i18n: sandbox.nextConfig.i18n,
               trailingSlash: false,
             },
-            url: requestUrl.toString(),
-            page: buildPagePayload({
-              pageName,
-              routeMatches,
-            }),
+            url: requestUrlWithParams.toString(),
+            page: pagePayload,
             body: requestBody,
             signal,
             waitUntil(waitable: Promise<unknown>) {
@@ -742,7 +761,7 @@ export function createEdgeFunctionArtifactInvoker({
     return invokeEdgeRuntimeHandler({
       sandbox,
       request: ctx.request,
-      pageName: output.sourcePage,
+      pageName: output.pathname,
       routeMatches: ctx.routeMatches ?? undefined,
       signal: ctx.request.signal,
       incrementalCache,
@@ -770,6 +789,10 @@ export function createEdgeMiddlewareInvoker({
   let sandbox: EdgeSandboxDefinition | undefined;
 
   return async (ctx: MiddlewareContext): Promise<RouterMiddlewareResult> => {
+    if (!shouldInvokeMiddlewareForRequest(output, ctx)) {
+      return {};
+    }
+
     sandbox ??= buildEdgeSandboxDefinition({
       output,
       adapterDir,

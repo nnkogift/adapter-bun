@@ -25,6 +25,7 @@ import {
   defaultLoadModule,
   resolveOutputEntrypointPath,
   resolveRouteHandlerExport,
+  shouldInvokeMiddlewareForRequest,
   type ArtifactRouteHandler,
   type CreateFunctionArtifactInvokerOptions,
   type LoadedModule,
@@ -36,6 +37,24 @@ type LoadedNodeExecutor = {
   workingDirectory: string;
   patchFetch?: () => void;
 };
+
+async function normalizeLoadedNodeModule(
+  loadedModule: LoadedModule
+): Promise<LoadedModule> {
+  const defaultExport = (loadedModule as Record<string, unknown>).default;
+  if (
+    defaultExport &&
+    typeof defaultExport === 'object' &&
+    typeof (defaultExport as { then?: unknown }).then === 'function'
+  ) {
+    const resolvedDefault = await (defaultExport as Promise<unknown>);
+    if (resolvedDefault && typeof resolvedDefault === 'object') {
+      return resolvedDefault as LoadedModule;
+    }
+  }
+
+  return loadedModule;
+}
 
 let processCwdLock: Promise<void> = Promise.resolve();
 let fileSystemCacheClass:
@@ -308,6 +327,15 @@ type BunRequestLike = Request & {
 };
 
 async function readRequestBodyBuffer(request: Request): Promise<Buffer> {
+  const requestWithBytes = request as BunRequestLike;
+  if (typeof requestWithBytes.bytes === 'function') {
+    try {
+      return Buffer.from(await requestWithBytes.bytes());
+    } catch {
+      // Fall back to the standard Request reader.
+    }
+  }
+
   return Buffer.from(await request.arrayBuffer());
 }
 
@@ -578,6 +606,8 @@ async function invokeNodeRuntimeHandler({
   patchFetch?.();
 
   const requestUrl = new URL(context.request.url);
+  const originalMethod = context.request.headers.get('x-adapter-original-method');
+  const requestMethod = originalMethod ?? context.request.method;
   const debugNodeInvoke = process.env.ADAPTER_BUN_DEBUG_NODE === '1';
   if (debugNodeInvoke) {
     console.log('[adapter-bun][node][invoke:start]', {
@@ -585,7 +615,7 @@ async function invokeNodeRuntimeHandler({
       source: context.source,
       matchedPathname: context.matchedPathname,
       pathname: requestUrl.pathname,
-      method: context.request.method,
+      method: requestMethod,
     });
   }
   const body = await readRequestBodyBuffer(context.request);
@@ -596,6 +626,7 @@ async function invokeNodeRuntimeHandler({
     const requestWithBytes = context.request as BunRequestLike;
     console.log('[adapter-bun][node][request-body]', {
       method: context.request.method,
+      effectiveMethod: requestMethod,
       pathname: requestUrl.pathname,
       contentLengthHeader: context.request.headers.get('content-length'),
       contentTypeHeader: context.request.headers.get('content-type'),
@@ -608,7 +639,8 @@ async function invokeNodeRuntimeHandler({
   const requestHeaders = {
     host: requestUrl.host,
     ...toOutgoingHttpHeaders(context.request.headers),
-  };
+  } as OutgoingHttpHeaders & Record<string, string | string[] | number | undefined>;
+  delete requestHeaders['x-adapter-original-method'];
 
   return new Promise<Response>((resolve, reject) => {
     let settled = false;
@@ -646,10 +678,6 @@ async function invokeNodeRuntimeHandler({
             );
             return;
           }
-
-          if (!res.writableEnded) {
-            res.end();
-          }
         } catch (error) {
           if (!res.headersSent) {
             res.statusCode = 500;
@@ -668,7 +696,7 @@ async function invokeNodeRuntimeHandler({
               error,
               request: {
                 url: requestUrl.toString(),
-                method: context.request.method,
+                method: requestMethod,
                 headers: Object.fromEntries(context.request.headers.entries()),
               },
               route: {
@@ -705,7 +733,7 @@ async function invokeNodeRuntimeHandler({
       // HEAD suppresses the body per HTTP spec, but the caller (e.g. ISR
       // cache during res.revalidate()) needs the body to store a complete
       // cache entry.  All other methods are preserved as-is.
-      const internalMethod = context.request.method === 'HEAD' ? 'GET' : context.request.method;
+      const internalMethod = requestMethod === 'HEAD' ? 'GET' : requestMethod;
       const clientRequest = sendHttpRequest(
         {
           hostname: '127.0.0.1',
@@ -729,12 +757,12 @@ async function invokeNodeRuntimeHandler({
             );
             if (debugNodeInvoke) {
               console.log('[adapter-bun][node][invoke:response]', {
-                outputId: context.output.id,
-                pathname: requestUrl.pathname,
-                method: context.request.method,
-                status: clientResponse.statusCode ?? 200,
-                mode: 'stream',
-              });
+                  outputId: context.output.id,
+                  pathname: requestUrl.pathname,
+                  method: requestMethod,
+                  status: clientResponse.statusCode ?? 200,
+                  mode: 'stream',
+                });
             }
             settle(() => {
               resolve(response);
@@ -749,7 +777,7 @@ async function invokeNodeRuntimeHandler({
                 console.log('[adapter-bun][node][invoke:response]', {
                   outputId: context.output.id,
                   pathname: requestUrl.pathname,
-                  method: context.request.method,
+                  method: requestMethod,
                   status: clientResponse.statusCode ?? 200,
                   mode: 'buffer',
                 });
@@ -773,7 +801,7 @@ async function invokeNodeRuntimeHandler({
           console.error('[adapter-bun][node][invoke:client-error]', {
             outputId: context.output.id,
             pathname: requestUrl.pathname,
-            method: context.request.method,
+            method: requestMethod,
             error,
           });
         }
@@ -906,7 +934,10 @@ export function createNodeFunctionArtifactInvoker({
         await ensureNextNodeEnvironment({
           entrypointPath,
         });
-        const loadedModule = await loadModule(entrypointPath);
+        const rawLoadedModule = await loadModule(entrypointPath);
+        const loadedModule = await normalizeLoadedNodeModule(
+          rawLoadedModule as LoadedModule
+        );
         resetNodeFetchPatchState();
         const patchFetch =
           typeof (loadedModule as LoadedModule).patchFetch === 'function'
@@ -968,6 +999,10 @@ export function createNodeMiddlewareInvoker({
   let modulePromise: Promise<NodeMiddlewareModule> | undefined;
 
   return async (ctx: MiddlewareContext): Promise<RouterMiddlewareResult> => {
+    if (!shouldInvokeMiddlewareForRequest(output, ctx)) {
+      return {};
+    }
+
     modulePromise ??= (async () => {
       const entrypointPath = resolveOutputEntrypointPath(
         output,

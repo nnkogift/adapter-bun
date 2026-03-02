@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import type { MiddlewareContext, RouteHas } from '@next/routing';
 import type { BunDeploymentManifest, BunFunctionArtifact } from '../types.ts';
 
 export type LambdaLikeResult = {
@@ -121,4 +122,154 @@ export function resolveOutputFilePath(
     adapterDir,
     path.join(functionRoot, fileRelativePath)
   );
+}
+
+type MiddlewareMatcherLike = {
+  regexp?: string;
+  sourceRegex?: string;
+  has?: RouteHas[];
+  missing?: RouteHas[];
+};
+
+function parseCookieHeader(headerValue: string): Record<string, string> {
+  const cookies: Record<string, string> = {};
+  const segments = headerValue.split(';');
+  for (const segment of segments) {
+    const trimmed = segment.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+    const delimiterIndex = trimmed.indexOf('=');
+    if (delimiterIndex === -1) {
+      cookies[trimmed] = '';
+      continue;
+    }
+    const key = trimmed.slice(0, delimiterIndex).trim();
+    if (!key) {
+      continue;
+    }
+    const value = trimmed.slice(delimiterIndex + 1).trim();
+    cookies[key] = value;
+  }
+  return cookies;
+}
+
+function getConditionValue(
+  condition: RouteHas,
+  url: URL,
+  headers: Headers
+): string | undefined {
+  switch (condition.type) {
+    case 'header':
+      return headers.get(condition.key) ?? undefined;
+    case 'cookie': {
+      const cookieHeader = headers.get('cookie');
+      if (!cookieHeader) {
+        return undefined;
+      }
+      const cookies = parseCookieHeader(cookieHeader);
+      return cookies[condition.key];
+    }
+    case 'query':
+      return url.searchParams.get(condition.key) ?? undefined;
+    case 'host':
+      return url.hostname;
+    default:
+      return undefined;
+  }
+}
+
+function matchesRouteCondition(
+  condition: RouteHas,
+  url: URL,
+  headers: Headers
+): boolean {
+  const value = getConditionValue(condition, url, headers);
+  if (value === undefined) {
+    return false;
+  }
+
+  if (!('value' in condition) || condition.value === undefined) {
+    return true;
+  }
+
+  try {
+    if (new RegExp(condition.value).test(value)) {
+      return true;
+    }
+  } catch {
+    // Ignore invalid pattern and fallback to exact string match.
+  }
+
+  return value === condition.value;
+}
+
+function conditionsPass(
+  matcher: MiddlewareMatcherLike,
+  url: URL,
+  headers: Headers
+): boolean {
+  if (matcher.has?.some((condition) => !matchesRouteCondition(condition, url, headers))) {
+    return false;
+  }
+
+  if (matcher.missing?.some((condition) => matchesRouteCondition(condition, url, headers))) {
+    return false;
+  }
+
+  return true;
+}
+
+function getMiddlewareMatchers(output: BunFunctionArtifact): MiddlewareMatcherLike[] | null {
+  const config = output.config;
+  if (!config || typeof config !== 'object') {
+    return null;
+  }
+
+  const maybeMatchers = (config as { matchers?: unknown }).matchers;
+  if (!Array.isArray(maybeMatchers) || maybeMatchers.length === 0) {
+    return null;
+  }
+
+  const matchers = maybeMatchers.filter(
+    (value): value is MiddlewareMatcherLike =>
+      value !== null && typeof value === 'object'
+  );
+  return matchers.length > 0 ? matchers : null;
+}
+
+export function shouldInvokeMiddlewareForRequest(
+  output: BunFunctionArtifact,
+  ctx: MiddlewareContext
+): boolean {
+  const matchers = getMiddlewareMatchers(output);
+  if (!matchers) {
+    return true;
+  }
+
+  const { pathname } = ctx.url;
+
+  for (const matcher of matchers) {
+    const pattern = matcher.sourceRegex ?? matcher.regexp;
+    if (typeof pattern !== 'string') {
+      return true;
+    }
+
+    let routeRegex: RegExp;
+    try {
+      routeRegex = new RegExp(pattern);
+    } catch {
+      return true;
+    }
+
+    if (!routeRegex.test(pathname)) {
+      continue;
+    }
+
+    if (conditionsPass(matcher, ctx.url, ctx.headers)) {
+      return true;
+    }
+  }
+
+  return false;
 }

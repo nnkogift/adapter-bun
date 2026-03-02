@@ -51,6 +51,22 @@ export function collectOutputPathnames(
   return [...pathnames].sort((a, b) => a.localeCompare(b));
 }
 
+export function mergePathnamesWithStaticAssets(
+  pathnames: string[],
+  staticAssets: BunStaticAsset[]
+): string[] {
+  const merged = new Set(pathnames);
+  for (const asset of staticAssets) {
+    merged.add(asset.pathname);
+  }
+
+  if (merged.has('/index') && !merged.has('/')) {
+    merged.add('/');
+  }
+
+  return [...merged].sort((a, b) => a.localeCompare(b));
+}
+
 export function buildRouterManifest({
   ctx,
   generatedAt,

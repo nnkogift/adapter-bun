@@ -40,6 +40,7 @@ export type {
 } from './image.ts';
 
 export type RouteResolutionResult = ResolveRoutesResult;
+export type RouteMatches = Record<string, string | string[]>;
 
 export type RouterRouteKind =
   | 'static'
@@ -58,7 +59,7 @@ export type RouterMiddlewareResult = MiddlewareResult & {
 export interface RouteDispatchBaseContext {
   request: Request;
   matchedPathname: string;
-  routeMatches: Record<string, string> | undefined;
+  routeMatches: RouteMatches | undefined;
   resolution: RouteResolutionResult;
   cacheState?: PrerenderCacheState;
 }
