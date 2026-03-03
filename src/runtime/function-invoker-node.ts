@@ -30,6 +30,7 @@ import {
   type LoadedModule,
   type LambdaLikeResult,
 } from './function-invoker-shared.ts';
+import { createMiddlewareMatcher } from './middleware-matcher.ts';
 
 type LoadedNodeExecutor = {
   handler: ArtifactRouteHandler;
@@ -863,6 +864,13 @@ async function invokeNodeRuntimeHandler({
     ...toOutgoingHttpHeaders(context.request.headers),
   } as OutgoingHttpHeaders & Record<string, string | string[] | number | undefined>;
   delete requestHeaders['x-adapter-original-method'];
+  if (
+    requestUrl.pathname.startsWith('/_next/data/') &&
+    requestUrl.pathname.endsWith('.json') &&
+    !hasOutgoingHeader(requestHeaders, 'x-nextjs-data')
+  ) {
+    requestHeaders['x-nextjs-data'] = '1';
+  }
   const forwardedProto = requestUrl.protocol.replace(/:$/, '') || 'http';
   if (!hasOutgoingHeader(requestHeaders, 'x-forwarded-host')) {
     requestHeaders['x-forwarded-host'] = requestUrl.host;
@@ -884,6 +892,7 @@ async function invokeNodeRuntimeHandler({
       xForwardedHost: requestHeaders['x-forwarded-host'],
       xForwardedPort: requestHeaders['x-forwarded-port'],
       xForwardedProto: requestHeaders['x-forwarded-proto'],
+      xNextjsData: requestHeaders['x-nextjs-data'],
     });
   }
 
@@ -903,6 +912,17 @@ async function invokeNodeRuntimeHandler({
         const previousFetch = globalThis.fetch;
         globalThis.fetch = createTagEvolutionGuardFetch(previousFetch);
         try {
+          const tunneledOriginalMethodHeader = req.headers['x-adapter-original-method'];
+          const tunneledOriginalMethod = Array.isArray(tunneledOriginalMethodHeader)
+            ? tunneledOriginalMethodHeader[0]
+            : tunneledOriginalMethodHeader;
+          if (
+            typeof tunneledOriginalMethod === 'string' &&
+            tunneledOriginalMethod.length > 0
+          ) {
+            req.method = tunneledOriginalMethod.toUpperCase();
+            delete req.headers['x-adapter-original-method'];
+          }
           const maybeResult = await handler(req, res, {
             waitUntil(waitable: Promise<unknown>) {
               void waitable.catch(() => undefined);
@@ -987,11 +1007,9 @@ async function invokeNodeRuntimeHandler({
         return;
       }
 
-      // Upgrade HEAD to GET so the handler returns a full response body.
-      // HEAD suppresses the body per HTTP spec, but the caller (e.g. ISR
-      // cache during res.revalidate()) needs the body to store a complete
-      // cache entry.  All other methods are preserved as-is.
-      const internalMethod = requestMethod === 'HEAD' ? 'GET' : requestMethod;
+      const shouldTunnelOptionsBody =
+        requestMethod.toUpperCase() === 'OPTIONS' && body.byteLength > 0;
+      const internalMethod = shouldTunnelOptionsBody ? 'POST' : requestMethod;
       const clientRequest = sendHttpRequest(
         {
           hostname: '127.0.0.1',
@@ -1000,6 +1018,9 @@ async function invokeNodeRuntimeHandler({
           path: `${requestUrl.pathname}${requestUrl.search}`,
           headers: {
             ...requestHeaders,
+            ...(shouldTunnelOptionsBody
+              ? { 'x-adapter-original-method': requestMethod }
+              : {}),
             connection: 'close',
           },
           agent: false,
@@ -1039,9 +1060,9 @@ async function invokeNodeRuntimeHandler({
           if (shouldStreamResponse) {
             const response = toStreamingResponse(
               clientResponse,
-              internalMethod,
-              closeServer
-            );
+                  requestMethod,
+                  closeServer
+                );
             if (debugNodeInvoke) {
               console.log('[adapter-bun][node][invoke:response]', {
                 outputId: context.output.id,
@@ -1058,7 +1079,7 @@ async function invokeNodeRuntimeHandler({
             return;
           }
 
-          void toBufferedResponse(clientResponse, internalMethod, closeServer)
+          void toBufferedResponse(clientResponse, requestMethod, closeServer)
             .then((response) => {
               if (debugNodeInvoke) {
                 console.log('[adapter-bun][node][invoke:response]', {
@@ -1286,8 +1307,13 @@ export function createNodeMiddlewareInvoker({
   }
 
   let modulePromise: Promise<NodeMiddlewareModule> | undefined;
+  const matcher = createMiddlewareMatcher(output);
 
   return async (ctx: MiddlewareContext): Promise<RouterMiddlewareResult> => {
+    if (matcher && !matcher(ctx.url, ctx.headers)) {
+      return {};
+    }
+
     modulePromise ??= (async () => {
       const entrypointPath = resolveOutputEntrypointPath(
         output,

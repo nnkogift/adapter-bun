@@ -128,6 +128,7 @@ export interface BunDeploymentManifest {
     repoRoot: string;
     distDir: string;
     basePath: string;
+    trailingSlash: boolean;
     i18n: BuildCompleteContext['config']['i18n'] | null;
   };
   server: {

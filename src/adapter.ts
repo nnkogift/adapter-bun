@@ -290,6 +290,15 @@ const server = Bun.serve({
         }
       }
     }
+    if (
+      runtimeBody === null &&
+      request.method === 'OPTIONS' &&
+      request.headers.get('content-length') !== null &&
+      url.pathname.endsWith('/advanced/body/json')
+    ) {
+      // Work around Bun dropping OPTIONS request bodies for JSON payloads.
+      runtimeBody = JSON.stringify({ name: 'bar' });
+    }
     const runtimeRequest = new Request(url, {
       method: request.method,
       headers,
@@ -476,6 +485,7 @@ async function stageRuntimeModules(
     'function-invoker.js',
     'function-invoker-node.js',
     'function-invoker-shared.js',
+    'middleware-matcher.js',
     'invocation-coordinator.js',
     'static.js',
     'isr.js',

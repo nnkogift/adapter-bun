@@ -8,14 +8,121 @@ import type {
   BuildCompleteContext,
 } from './types.ts';
 
+type BuildRoute = BuildCompleteContext['routing']['beforeFiles'][number] & {
+  regex?: string;
+};
+
+function cloneRouteHasConditions(route: BuildRoute): BuildRoute['has'] {
+  if (!Array.isArray(route.has)) {
+    return undefined;
+  }
+  return route.has.map((condition) => ({ ...condition }));
+}
+
+function cloneRouteMissingConditions(route: BuildRoute): BuildRoute['missing'] {
+  if (!Array.isArray(route.missing)) {
+    return undefined;
+  }
+  return route.missing.map((condition) => ({ ...condition }));
+}
+
+function hasMissingXNextjsData(
+  missing: BuildRoute['missing']
+): boolean {
+  if (!Array.isArray(missing)) {
+    return false;
+  }
+  return missing.some(
+    (condition) =>
+      condition?.type === 'header' &&
+      typeof condition.key === 'string' &&
+      condition.key.toLowerCase() === 'x-nextjs-data'
+  );
+}
+
+function toSourceRegex(route: BuildRoute): string {
+  if (typeof route.sourceRegex === 'string' && route.sourceRegex.length > 0) {
+    return route.sourceRegex;
+  }
+  if (typeof route.regex === 'string' && route.regex.length > 0) {
+    return route.regex;
+  }
+  if (typeof route.source === 'string' && route.source.length > 0) {
+    return route.source;
+  }
+
+  return '^$';
+}
+
+function normalizeRoute(route: BuildRoute): BuildRoute {
+  const normalized: BuildRoute = {
+    sourceRegex: toSourceRegex(route),
+  };
+
+  if (typeof route.source === 'string' && route.source.length > 0) {
+    normalized.source = route.source;
+  }
+  if (typeof route.destination === 'string') {
+    normalized.destination = route.destination;
+  }
+  if (route.headers && typeof route.headers === 'object') {
+    normalized.headers = { ...route.headers };
+  }
+  if (typeof route.status === 'number') {
+    normalized.status = route.status;
+  }
+  if (route.priority === true) {
+    normalized.priority = true;
+  }
+
+  const hasConditions = cloneRouteHasConditions(route);
+  if (hasConditions) {
+    normalized.has = hasConditions;
+  }
+
+  const missingConditions = cloneRouteMissingConditions(route);
+  if (missingConditions) {
+    normalized.missing = missingConditions;
+  }
+
+  // Skip automatic trailing-slash redirects for data requests. Next's data
+  // fetches should resolve JSON payloads instead of receiving page redirects.
+  const locationHeader =
+    (normalized.headers?.Location ?? normalized.headers?.location) ?? null;
+  if (
+    normalized.priority === true &&
+    typeof normalized.status === 'number' &&
+    normalized.status >= 300 &&
+    normalized.status < 400 &&
+    typeof locationHeader === 'string' &&
+    !hasMissingXNextjsData(normalized.missing)
+  ) {
+    normalized.missing = [
+      ...(normalized.missing ?? []),
+      {
+        type: 'header',
+        key: 'x-nextjs-data',
+      },
+    ];
+  }
+
+  return normalized;
+}
+
+function normalizeRoutes(
+  routes: BuildCompleteContext['routing']['beforeFiles']
+): BuildCompleteContext['routing']['beforeFiles'] {
+  return routes.map((route) => normalizeRoute(route as BuildRoute));
+}
+
 function toRouteGraph(routing: BuildCompleteContext['routing']): BunRouteGraph {
   return {
-    beforeMiddleware: routing.beforeMiddleware,
-    beforeFiles: routing.beforeFiles,
-    afterFiles: routing.afterFiles,
-    dynamicRoutes: routing.dynamicRoutes,
-    onMatch: routing.onMatch,
-    fallback: routing.fallback,
+    beforeMiddleware: normalizeRoutes(routing.beforeMiddleware),
+    beforeFiles: normalizeRoutes(routing.beforeFiles),
+    afterFiles: normalizeRoutes(routing.afterFiles),
+    dynamicRoutes: normalizeRoutes(routing.dynamicRoutes),
+    onMatch: normalizeRoutes(routing.onMatch),
+    fallback: normalizeRoutes(routing.fallback),
     shouldNormalizeNextData: routing.shouldNormalizeNextData,
     rsc: routing.rsc,
   };
@@ -124,6 +231,7 @@ export function buildDeploymentManifest({
       repoRoot: ctx.repoRoot,
       distDir: ctx.distDir,
       basePath: ctx.config.basePath,
+      trailingSlash: Boolean(ctx.config.trailingSlash),
       i18n: ctx.config.i18n ?? null,
     },
     server: {

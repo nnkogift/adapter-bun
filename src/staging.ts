@@ -434,6 +434,21 @@ function normalizeFallbackInitialHeaders({
   return setSingleHeaderValue(headers, 'cache-control', HTML_ROUTE_CACHE_CONTROL);
 }
 
+function isExtensionlessRoutePathname(pathname: string): boolean {
+  const normalized = trimSlashes(pathname);
+  if (normalized.length === 0) {
+    return true;
+  }
+
+  const segments = normalized.split('/');
+  const lastSegment = segments[segments.length - 1] ?? '';
+  if (lastSegment.startsWith('[') && lastSegment.endsWith(']')) {
+    return true;
+  }
+
+  return path.posix.extname(lastSegment) === '';
+}
+
 export async function stageStaticAssets({
   outputs,
   projectDir,
@@ -468,7 +483,7 @@ export async function stageStaticAssets({
       objectKey,
       contentType:
         path.extname(output.filePath) === '.html' &&
-        path.posix.extname(trimSlashes(output.pathname)) === ''
+        isExtensionlessRoutePathname(output.pathname)
           ? 'text/html; charset=utf-8'
           : null,
       cacheControl: resolveStaticAssetCacheControl({

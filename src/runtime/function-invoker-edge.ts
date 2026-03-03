@@ -17,6 +17,7 @@ import {
   type CreateFunctionArtifactInvokerOptions,
   type LambdaLikeResult,
 } from './function-invoker-shared.ts';
+import { createMiddlewareMatcher } from './middleware-matcher.ts';
 
 type EdgeAssetBinding = {
   name: string;
@@ -594,22 +595,17 @@ async function invokeEdgeRuntimeHandler({
 
     const requestUrl = new URL(request.url);
     const requestUrlWithParams = new URL(requestUrl.toString());
-    if (routeMatches) {
-      for (const [key, value] of Object.entries(routeMatches)) {
-        requestUrlWithParams.searchParams.delete(key);
-        if (Array.isArray(value)) {
-          for (const item of value) {
-            requestUrlWithParams.searchParams.append(key, item);
-          }
-        } else {
-          requestUrlWithParams.searchParams.set(key, value);
-        }
-      }
-    }
     const requestHeaders = toRequestHeadersRecord(
       request.headers,
       requestUrlWithParams.host
     );
+    if (
+      requestUrl.pathname.startsWith('/_next/data/') &&
+      requestUrl.pathname.endsWith('.json') &&
+      requestHeaders['x-nextjs-data'] !== '1'
+    ) {
+      requestHeaders['x-nextjs-data'] = '1';
+    }
     const requestBody = toEdgeRequestBody(request);
     const waitUntilTasks: Promise<unknown>[] = [];
     const pagePayload = buildPagePayload({
@@ -769,8 +765,13 @@ export function createEdgeMiddlewareInvoker({
   }
 
   let sandbox: EdgeSandboxDefinition | undefined;
+  const matcher = createMiddlewareMatcher(output);
 
   return async (ctx: MiddlewareContext): Promise<RouterMiddlewareResult> => {
+    if (matcher && !matcher(ctx.url, ctx.headers)) {
+      return {};
+    }
+
     sandbox ??= buildEdgeSandboxDefinition({
       output,
       adapterDir,

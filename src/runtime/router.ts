@@ -201,6 +201,9 @@ function maybeResolveNextDataFallbackPathname({
   }
 
   for (const candidatePathname of candidatePathnames) {
+    if (candidatePathname === '/api' || candidatePathname.startsWith('/api/')) {
+      continue;
+    }
     if (
       indexes.functionByPathname.has(candidatePathname) ||
       indexes.prerenderByPathname.has(candidatePathname) ||
@@ -315,20 +318,50 @@ function withMiddlewareRequestMutations({
   request,
   rewriteUrl,
   requestHeaders,
+  basePath,
+  buildId,
 }: {
   request: Request;
   rewriteUrl: URL | null;
   requestHeaders: Headers | null;
+  basePath: string;
+  buildId: string;
 }): Request {
   if (!rewriteUrl && !requestHeaders) {
     return request;
+  }
+
+  const requestUrl = new URL(request.url);
+  const pathnameWithoutBasePath = resolveRequestPathnameWithoutBasePath({
+    requestPathname: requestUrl.pathname,
+    basePath,
+  });
+  const isNextDataRequest =
+    request.headers.get('x-nextjs-data') === '1' ||
+    (pathnameWithoutBasePath.startsWith(`/_next/data/${buildId}/`) &&
+      pathnameWithoutBasePath.endsWith('.json'));
+  let targetUrl = rewriteUrl ?? requestUrl;
+  if (rewriteUrl && isNextDataRequest) {
+    const rewrittenNextDataPath = resolveNextDataRewriteHeader({
+      request,
+      rewriteUrl,
+      basePath,
+      buildId,
+    });
+    if (rewrittenNextDataPath) {
+      targetUrl = new URL(rewrittenNextDataPath, requestUrl.origin);
+    } else {
+      targetUrl = requestUrl;
+    }
+  } else if (!rewriteUrl) {
+    targetUrl = requestUrl;
   }
 
   const method = request.method.toUpperCase();
   const body =
     method === 'GET' || method === 'HEAD' ? undefined : request.clone().body;
 
-  return new Request((rewriteUrl ?? new URL(request.url)).toString(), {
+  return new Request(targetUrl.toString(), {
     method: request.method,
     headers: requestHeaders ?? request.headers,
     body,
@@ -346,7 +379,7 @@ function resolveNextDataRewriteHeader({
   basePath: string;
   buildId: string;
 }): string | null {
-  if (!rewriteUrl || request.headers.get('x-nextjs-data') !== '1') {
+  if (!rewriteUrl) {
     return null;
   }
 
@@ -390,19 +423,19 @@ function resolveNextDataRewriteHeader({
 
 function normalizeMiddlewareInvocationUrl({
   url,
-  headers,
   basePath,
   buildId,
+  trailingSlash,
+  sourceRequestUrl,
+  i18n,
 }: {
   url: URL;
-  headers: Headers;
   basePath: string;
   buildId: string;
+  trailingSlash: boolean;
+  sourceRequestUrl: URL;
+  i18n: BunDeploymentManifest['build']['i18n'];
 }): URL {
-  if (headers.get('x-nextjs-data') !== '1') {
-    return url;
-  }
-
   const pathnameWithoutBasePath =
     basePath && url.pathname.startsWith(`${basePath}/`)
       ? url.pathname.slice(basePath.length)
@@ -426,9 +459,38 @@ function normalizeMiddlewareInvocationUrl({
     normalizedPath = normalizedPath.slice(0, -'/index'.length);
   }
 
-  const nextPathname = normalizedPath.length > 0 ? `/${normalizedPath}` : '/';
+  let nextPathname = normalizedPath.length > 0 ? `/${normalizedPath}` : '/';
+  const sourceLocale = resolveNextDataRequestLocale({
+    requestUrl: sourceRequestUrl,
+    basePath,
+    buildId,
+    i18n,
+  });
+  if (sourceLocale) {
+    const firstSegment = nextPathname
+      .split('/')
+      .find((segment) => segment.length > 0);
+    const hasLocalePrefix =
+      !!firstSegment &&
+      i18n?.locales.some(
+        (locale) => locale.toLowerCase() === firstSegment.toLowerCase()
+      );
+    if (!hasLocalePrefix) {
+      nextPathname =
+        nextPathname === '/' ? `/${sourceLocale}` : `/${sourceLocale}${nextPathname}`;
+    }
+  }
   const normalizedUrl = new URL(url.toString());
-  normalizedUrl.pathname = basePath ? `${basePath}${nextPathname}` : nextPathname;
+  const normalizedWithTrailingSlash =
+    trailingSlash &&
+    nextPathname !== '/' &&
+    !nextPathname.endsWith('/') &&
+    !STATIC_FILE_EXTENSION_PATTERN.test(nextPathname.split('/').pop() ?? '')
+      ? `${nextPathname}/`
+      : nextPathname;
+  normalizedUrl.pathname = basePath
+    ? `${basePath}${normalizedWithTrailingSlash}`
+    : normalizedWithTrailingSlash;
   return normalizedUrl;
 }
 
@@ -551,6 +613,28 @@ function stripMiddlewareResponse(
 
   const { response: _response, ...middlewareResult } = result;
   return middlewareResult;
+}
+
+function normalizeMiddlewareErrorResponse(response: Response): Response {
+  const errorHeader = response.headers.get('error');
+  if (!errorHeader) {
+    return response;
+  }
+
+  if (
+    errorHeader.includes('cannot be parsed as a URL') &&
+    !errorHeader.includes('Invalid URL')
+  ) {
+    const headers = new Headers(response.headers);
+    headers.set('error', `Invalid URL: ${errorHeader}`);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
+  return response;
 }
 
 function stripRequestHeaderEchoes({
@@ -713,6 +797,16 @@ function withRouteMetadata(
     headers.set('cache-control', DOCUMENT_RESPONSE_CACHE_CONTROL);
   }
 
+  if (
+    route.kind === 'function' &&
+    route.id &&
+    (route.id === '/api' || route.id.startsWith('/api/')) &&
+    !headers.has('content-type') &&
+    response.body
+  ) {
+    headers.set('content-type', 'text/plain; charset=utf-8');
+  }
+
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -818,6 +912,216 @@ function withoutResolvedLocationHeader(
   };
 }
 
+function toRedirectLocation({
+  redirectUrl,
+  requestUrl,
+}: {
+  redirectUrl: URL;
+  requestUrl: URL;
+}): string {
+  if (redirectUrl.origin === requestUrl.origin) {
+    return `${redirectUrl.pathname}${redirectUrl.search}${redirectUrl.hash}`;
+  }
+  return redirectUrl.toString();
+}
+
+function resolveNextDataRequestLocale({
+  requestUrl,
+  basePath,
+  buildId,
+  i18n,
+}: {
+  requestUrl: URL;
+  basePath: string;
+  buildId: string;
+  i18n: BunDeploymentManifest['build']['i18n'];
+}): string | null {
+  if (!i18n) {
+    return null;
+  }
+
+  const pathnameWithoutBasePath = resolveRequestPathnameWithoutBasePath({
+    requestPathname: requestUrl.pathname,
+    basePath,
+  });
+  const nextDataPrefix = `/_next/data/${buildId}/`;
+  if (
+    !pathnameWithoutBasePath.startsWith(nextDataPrefix) ||
+    !pathnameWithoutBasePath.endsWith('.json')
+  ) {
+    return null;
+  }
+
+  const encodedPath = pathnameWithoutBasePath
+    .slice(nextDataPrefix.length, -'.json'.length)
+    .replace(/\/+/g, '/')
+    .replace(/^\/+/, '');
+  if (!encodedPath) {
+    return null;
+  }
+
+  const firstSegment = encodedPath.split('/').find((segment) => segment.length > 0);
+  if (!firstSegment) {
+    return null;
+  }
+
+  const locale = i18n.locales.find(
+    (candidate) => candidate.toLowerCase() === firstSegment.toLowerCase()
+  );
+  return locale ?? null;
+}
+
+function withLocalizedNextDataRedirect({
+  redirectLocation,
+  requestUrl,
+  basePath,
+  buildId,
+  i18n,
+}: {
+  redirectLocation: string;
+  requestUrl: URL;
+  basePath: string;
+  buildId: string;
+  i18n: BunDeploymentManifest['build']['i18n'];
+}): string {
+  if (!redirectLocation.startsWith('/') || !i18n) {
+    return redirectLocation;
+  }
+
+  const requestLocale = resolveNextDataRequestLocale({
+    requestUrl,
+    basePath,
+    buildId,
+    i18n,
+  });
+  if (!requestLocale) {
+    return redirectLocation;
+  }
+
+  const parsed = new URL(redirectLocation, 'http://n');
+  if (parsed.pathname === '/api' || parsed.pathname.startsWith('/api/')) {
+    return redirectLocation;
+  }
+
+  const strippedPathname =
+    basePath &&
+    (parsed.pathname === basePath || parsed.pathname.startsWith(`${basePath}/`))
+      ? parsed.pathname.slice(basePath.length) || '/'
+      : parsed.pathname;
+  const firstSegment = strippedPathname.split('/').find(
+    (segment) => segment.length > 0
+  );
+  if (
+    firstSegment &&
+    i18n.locales.some(
+      (locale) => locale.toLowerCase() === firstSegment.toLowerCase()
+    )
+  ) {
+    return redirectLocation;
+  }
+
+  const localizedPathname =
+    strippedPathname === '/'
+      ? `/${requestLocale}`
+      : `/${requestLocale}${strippedPathname}`;
+  parsed.pathname = basePath ? `${basePath}${localizedPathname}` : localizedPathname;
+  return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+}
+
+function withLocalizedNextDataResolutionHeaders({
+  resolution,
+  requestUrl,
+  basePath,
+  buildId,
+  i18n,
+}: {
+  resolution: RouteResolutionResult;
+  requestUrl: URL;
+  basePath: string;
+  buildId: string;
+  i18n: BunDeploymentManifest['build']['i18n'];
+}): RouteResolutionResult {
+  if (!resolution.resolvedHeaders) {
+    return resolution;
+  }
+
+  const requestLocale = resolveNextDataRequestLocale({
+    requestUrl,
+    basePath,
+    buildId,
+    i18n,
+  });
+  if (!requestLocale) {
+    return resolution;
+  }
+
+  const headers = new Headers(resolution.resolvedHeaders);
+  let mutated = false;
+  const nextDataRedirect = headers.get('x-nextjs-redirect');
+  if (nextDataRedirect) {
+    const localizedRedirect = withLocalizedNextDataRedirect({
+      redirectLocation: nextDataRedirect,
+      requestUrl,
+      basePath,
+      buildId,
+      i18n,
+    });
+    if (localizedRedirect !== nextDataRedirect) {
+      headers.set('x-nextjs-redirect', localizedRedirect);
+      mutated = true;
+    }
+  }
+
+  if (!mutated) {
+    return resolution;
+  }
+
+  return {
+    ...resolution,
+    resolvedHeaders: headers,
+  };
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1';
+}
+
+function normalizeLoopbackRewriteUrl({
+  rewriteUrl,
+  requestUrl,
+}: {
+  rewriteUrl: URL;
+  requestUrl: URL;
+}): URL {
+  if (rewriteUrl.origin === requestUrl.origin) {
+    return rewriteUrl;
+  }
+  if (rewriteUrl.protocol !== requestUrl.protocol) {
+    return rewriteUrl;
+  }
+
+  const rewritePort =
+    rewriteUrl.port || (rewriteUrl.protocol === 'https:' ? '443' : '80');
+  const requestPort =
+    requestUrl.port || (requestUrl.protocol === 'https:' ? '443' : '80');
+  if (rewritePort !== requestPort) {
+    return rewriteUrl;
+  }
+
+  if (
+    !isLoopbackHostname(rewriteUrl.hostname) ||
+    !isLoopbackHostname(requestUrl.hostname)
+  ) {
+    return rewriteUrl;
+  }
+
+  return new URL(
+    `${rewriteUrl.pathname}${rewriteUrl.search}${rewriteUrl.hash}`,
+    requestUrl.origin
+  );
+}
+
 function normalizeRscBasePathname(pathname: string): string {
   if (pathname === '/') {
     return '/index';
@@ -917,6 +1221,271 @@ function maybePreferExactMatchedPathname({
   }
 
   return matchedPathname;
+}
+
+function resolveRouteMatchValue(
+  routeMatches: Record<string, string | string[]>,
+  descriptor: DynamicSegmentDescriptor,
+  numericIndex: number
+): { value: string | string[] | undefined; nextNumericIndex: number } {
+  const direct = routeMatches[descriptor.name];
+  if (typeof direct === 'string' || Array.isArray(direct)) {
+    return { value: direct, nextNumericIndex: numericIndex };
+  }
+
+  const prefixed = routeMatches[`nxtP${descriptor.name}`];
+  if (typeof prefixed === 'string' || Array.isArray(prefixed)) {
+    return { value: prefixed, nextNumericIndex: numericIndex };
+  }
+
+  const numeric = routeMatches[String(numericIndex)];
+  if (typeof numeric === 'string' || Array.isArray(numeric)) {
+    return { value: numeric, nextNumericIndex: numericIndex + 1 };
+  }
+
+  return { value: undefined, nextNumericIndex: numericIndex };
+}
+
+function maybeResolveConcreteMatchedPathname({
+  matchedPathname,
+  routeMatches,
+  indexes,
+  i18n,
+}: {
+  matchedPathname: string;
+  routeMatches: Record<string, string | string[]> | undefined;
+  indexes: ReturnType<typeof buildRouteIndexes>;
+  i18n: BunDeploymentManifest['build']['i18n'];
+}): string {
+  if (!matchedPathname.includes('[') || !routeMatches) {
+    return matchedPathname;
+  }
+
+  const segments = matchedPathname.split('/').filter(Boolean);
+  if (segments.length === 0) {
+    return matchedPathname;
+  }
+
+  const concreteSegments: string[] = [];
+  let numericIndex = 1;
+
+  for (const segment of segments) {
+    const descriptor = parseDynamicSegmentDescriptor(segment);
+    if (!descriptor) {
+      concreteSegments.push(segment);
+      continue;
+    }
+
+    const { value, nextNumericIndex } = resolveRouteMatchValue(
+      routeMatches,
+      descriptor,
+      numericIndex
+    );
+    numericIndex = nextNumericIndex;
+    if (value === undefined) {
+      return matchedPathname;
+    }
+
+    if (descriptor.catchAll) {
+      if (Array.isArray(value)) {
+        if (value.length === 0) {
+          if (descriptor.optionalCatchAll) {
+            continue;
+          }
+          return matchedPathname;
+        }
+        concreteSegments.push(...value.map((part) => encodeURIComponent(part)));
+        continue;
+      }
+
+      const parts = value
+        .split('/')
+        .filter((part) => part.length > 0)
+        .map((part) => encodeURIComponent(part));
+      if (parts.length === 0) {
+        if (descriptor.optionalCatchAll) {
+          continue;
+        }
+        return matchedPathname;
+      }
+      concreteSegments.push(...parts);
+      continue;
+    }
+
+    if (Array.isArray(value)) {
+      if (value.length === 0) {
+        return matchedPathname;
+      }
+      const firstValue = value[0];
+      if (typeof firstValue !== 'string' || firstValue.length === 0) {
+        return matchedPathname;
+      }
+      concreteSegments.push(encodeURIComponent(firstValue));
+      continue;
+    }
+
+    if (value.length === 0) {
+      return matchedPathname;
+    }
+    concreteSegments.push(encodeURIComponent(value));
+  }
+
+  const concretePathname = concreteSegments.length > 0 ? `/${concreteSegments.join('/')}` : '/';
+  if (hasOutputPathname(indexes, concretePathname)) {
+    return concretePathname;
+  }
+  if (i18n && concretePathname !== '/') {
+    const localeCandidate = concretePathname.split('/').filter(Boolean)[0];
+    if (
+      localeCandidate &&
+      i18n.locales.some(
+        (locale) => locale.toLowerCase() === localeCandidate.toLowerCase()
+      )
+    ) {
+      const withoutLocale = concretePathname.slice(localeCandidate.length + 1) || '/';
+      if (hasOutputPathname(indexes, withoutLocale)) {
+        return withoutLocale;
+      }
+      if (
+        withoutLocale !== '/' &&
+        hasOutputPathname(indexes, `${withoutLocale}/index`)
+      ) {
+        return `${withoutLocale}/index`;
+      }
+    }
+  }
+  if (
+    concretePathname !== '/' &&
+    hasOutputPathname(indexes, `${concretePathname}/index`)
+  ) {
+    return `${concretePathname}/index`;
+  }
+
+  return matchedPathname;
+}
+
+function resolveConcretePathnameFromRouteMatches({
+  matchedPathname,
+  routeMatches,
+}: {
+  matchedPathname: string;
+  routeMatches: Record<string, string | string[]> | undefined;
+}): string | null {
+  if (!matchedPathname.includes('[')) {
+    return matchedPathname;
+  }
+  if (!routeMatches) {
+    return null;
+  }
+
+  const segments = matchedPathname.split('/').filter(Boolean);
+  if (segments.length === 0) {
+    return '/';
+  }
+
+  const concreteSegments: string[] = [];
+  let numericIndex = 1;
+
+  for (const segment of segments) {
+    const descriptor = parseDynamicSegmentDescriptor(segment);
+    if (!descriptor) {
+      concreteSegments.push(segment);
+      continue;
+    }
+
+    const { value, nextNumericIndex } = resolveRouteMatchValue(
+      routeMatches,
+      descriptor,
+      numericIndex
+    );
+    numericIndex = nextNumericIndex;
+    if (value === undefined) {
+      return null;
+    }
+
+    if (descriptor.catchAll) {
+      const parts = Array.isArray(value)
+        ? value
+        : value.split('/').filter((part) => part.length > 0);
+      if (parts.length === 0) {
+        if (descriptor.optionalCatchAll) {
+          continue;
+        }
+        return null;
+      }
+      concreteSegments.push(...parts.map((part) => encodeURIComponent(part)));
+      continue;
+    }
+
+    const firstValue = Array.isArray(value) ? value[0] : value;
+    if (typeof firstValue !== 'string' || firstValue.length === 0) {
+      return null;
+    }
+    concreteSegments.push(encodeURIComponent(firstValue));
+  }
+
+  return concreteSegments.length > 0 ? `/${concreteSegments.join('/')}` : '/';
+}
+
+function withResolvedNextDataRequestPath({
+  request,
+  matchedPathname,
+  routeMatches,
+  basePath,
+  buildId,
+}: {
+  request: Request;
+  matchedPathname: string;
+  routeMatches: Record<string, string | string[]> | undefined;
+  basePath: string;
+  buildId: string;
+}): Request {
+  const requestUrl = new URL(request.url);
+  const pathnameWithoutBasePath = resolveRequestPathnameWithoutBasePath({
+    requestPathname: requestUrl.pathname,
+    basePath,
+  });
+  const nextDataPrefix = `/_next/data/${buildId}/`;
+  const isNextDataRequest =
+    request.headers.get('x-nextjs-data') === '1' ||
+    (pathnameWithoutBasePath.startsWith(nextDataPrefix) &&
+      pathnameWithoutBasePath.endsWith('.json'));
+  if (!isNextDataRequest) {
+    return request;
+  }
+
+  const concretePathname = resolveConcretePathnameFromRouteMatches({
+    matchedPathname,
+    routeMatches,
+  });
+  if (!concretePathname) {
+    return request;
+  }
+
+  const normalizedConcretePathname =
+    concretePathname === '/'
+      ? '/index'
+      : concretePathname.endsWith('/')
+        ? concretePathname.slice(0, -1) || '/'
+        : concretePathname;
+  const nextDataPathname = `${nextDataPrefix}${normalizedConcretePathname.slice(1)}.json`;
+  const nextDataPathnameWithBasePath = basePath
+    ? `${basePath}${nextDataPathname}`
+    : nextDataPathname;
+  if (requestUrl.pathname === nextDataPathnameWithBasePath) {
+    return request;
+  }
+
+  const method = request.method.toUpperCase();
+  const body =
+    method === 'GET' || method === 'HEAD' ? undefined : request.clone().body;
+  const rewrittenUrl = new URL(requestUrl.toString());
+  rewrittenUrl.pathname = nextDataPathnameWithBasePath;
+  return new Request(rewrittenUrl.toString(), {
+    method: request.method,
+    headers: request.headers,
+    body,
+  });
 }
 
 function toResolutionI18nConfig(manifest: BunDeploymentManifest) {
@@ -1823,6 +2392,15 @@ function decodeURIComponentSafe(value: string): string {
   }
 }
 
+function isMalformedEncodedPathname(pathname: string): boolean {
+  try {
+    decodeURI(pathname);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 type DynamicSegmentDescriptor = {
   name: string;
   catchAll: boolean;
@@ -1902,7 +2480,14 @@ function normalizeRouteMatchesForPathname({
 
   for (const segment of dynamicSegments) {
     const fallbackValue = numericValues[numericIndex];
+    const prefixedRouteKey = `nxtP${segment.name}`;
     let rawValue = normalized[segment.name];
+    if (
+      typeof rawValue !== 'string' &&
+      typeof normalized[prefixedRouteKey] === 'string'
+    ) {
+      rawValue = normalized[prefixedRouteKey];
+    }
     if (typeof rawValue !== 'string' && typeof fallbackValue === 'string') {
       rawValue = fallbackValue;
       numericIndex += 1;
@@ -1926,7 +2511,6 @@ function normalizeRouteMatchesForPathname({
       continue;
     }
 
-    const prefixedRouteKey = `nxtP${segment.name}`;
     if (typeof normalized[prefixedRouteKey] !== 'string') {
       normalized[prefixedRouteKey] = normalizedRawValue;
     }
@@ -2418,6 +3002,26 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
   return {
     manifest,
     async handleRequest(request: Request): Promise<Response> {
+      const incomingUrl = new URL(request.url);
+      if (process.env.ADAPTER_BUN_DEBUG_REDIRECT === '1') {
+        console.log('[adapter-bun][req]', {
+          method: request.method,
+          url: incomingUrl.toString(),
+          rsc: request.headers.get('rsc'),
+          xNextjsData: request.headers.get('x-nextjs-data'),
+          xMiddlewarePrefetch: request.headers.get('x-middleware-prefetch'),
+          nextAction: request.headers.get('next-action'),
+        });
+      }
+      if (isMalformedEncodedPathname(incomingUrl.pathname)) {
+        return new Response('Bad Request', {
+          status: 400,
+          headers: {
+            'content-type': 'text/plain; charset=utf-8',
+          },
+        });
+      }
+
       if (
         process.env.ADAPTER_BUN_DEBUG_BODY === '1' &&
         request.method.toUpperCase() === 'OPTIONS'
@@ -2463,10 +3067,10 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       let middlewareResponse: Response | null = null;
       let middlewareRewriteUrl: URL | null = null;
       let middlewareRequestHeaders: Headers | null = null;
-      const {
-        headers: incomingRequestHeaders,
-        didStrip: didStripIncomingMiddlewareHeaders,
-      } = sanitizeIncomingMiddlewareRequestHeaders(request.headers);
+  const {
+    headers: incomingRequestHeaders,
+    didStrip: didStripIncomingMiddlewareHeaders,
+  } = sanitizeIncomingMiddlewareRequestHeaders(request.headers);
       const internalMiddlewareRequestHeaders =
         collectInternalMiddlewareRequestHeaders(incomingRequestHeaders);
       const debugMiddleware =
@@ -2485,9 +3089,11 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         invokeMiddleware: async (ctx) => {
           const normalizedMiddlewareUrl = normalizeMiddlewareInvocationUrl({
             url: ctx.url,
-            headers: ctx.headers,
             basePath: manifest.build.basePath,
             buildId: manifest.build.buildId,
+            trailingSlash: manifest.build.trailingSlash,
+            sourceRequestUrl: new URL(request.url),
+            i18n: manifest.build.i18n,
           });
           const middlewareHeaders = stripInternalMiddlewareRequestHeaders(
             ctx.headers
@@ -2498,8 +3104,20 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
             headers: middlewareHeaders,
             method: request.method.toUpperCase(),
           };
-          const result: RouterMiddlewareResult | {} =
+          let result: RouterMiddlewareResult | {} =
             (await options.invokeMiddleware?.(middlewareCtx)) ?? {};
+          if ('rewrite' in result && result.rewrite instanceof URL) {
+            const normalizedRewrite = normalizeLoopbackRewriteUrl({
+              rewriteUrl: result.rewrite,
+              requestUrl: ctx.url,
+            });
+            if (normalizedRewrite.toString() !== result.rewrite.toString()) {
+              result = {
+                ...result,
+                rewrite: normalizedRewrite,
+              };
+            }
+          }
           let restoredRequestHeaders: Headers | null = null;
 
           if ('rewrite' in result && result.rewrite instanceof URL) {
@@ -2513,12 +3131,15 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
             middlewareRequestHeaders = restoredRequestHeaders;
           }
           if ('response' in result && result.response) {
-            middlewareResponse = result.response;
+            middlewareResponse = normalizeMiddlewareErrorResponse(result.response);
           }
           if (debugMiddleware) {
             const debugUrl = new URL(ctx.url.toString());
             if (
+              debugUrl.pathname.includes('/rewrite-to-dynamic') ||
+              debugUrl.pathname.includes('/rewrite-to-config-rewrite') ||
               debugUrl.pathname.includes('/rewrite-to-app') ||
+              debugUrl.pathname.includes('/rewrite-1') ||
               debugUrl.searchParams.has('draft')
             ) {
               const responseHeaders =
@@ -2556,14 +3177,55 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         resolution: unresolvedResolution,
         requestHeaders: incomingRequestHeaders,
       });
+      resolution = withLocalizedNextDataResolutionHeaders({
+        resolution,
+        requestUrl: new URL(request.url),
+        basePath: manifest.build.basePath,
+        buildId: manifest.build.buildId,
+        i18n: manifest.build.i18n,
+      });
       const resolvedMiddlewareRequestHeaders =
         middlewareRequestHeaders as Headers | null;
       const resolvedMiddlewareRewriteUrl =
         middlewareRewriteUrl as URL | null;
+      if (process.env.ADAPTER_BUN_DEBUG_REDIRECT === '1') {
+        const debugRedirectUrl = new URL(request.url);
+        const middlewareResponseForDebug = middlewareResponse as Response | null;
+        if (
+          debugRedirectUrl.pathname === '/' ||
+          debugRedirectUrl.pathname === '/fr' ||
+          debugRedirectUrl.pathname === '/to' ||
+          debugRedirectUrl.pathname === '/nl/to'
+        ) {
+          console.log('[adapter-bun][redirect][resolution]', {
+            requestUrl: debugRedirectUrl.toString(),
+            middlewareResponded: resolution.middlewareResponded ?? false,
+            redirect: resolution.redirect
+              ? {
+                  url: resolution.redirect.url.toString(),
+                  status: resolution.redirect.status,
+                }
+              : null,
+            resolvedLocationHeader:
+              resolution.resolvedHeaders?.get('location') ?? null,
+            middlewareResponse: middlewareResponseForDebug
+              ? {
+                  status: middlewareResponseForDebug.status,
+                  location: middlewareResponseForDebug.headers.get('location'),
+                  xMiddlewareRedirect:
+                    middlewareResponseForDebug.headers.get('x-middleware-redirect'),
+                }
+              : null,
+          });
+        }
+      }
       if (debugMiddleware) {
         const debugUrl = new URL(request.url);
         if (
+          debugUrl.pathname.includes('/rewrite-to-dynamic') ||
+          debugUrl.pathname.includes('/rewrite-to-config-rewrite') ||
           debugUrl.pathname.includes('/rewrite-to-app') ||
+          debugUrl.pathname.includes('/rewrite-1') ||
           debugUrl.searchParams.has('draft')
         ) {
           console.log('[adapter-bun][middleware][resolution]', {
@@ -2608,12 +3270,14 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           resolvedMiddlewareRequestHeaders.get('x-middleware-set-cookie') ?? ''
         );
       }
-      const requestWithMiddlewareMutations = withMiddlewareRequestMutations({
+      let requestWithMiddlewareMutations = withMiddlewareRequestMutations({
         request,
         rewriteUrl: resolvedMiddlewareRewriteUrl,
         requestHeaders:
           resolvedMiddlewareRequestHeaders ??
           (didStripIncomingMiddlewareHeaders ? incomingRequestHeaders : null),
+        basePath: manifest.build.basePath,
+        buildId: manifest.build.buildId,
       });
       const originalRequestUrl = new URL(request.url);
       const mutatedRequestUrl = new URL(requestWithMiddlewareMutations.url);
@@ -2626,9 +3290,46 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
 
       if (resolution.redirect) {
         const redirectResolution = withoutResolvedLocationHeader(resolution);
+        const redirectRequestUrl = new URL(requestWithMiddlewareMutations.url);
+        const redirectLocation = toRedirectLocation({
+          redirectUrl: resolution.redirect.url,
+          requestUrl: redirectRequestUrl,
+        });
+        const redirectPathnameWithoutBasePath = resolveRequestPathnameWithoutBasePath({
+          requestPathname: redirectRequestUrl.pathname,
+          basePath: manifest.build.basePath,
+        });
+        const isNextDataRedirectRequest =
+          redirectPathnameWithoutBasePath.startsWith(
+            `/_next/data/${manifest.build.buildId}/`
+          ) && redirectPathnameWithoutBasePath.endsWith('.json');
+        const redirectHeaders = new Headers();
+        if (isNextDataRedirectRequest) {
+          redirectHeaders.set(
+            'x-nextjs-redirect',
+            withLocalizedNextDataRedirect({
+              redirectLocation,
+              requestUrl: redirectRequestUrl,
+              basePath: manifest.build.basePath,
+              buildId: manifest.build.buildId,
+              i18n: manifest.build.i18n,
+            })
+          );
+        } else {
+          redirectHeaders.set('location', redirectLocation);
+        }
+        if (process.env.ADAPTER_BUN_DEBUG_REDIRECT === '1') {
+          console.log('[adapter-bun][redirect]', {
+            requestUrl: redirectRequestUrl.toString(),
+            redirectUrl: resolution.redirect.url.toString(),
+            resolvedLocationHeader:
+              resolution.resolvedHeaders?.get('location') ?? null,
+            redirectLocation,
+          });
+        }
         const response = new Response(null, {
           status: resolution.redirect.status,
-          headers: { location: resolution.redirect.url.toString() },
+          headers: redirectHeaders,
         });
         return withRouteMetadata(
           applyResolutionToResponse(
@@ -2678,11 +3379,73 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       }
 
       if (isRedirectResolution(resolution)) {
+        let redirectResolution = resolution;
+        const redirectLocationHeader =
+          redirectResolution.resolvedHeaders?.get('location');
+        if (redirectLocationHeader) {
+          try {
+            const normalizedLocation = toRedirectLocation({
+              redirectUrl: new URL(redirectLocationHeader, mutatedRequestUrl),
+              requestUrl: mutatedRequestUrl,
+            });
+            if (normalizedLocation !== redirectLocationHeader) {
+              redirectResolution = withResolvedHeader(
+                redirectResolution,
+                'location',
+                normalizedLocation
+              );
+            }
+          } catch {
+            // Leave malformed redirect locations untouched so upstream behavior
+            // remains observable to callers/tests.
+          }
+        }
+        const redirectPathnameWithoutBasePath = resolveRequestPathnameWithoutBasePath({
+          requestPathname: mutatedRequestUrl.pathname,
+          basePath: manifest.build.basePath,
+        });
+        const isNextDataRedirectRequest =
+          redirectPathnameWithoutBasePath.startsWith(
+            `/_next/data/${manifest.build.buildId}/`
+          ) && redirectPathnameWithoutBasePath.endsWith('.json');
+        if (isNextDataRedirectRequest) {
+          const redirectHeaders = new Headers(redirectResolution.resolvedHeaders);
+          const normalizedLocation = redirectHeaders.get('location');
+          if (normalizedLocation) {
+            redirectHeaders.delete('location');
+            redirectHeaders.set(
+              'x-nextjs-redirect',
+              withLocalizedNextDataRedirect({
+                redirectLocation: normalizedLocation,
+                requestUrl: mutatedRequestUrl,
+                basePath: manifest.build.basePath,
+                buildId: manifest.build.buildId,
+                i18n: manifest.build.i18n,
+              })
+            );
+            redirectResolution = {
+              ...redirectResolution,
+              resolvedHeaders: redirectHeaders,
+            };
+          }
+        }
+        if (
+          process.env.ADAPTER_BUN_DEBUG_REDIRECT === '1' &&
+          mutatedRequestUrl.pathname.includes('/_next/data/')
+        ) {
+          console.log('[adapter-bun][redirect][next-data]', {
+            requestUrl: mutatedRequestUrl.toString(),
+            status: redirectResolution.status,
+            location: redirectResolution.resolvedHeaders?.get('location') ?? null,
+            xNextjsRedirect:
+              redirectResolution.resolvedHeaders?.get('x-nextjs-redirect') ?? null,
+          });
+        }
         return withRouteMetadata(
           applyResolutionToResponse(
-            new Response(null, { status: resolution.status }),
-            resolution,
-            resolution.status
+            new Response(null, { status: redirectResolution.status }),
+            redirectResolution,
+            redirectResolution.status
           ),
           { kind: 'redirect' }
         );
@@ -2947,6 +3710,32 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       // Pages Router can emit root as "/index", while App Router commonly
       // keeps it as "/". Prefer "/" when present and only fall back to
       // "/index" when "/" has no output binding.
+      const requestPathnameWithoutBasePath = resolveRequestPathnameWithoutBasePath({
+        requestPathname: requestUrl.pathname,
+        basePath: manifest.build.basePath,
+      });
+      const isNextDataRequestPathname =
+        requestPathnameWithoutBasePath.startsWith(
+          `/_next/data/${manifest.build.buildId}/`
+        ) && requestPathnameWithoutBasePath.endsWith('.json');
+      if (
+        isNextDataRequestPathname &&
+        matchedPathname &&
+        (matchedPathname === '/api' || matchedPathname.startsWith('/api/'))
+      ) {
+        return withRouteMetadata(
+          applyResolutionToResponse(
+            notFoundResponse({
+              status: resolution.status ?? 404,
+              body: 'Not Found',
+            }),
+            resolution,
+            resolution.status ?? 404
+          ),
+          { kind: 'not-found' }
+        );
+      }
+
       const normalizedMatchedPathname =
         matchedPathname === '/'
           ? !hasOutputPathname(indexes, '/') && hasOutputPathname(indexes, '/index')
@@ -2966,14 +3755,27 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
         manifest,
         indexes,
       });
-      const resolvedRouteMatches = normalizeRouteMatchesForPathname({
+      let resolvedRouteMatches = normalizeRouteMatchesForPathname({
         matchedPathname: resolvedMatchedPathname,
         routeMatches: effectiveRouteMatches,
+      });
+      resolvedMatchedPathname = maybeResolveConcreteMatchedPathname({
+        matchedPathname: resolvedMatchedPathname,
+        routeMatches: resolvedRouteMatches,
+        indexes,
+        i18n: manifest.build.i18n,
       });
       const hydratedRouteMatches = hydrateMissingSingleSegmentDynamicRouteMatches({
         matchedPathname: resolvedMatchedPathname,
         routeMatches: resolvedRouteMatches,
         requestPathname: mutatedRequestUrl.pathname,
+        basePath: manifest.build.basePath,
+        buildId: manifest.build.buildId,
+      });
+      requestWithMiddlewareMutations = withResolvedNextDataRequestPath({
+        request: requestWithMiddlewareMutations,
+        matchedPathname: resolvedMatchedPathname,
+        routeMatches: hydratedRouteMatches,
         basePath: manifest.build.basePath,
         buildId: manifest.build.buildId,
       });
@@ -2991,6 +3793,56 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
             hasStatic: indexes.staticByPathname.has(resolvedMatchedPathname),
             hasPrerender: indexes.prerenderByPathname.has(resolvedMatchedPathname),
             hasFunction: indexes.functionByPathname.has(resolvedMatchedPathname),
+            resolvedRouteMatches,
+            hydratedRouteMatches,
+          });
+        }
+        if (debugUrl.pathname.includes('/rewrite-1')) {
+          console.log('[adapter-bun][middleware][route-selection]', {
+            requestUrl: debugUrl.toString(),
+            mutatedRequestUrl: requestWithMiddlewareMutations.url,
+            didInternalMiddlewareRewrite,
+            initialMatchedPathname: resolution.matchedPathname ?? null,
+            fallbackMatchedPathname: matchedPathname ?? null,
+            normalizedMatchedPathname,
+            resolvedMatchedPathname,
+            hasStatic: indexes.staticByPathname.has(resolvedMatchedPathname),
+            hasPrerender: indexes.prerenderByPathname.has(resolvedMatchedPathname),
+            hasFunction: indexes.functionByPathname.has(resolvedMatchedPathname),
+            resolvedRouteMatches,
+            hydratedRouteMatches,
+          });
+        }
+        if (debugUrl.pathname.includes('/rewrite-to-dynamic')) {
+          console.log('[adapter-bun][middleware][route-selection]', {
+            requestUrl: debugUrl.toString(),
+            mutatedRequestUrl: requestWithMiddlewareMutations.url,
+            didInternalMiddlewareRewrite,
+            initialMatchedPathname: resolution.matchedPathname ?? null,
+            fallbackMatchedPathname: matchedPathname ?? null,
+            normalizedMatchedPathname,
+            resolvedMatchedPathname,
+            hasStatic: indexes.staticByPathname.has(resolvedMatchedPathname),
+            hasPrerender: indexes.prerenderByPathname.has(resolvedMatchedPathname),
+            hasFunction: indexes.functionByPathname.has(resolvedMatchedPathname),
+            resolvedRouteMatches,
+            hydratedRouteMatches,
+          });
+        }
+        if (debugUrl.pathname.includes('/rewrite-to-config-rewrite')) {
+          console.log('[adapter-bun][middleware][route-selection]', {
+            requestUrl: debugUrl.toString(),
+            mutatedRequestUrl: requestWithMiddlewareMutations.url,
+            didInternalMiddlewareRewrite,
+            initialMatchedPathname: resolution.matchedPathname ?? null,
+            fallbackMatchedPathname: matchedPathname ?? null,
+            normalizedMatchedPathname,
+            resolvedMatchedPathname,
+            hasStatic: indexes.staticByPathname.has(resolvedMatchedPathname),
+            hasPrerender: indexes.prerenderByPathname.has(resolvedMatchedPathname),
+            hasFunction: indexes.functionByPathname.has(resolvedMatchedPathname),
+            resolvedRouteMatches,
+            hydratedRouteMatches,
           });
         }
       }
