@@ -326,9 +326,15 @@ async function addFunctionFile({
 
   if (existingPath) {
     if (existingPath !== sourcePath) {
-      throw new Error(
-        `Function bundle path collision at "${normalizedRelativePath}" from "${existingPath}" and "${sourcePath}"`
-      );
+      // WASM bindings can appear in both SSR and edge chunks with
+      // different source paths but identical content (e.g. resvg.wasm).
+      // Allow the collision silently for WASM files; for other file
+      // kinds the collision indicates a genuine conflict.
+      if (kind !== 'wasm') {
+        throw new Error(
+          `Function bundle path collision at "${normalizedRelativePath}" from "${existingPath}" and "${sourcePath}"`
+        );
+      }
     }
     // Already copied by a previous function — just record in this function's files
     files.push({ kind, relativePath: normalizedRelativePath, sourcePath });

@@ -277,14 +277,33 @@ function applyHostEdgeGlobals(snapshot: EdgeHostGlobalSnapshot): void {
   }
 }
 
+async function loadWasmBindings(
+  bindings: EdgeWasmBinding[]
+): Promise<Record<string, WebAssembly.Module>> {
+  const modules: Record<string, WebAssembly.Module> = {};
+  await Promise.all(
+    bindings.map(async (binding) => {
+      const bytes = await Bun.file(binding.filePath).arrayBuffer();
+      modules[binding.name] = await WebAssembly.compile(bytes);
+    })
+  );
+  return modules;
+}
+
+const edgeAssetsByOutputId = new Map<string, EdgeAssetBinding[]>();
+
 async function ensureHostEdgeHandlerLoaded({
   outputId,
   name,
   paths,
+  wasm,
+  assets,
 }: {
   outputId: string;
   name: string;
   paths: string[];
+  wasm: EdgeWasmBinding[];
+  assets: EdgeAssetBinding[];
 }): Promise<EdgeHostHandler> {
   ensureHostAsyncLocalStorage();
 
@@ -296,6 +315,17 @@ async function ensureHostEdgeHandlerLoaded({
   if (activeHostEdgeOutputId !== outputId || !cachedHandler) {
     resetHostEdgeGlobals();
     try {
+      // Load and bind WASM modules to globalThis before loading edge scripts
+      if (wasm.length > 0) {
+        const wasmModules = await loadWasmBindings(wasm);
+        Object.assign(globalThis, wasmModules);
+      }
+
+      // Store asset bindings for blob: fetch interception
+      if (assets.length > 0) {
+        edgeAssetsByOutputId.set(outputId, assets);
+      }
+
       for (const scriptPath of paths) {
         clearHostRequireCache(scriptPath);
       }
@@ -570,6 +600,8 @@ async function invokeEdgeRuntimeHandler({
       outputId: sandbox.outputId,
       name: sandbox.name,
       paths: sandbox.paths,
+      wasm: sandbox.wasm,
+      assets: sandbox.assets,
     });
 
     const edgeSnapshot = hostEdgeGlobalsByOutputId.get(sandbox.outputId);
@@ -595,6 +627,18 @@ async function invokeEdgeRuntimeHandler({
 
     const requestUrl = new URL(request.url);
     const requestUrlWithParams = new URL(requestUrl.toString());
+    if (routeMatches) {
+      for (const [key, value] of Object.entries(routeMatches)) {
+        requestUrlWithParams.searchParams.delete(key);
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            requestUrlWithParams.searchParams.append(key, item);
+          }
+        } else {
+          requestUrlWithParams.searchParams.set(key, value);
+        }
+      }
+    }
     const requestHeaders = toRequestHeadersRecord(
       request.headers,
       requestUrlWithParams.host
@@ -612,6 +656,29 @@ async function invokeEdgeRuntimeHandler({
       pageName,
       routeMatches,
     });
+
+    // Install blob: fetch interceptor for edge assets
+    const edgeAssets = edgeAssetsByOutputId.get(sandbox.outputId);
+    const previousFetch = globalThis.fetch;
+    if (edgeAssets && edgeAssets.length > 0) {
+      const nativeFetch = previousFetch;
+      (globalThis as { fetch: typeof fetch }).fetch = function edgeBlobFetch(
+        input: string | URL | Request,
+        init?: RequestInit
+      ) {
+        const inputString = String(input instanceof Request ? input.url : input);
+        if (inputString.startsWith('blob:')) {
+          const assetName = inputString.slice('blob:'.length);
+          const asset = edgeAssets.find((a) => a.name === assetName);
+          if (asset) {
+            return Promise.resolve(
+              new Response(Bun.file(asset.filePath).stream())
+            );
+          }
+        }
+        return nativeFetch(input, init);
+      } as typeof fetch;
+    }
 
     let invocationResult: unknown;
     try {
@@ -644,6 +711,11 @@ async function invokeEdgeRuntimeHandler({
         },
       });
     } finally {
+      // Restore original fetch if we installed blob: interceptor
+      if (edgeAssets && edgeAssets.length > 0) {
+        (globalThis as { fetch: typeof fetch }).fetch = previousFetch;
+      }
+
       if (hadAssetSuffix) {
         hostGlobals.NEXT_CLIENT_ASSET_SUFFIX = previousAssetSuffix;
       } else {

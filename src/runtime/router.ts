@@ -523,7 +523,10 @@ function shouldAttemptAppNotFoundFunction({
     return false;
   }
 
-  return !requestInfo.isAssetPath;
+  // Allow the app not-found handler for asset-like paths too — Next.js
+  // renders the not-found page for non-existent assets (e.g. /favicon.ico
+  // when no favicon exists) so the response is HTML with a proper 404 status.
+  return true;
 }
 
 type NotFoundRequestInfo = {
@@ -694,12 +697,8 @@ function applyResolutionToResponse(
         }
         continue;
       }
-      if (normalizedKey === 'cache-control' && hasExplicitCacheControl) {
-        continue;
-      }
       if (
         normalizedKey === 'cache-control' &&
-        !hasExplicitCacheControl &&
         normalizeCacheControlValue(value) === IMPLICIT_IMMUTABLE_CACHE_CONTROL
       ) {
         continue;
@@ -879,6 +878,42 @@ function withDerivedRedirectDestinations<T extends ResolutionRoute>(
   routes: readonly T[]
 ): T[] {
   return routes.map((route) => withDerivedRedirectDestination(route));
+}
+
+type RouteWithRegex = ResolutionRoute & { sourceRegex?: string };
+
+/**
+ * Resolve header-only route rules (from next.config.js `headers`) that match
+ * a specific pathname. This mirrors @next/routing's `processRoutes` but only
+ * extracts header entries — it intentionally skips redirects and rewrites so
+ * we can apply config-level headers that @next/routing's `onMatch` overwrites.
+ */
+function resolveConfigHeadersForPathname(
+  routes: readonly RouteWithRegex[],
+  pathname: string
+): Record<string, string> | null {
+  let headers: Record<string, string> | null = null;
+  for (const route of routes) {
+    if (!route.headers || !route.sourceRegex) {
+      continue;
+    }
+    // Only match header-only rules (no destination = no redirect/rewrite)
+    if (route.destination) {
+      continue;
+    }
+    try {
+      const re = new RegExp(route.sourceRegex);
+      if (re.test(pathname)) {
+        headers ??= {};
+        for (const [key, value] of Object.entries(route.headers)) {
+          headers[key.toLowerCase()] = value;
+        }
+      }
+    } catch {
+      // Invalid regex — skip
+    }
+  }
+  return headers;
 }
 
 function toResolutionRoutes(manifest: BunDeploymentManifest) {
@@ -1320,14 +1355,14 @@ function maybeResolveConcreteMatchedPathname({
       if (typeof firstValue !== 'string' || firstValue.length === 0) {
         return matchedPathname;
       }
-      concreteSegments.push(encodeURIComponent(firstValue));
+      concreteSegments.push(encodeURIComponent(firstValue) + descriptor.suffix);
       continue;
     }
 
     if (value.length === 0) {
       return matchedPathname;
     }
-    concreteSegments.push(encodeURIComponent(value));
+    concreteSegments.push(encodeURIComponent(value) + descriptor.suffix);
   }
 
   const concretePathname = concreteSegments.length > 0 ? `/${concreteSegments.join('/')}` : '/';
@@ -1359,6 +1394,16 @@ function maybeResolveConcreteMatchedPathname({
     hasOutputPathname(indexes, `${concretePathname}/index`)
   ) {
     return `${concretePathname}/index`;
+  }
+
+  // For RSC segment requests (pathnames containing .segments/) where all
+  // dynamic segments were resolved to concrete values, return the concrete
+  // pathname even when it's not in the prerender/static indexes.  This
+  // lets the prerender cache lookup miss naturally so the function is
+  // invoked with real params instead of serving a fallback shell that
+  // contains bracket-notation placeholders (e.g. [n]).
+  if (concretePathname !== matchedPathname && matchedPathname.includes('.segments/')) {
+    return concretePathname;
   }
 
   return matchedPathname;
@@ -3067,6 +3112,7 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
       let middlewareResponse: Response | null = null;
       let middlewareRewriteUrl: URL | null = null;
       let middlewareRequestHeaders: Headers | null = null;
+      let middlewareResponseHeaders: Headers | null = null;
   const {
     headers: incomingRequestHeaders,
     didStrip: didStripIncomingMiddlewareHeaders,
@@ -3129,6 +3175,9 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
               internalHeaders: internalMiddlewareRequestHeaders,
             });
             middlewareRequestHeaders = restoredRequestHeaders;
+          }
+          if ('responseHeaders' in result && result.responseHeaders instanceof Headers) {
+            middlewareResponseHeaders = result.responseHeaders;
           }
           if ('response' in result && result.response) {
             middlewareResponse = normalizeMiddlewareErrorResponse(result.response);
@@ -3857,9 +3906,39 @@ export function createRouterRuntime(options: RouterRuntimeOptions): RouterRuntim
           asset: staticAsset,
           source: 'static',
         });
+        let staticResponse = applyResolutionToResponse(response, resolution);
+        // @next/routing's onMatch rules can override user-configured
+        // headers from next.config.js and middleware response headers
+        // (e.g. immutable cache-control for _next/static overwrites a
+        // user's cache-control). Re-apply those authoritative headers
+        // last so they win.
+        const configHeaders = resolveConfigHeadersForPathname(
+          manifest.routeGraph.beforeMiddleware as RouteWithRegex[],
+          resolvedMatchedPathname
+        );
+        const resolvedMiddlewareResponseHeaders = middlewareResponseHeaders as Headers | null;
+        if (configHeaders || resolvedMiddlewareResponseHeaders) {
+          const overrideHeaders = new Headers(staticResponse.headers);
+          if (configHeaders) {
+            for (const [key, value] of Object.entries(configHeaders)) {
+              overrideHeaders.set(key, value);
+            }
+          }
+          // Middleware headers take highest priority
+          if (resolvedMiddlewareResponseHeaders) {
+            for (const [key, value] of resolvedMiddlewareResponseHeaders.entries()) {
+              overrideHeaders.set(key, value);
+            }
+          }
+          staticResponse = new Response(staticResponse.body, {
+            status: staticResponse.status,
+            statusText: staticResponse.statusText,
+            headers: overrideHeaders,
+          });
+        }
         return withRouteMetadata(
           withRscVaryForRequest(
-            applyResolutionToResponse(response, resolution),
+            staticResponse,
             requestWithMiddlewareMutations
           ),
           {

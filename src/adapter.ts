@@ -876,6 +876,11 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
           : existingCacheHandlers
             ? { cacheHandlers: existingCacheHandlers }
             : {}),
+        // Enable cacheComponents when the experimental flag is set via env.
+        ...(process.env.__NEXT_CACHE_COMPONENTS === 'true' ||
+        process.env.NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS === 'true'
+          ? { cacheComponents: true }
+          : {}),
         experimental: {
           ...config.experimental,
           trustHostHeader: true,

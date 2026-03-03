@@ -82,8 +82,14 @@ export function createMiddlewareMatcher(
   }
 
   return (url: URL, headers: Headers): boolean => {
+    let decodedPathname: string;
+    try {
+      decodedPathname = decodeURIComponent(url.pathname);
+    } catch {
+      decodedPathname = url.pathname;
+    }
     const matched = routeMatcher(
-      url.pathname,
+      decodedPathname,
       { headers: toRequestHeaders(headers) } as Parameters<
         ReturnType<typeof getMiddlewareRouteMatcher>
       >[1],

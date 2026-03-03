@@ -58,10 +58,20 @@ if has_script "setup"; then
   bun run setup >&2
 fi
 
-# Ensure static HTML generated during build includes immutable asset query params.
-export VERCEL_IMMUTABLE_ASSET_TOKEN="bun-adapter-token"
-export IMMUTABLE_ASSET_TOKEN="$VERCEL_IMMUTABLE_ASSET_TOKEN"
-export NEXT_DEPLOYMENT_ID="$VERCEL_IMMUTABLE_ASSET_TOKEN"
+# Generate a stable deployment ID before the build so it is baked into
+# client bundles and used consistently at runtime.
+DEPLOY_RANDOM=$(node -e "console.log(require('crypto').randomBytes(8).toString('base64url'))")
+export NEXT_DEPLOYMENT_ID="bun-adapter-${DEPLOY_RANDOM}"
+export VERCEL_IMMUTABLE_ASSET_TOKEN="$NEXT_DEPLOYMENT_ID"
+export IMMUTABLE_ASSET_TOKEN="$NEXT_DEPLOYMENT_ID"
+
+# Forward experimental feature flags from the test harness.
+if [ -n "${__NEXT_CACHE_COMPONENTS:-}" ]; then
+  export NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS="${__NEXT_CACHE_COMPONENTS}"
+fi
+if [ -n "${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS:-}" ]; then
+  export __NEXT_CACHE_COMPONENTS="${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS}"
+fi
 
 bun --bun next build 2>&1 | tee -a "$NEXT_TEST_DIR/.adapter-build.log" >&2
 
@@ -69,15 +79,14 @@ if has_script "post-build"; then
   bun run post-build >&2
 fi
 
-# 6. Generate build ID markers for logs script and runtime env
+# 6. Record build ID markers for logs script
 BUILD_ID=$(cat ".next/BUILD_ID" 2>/dev/null || echo "unknown")
-export NEXT_DEPLOYMENT_ID="bun-adapter-$BUILD_ID"
 echo "BUILD_ID: $BUILD_ID" >> "$NEXT_TEST_DIR/.adapter-build.log"
 echo "DEPLOYMENT_ID: $NEXT_DEPLOYMENT_ID" >> "$NEXT_TEST_DIR/.adapter-build.log"
 echo "IMMUTABLE_ASSET_TOKEN: $IMMUTABLE_ASSET_TOKEN" >> "$NEXT_TEST_DIR/.adapter-build.log"
 
 # 7. Start Bun server on selected port
-PORT=$PORT bun bun-dist/server.js >> "$NEXT_TEST_DIR/.adapter-server.log" 2>&1 &
+PORT=$PORT NEXT_DEPLOYMENT_ID="$NEXT_DEPLOYMENT_ID" VERCEL_IMMUTABLE_ASSET_TOKEN="$VERCEL_IMMUTABLE_ASSET_TOKEN" IMMUTABLE_ASSET_TOKEN="$IMMUTABLE_ASSET_TOKEN" bun bun-dist/server.js >> "$NEXT_TEST_DIR/.adapter-server.log" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$NEXT_TEST_DIR/.adapter-server.pid"
 
