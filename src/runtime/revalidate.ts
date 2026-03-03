@@ -137,6 +137,7 @@ export function createBunRevalidateQueue({
   const activeLocks = new Map<string, number>();
   const pendingTasks: PrerenderRevalidateTask[] = [];
   const queuedCacheKeys = new Set<string>();
+  const taskWaitersByCacheKey = new Map<string, Array<() => void>>();
   let queueDraining = false;
 
   function isRscSeedPathname(pathname: string): boolean {
@@ -307,7 +308,17 @@ export function createBunRevalidateQueue({
           break;
         }
         queuedCacheKeys.delete(nextTask.cacheKey);
-        await runTask(nextTask);
+        try {
+          await runTask(nextTask);
+        } finally {
+          const waiters = taskWaitersByCacheKey.get(nextTask.cacheKey);
+          taskWaitersByCacheKey.delete(nextTask.cacheKey);
+          if (waiters) {
+            for (const resolve of waiters) {
+              resolve();
+            }
+          }
+        }
       }
     } finally {
       queueDraining = false;
@@ -318,13 +329,20 @@ export function createBunRevalidateQueue({
   }
 
   return {
-    enqueue(task: PrerenderRevalidateTask): void {
-      if (queuedCacheKeys.has(task.cacheKey)) {
-        return;
+    enqueue(task: PrerenderRevalidateTask): Promise<void> {
+      const completion = new Promise<void>((resolve) => {
+        const waiters = taskWaitersByCacheKey.get(task.cacheKey) ?? [];
+        waiters.push(resolve);
+        taskWaitersByCacheKey.set(task.cacheKey, waiters);
+      });
+
+      if (!queuedCacheKeys.has(task.cacheKey)) {
+        queuedCacheKeys.add(task.cacheKey);
+        pendingTasks.push(task);
+        void drainQueue();
       }
-      queuedCacheKeys.add(task.cacheKey);
-      pendingTasks.push(task);
-      void drainQueue();
+
+      return completion;
     },
   };
 }

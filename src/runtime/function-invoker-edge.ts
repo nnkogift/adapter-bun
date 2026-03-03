@@ -14,7 +14,6 @@ import type {
 import {
   asResponse,
   resolveOutputFilePath,
-  shouldInvokeMiddlewareForRequest,
   type CreateFunctionArtifactInvokerOptions,
   type LambdaLikeResult,
 } from './function-invoker-shared.ts';
@@ -103,7 +102,6 @@ const FORBIDDEN_RESPONSE_HEADERS = new Set([
 const NEXT_SERVER_MANIFESTS_SYMBOL = Symbol.for('next.server.manifests');
 const edgeRequire = createRequire(import.meta.url);
 let activeHostEdgeOutputId: string | null = null;
-let edgeInvocationLock: Promise<void> = Promise.resolve();
 const hostEdgeHandlerByOutputId = new Map<string, EdgeHostHandler>();
 const hostEdgeGlobalsByOutputId = new Map<string, EdgeHostGlobalSnapshot>();
 
@@ -275,21 +273,6 @@ function applyHostEdgeGlobals(snapshot: EdgeHostGlobalSnapshot): void {
     hostGlobals.__RSC_SERVER_MANIFEST = snapshot.rscServerManifest;
   } else {
     delete hostGlobals.__RSC_SERVER_MANIFEST;
-  }
-}
-
-async function withEdgeInvocationLock<T>(run: () => Promise<T>): Promise<T> {
-  const previousLock = edgeInvocationLock;
-  let releaseCurrentLock: (() => void) | undefined;
-  edgeInvocationLock = new Promise<void>((resolve) => {
-    releaseCurrentLock = resolve;
-  });
-
-  await previousLock;
-  try {
-    return await run();
-  } finally {
-    releaseCurrentLock?.();
   }
 }
 
@@ -545,8 +528,9 @@ function normalizeEdgeResponseHeaders(response: Response): Response {
 
 function resolveClientAssetSuffix(): string {
   const token =
-    process.env.NEXT_DEPLOYMENT_ID ??
+    process.env.VERCEL_IMMUTABLE_ASSET_TOKEN ??
     process.env.IMMUTABLE_ASSET_TOKEN ??
+    process.env.NEXT_DEPLOYMENT_ID ??
     null;
 
   if (typeof token === 'string' && token.length > 0) {
@@ -578,147 +562,145 @@ async function invokeEdgeRuntimeHandler({
   signal: AbortSignal;
   incrementalCache: unknown;
 }): Promise<Response> {
-  return withEdgeInvocationLock(async () => {
-    const hostGlobals = globalThis as EdgeHostGlobals;
-    const hostSnapshot = captureHostEdgeGlobals();
-    try {
-      const edgeHandler = await ensureHostEdgeHandlerLoaded({
-        outputId: sandbox.outputId,
-        name: sandbox.name,
-        paths: sandbox.paths,
-      });
+  const hostGlobals = globalThis as EdgeHostGlobals;
+  const hostSnapshot = captureHostEdgeGlobals();
+  try {
+    const edgeHandler = await ensureHostEdgeHandlerLoaded({
+      outputId: sandbox.outputId,
+      name: sandbox.name,
+      paths: sandbox.paths,
+    });
 
-      const edgeSnapshot = hostEdgeGlobalsByOutputId.get(sandbox.outputId);
-      if (edgeSnapshot) {
-        applyHostEdgeGlobals(edgeSnapshot);
-      }
-
-      const hadAssetSuffix = Object.prototype.hasOwnProperty.call(
-        hostGlobals,
-        'NEXT_CLIENT_ASSET_SUFFIX'
-      );
-      const previousAssetSuffix = hostGlobals.NEXT_CLIENT_ASSET_SUFFIX;
-      const hadIncrementalCache = Object.prototype.hasOwnProperty.call(
-        hostGlobals,
-        '__incrementalCache'
-      );
-      const previousIncrementalCache = hostGlobals.__incrementalCache;
-      const hadIncrementalCacheShared = Object.prototype.hasOwnProperty.call(
-        hostGlobals,
-        '__incrementalCacheShared'
-      );
-      const previousIncrementalCacheShared = hostGlobals.__incrementalCacheShared;
-
-      const requestUrl = new URL(request.url);
-      const requestUrlWithParams = new URL(requestUrl.toString());
-      if (routeMatches) {
-        for (const [key, value] of Object.entries(routeMatches)) {
-          requestUrlWithParams.searchParams.delete(key);
-          if (Array.isArray(value)) {
-            for (const item of value) {
-              requestUrlWithParams.searchParams.append(key, item);
-            }
-          } else {
-            requestUrlWithParams.searchParams.set(key, value);
-          }
-        }
-      }
-      const requestHeaders = toRequestHeadersRecord(
-        request.headers,
-        requestUrlWithParams.host
-      );
-      const requestBody = toEdgeRequestBody(request);
-      const waitUntilTasks: Promise<unknown>[] = [];
-      const pagePayload = buildPagePayload({
-        pageName,
-        routeMatches,
-      });
-
-      let invocationResult: unknown;
-      try {
-        hostGlobals.NEXT_CLIENT_ASSET_SUFFIX = resolveClientAssetSuffix();
-
-        if (incrementalCache !== undefined) {
-          hostGlobals.__incrementalCacheShared = true;
-          hostGlobals.__incrementalCache = incrementalCache;
-        }
-
-        const registerWaitUntil = (waitable: Promise<unknown>) => {
-          waitUntilTasks.push(waitable);
-        };
-        invocationResult = await edgeHandler({
-          request: {
-            headers: requestHeaders,
-            method: request.method,
-            nextConfig: {
-              basePath: sandbox.nextConfig.basePath,
-              i18n: sandbox.nextConfig.i18n,
-              trailingSlash: false,
-            },
-            url: requestUrlWithParams.toString(),
-            page: pagePayload,
-            body: requestBody,
-            signal,
-            waitUntil(waitable: Promise<unknown>) {
-              registerWaitUntil(waitable);
-            },
-          },
-        });
-      } finally {
-        if (hadAssetSuffix) {
-          hostGlobals.NEXT_CLIENT_ASSET_SUFFIX = previousAssetSuffix;
-        } else {
-          delete hostGlobals.NEXT_CLIENT_ASSET_SUFFIX;
-        }
-
-        if (hadIncrementalCache) {
-          hostGlobals.__incrementalCache = previousIncrementalCache;
-        } else {
-          delete hostGlobals.__incrementalCache;
-        }
-
-        if (hadIncrementalCacheShared) {
-          hostGlobals.__incrementalCacheShared = previousIncrementalCacheShared;
-        } else {
-          delete hostGlobals.__incrementalCacheShared;
-        }
-      }
-
-      let rawResponse = invocationResult;
-      if (
-        invocationResult &&
-        typeof invocationResult === 'object' &&
-        'response' in invocationResult
-      ) {
-        const fetchEventResult = invocationResult as EdgeFetchEventResultLike;
-        rawResponse = fetchEventResult.response;
-        if (fetchEventResult.waitUntil) {
-          waitUntilTasks.push(fetchEventResult.waitUntil);
-        }
-      }
-
-      for (const waitable of waitUntilTasks) {
-        void waitable.catch(() => undefined);
-      }
-
-      let response: Response;
-      if (isEdgeResponseLike(rawResponse)) {
-        response = await toHostResponse(rawResponse);
-      } else if (rawResponse instanceof Response) {
-        response = rawResponse;
-      } else if (rawResponse !== undefined && rawResponse !== null) {
-        response = asResponse(rawResponse as Response | LambdaLikeResult);
-      } else {
-        throw new Error(
-          `Edge function handler for output "${sandbox.outputId}" returned no response`
-        );
-      }
-
-      return normalizeEdgeResponseHeaders(response);
-    } finally {
-      applyHostEdgeGlobals(hostSnapshot);
+    const edgeSnapshot = hostEdgeGlobalsByOutputId.get(sandbox.outputId);
+    if (edgeSnapshot) {
+      applyHostEdgeGlobals(edgeSnapshot);
     }
-  });
+
+    const hadAssetSuffix = Object.prototype.hasOwnProperty.call(
+      hostGlobals,
+      'NEXT_CLIENT_ASSET_SUFFIX'
+    );
+    const previousAssetSuffix = hostGlobals.NEXT_CLIENT_ASSET_SUFFIX;
+    const hadIncrementalCache = Object.prototype.hasOwnProperty.call(
+      hostGlobals,
+      '__incrementalCache'
+    );
+    const previousIncrementalCache = hostGlobals.__incrementalCache;
+    const hadIncrementalCacheShared = Object.prototype.hasOwnProperty.call(
+      hostGlobals,
+      '__incrementalCacheShared'
+    );
+    const previousIncrementalCacheShared = hostGlobals.__incrementalCacheShared;
+
+    const requestUrl = new URL(request.url);
+    const requestUrlWithParams = new URL(requestUrl.toString());
+    if (routeMatches) {
+      for (const [key, value] of Object.entries(routeMatches)) {
+        requestUrlWithParams.searchParams.delete(key);
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            requestUrlWithParams.searchParams.append(key, item);
+          }
+        } else {
+          requestUrlWithParams.searchParams.set(key, value);
+        }
+      }
+    }
+    const requestHeaders = toRequestHeadersRecord(
+      request.headers,
+      requestUrlWithParams.host
+    );
+    const requestBody = toEdgeRequestBody(request);
+    const waitUntilTasks: Promise<unknown>[] = [];
+    const pagePayload = buildPagePayload({
+      pageName,
+      routeMatches,
+    });
+
+    let invocationResult: unknown;
+    try {
+      hostGlobals.NEXT_CLIENT_ASSET_SUFFIX = resolveClientAssetSuffix();
+
+      if (incrementalCache !== undefined) {
+        hostGlobals.__incrementalCacheShared = true;
+        hostGlobals.__incrementalCache = incrementalCache;
+      }
+
+      const registerWaitUntil = (waitable: Promise<unknown>) => {
+        waitUntilTasks.push(waitable);
+      };
+      invocationResult = await edgeHandler({
+        request: {
+          headers: requestHeaders,
+          method: request.method,
+          nextConfig: {
+            basePath: sandbox.nextConfig.basePath,
+            i18n: sandbox.nextConfig.i18n,
+            trailingSlash: false,
+          },
+          url: requestUrlWithParams.toString(),
+          page: pagePayload,
+          body: requestBody,
+          signal,
+          waitUntil(waitable: Promise<unknown>) {
+            registerWaitUntil(waitable);
+          },
+        },
+      });
+    } finally {
+      if (hadAssetSuffix) {
+        hostGlobals.NEXT_CLIENT_ASSET_SUFFIX = previousAssetSuffix;
+      } else {
+        delete hostGlobals.NEXT_CLIENT_ASSET_SUFFIX;
+      }
+
+      if (hadIncrementalCache) {
+        hostGlobals.__incrementalCache = previousIncrementalCache;
+      } else {
+        delete hostGlobals.__incrementalCache;
+      }
+
+      if (hadIncrementalCacheShared) {
+        hostGlobals.__incrementalCacheShared = previousIncrementalCacheShared;
+      } else {
+        delete hostGlobals.__incrementalCacheShared;
+      }
+    }
+
+    let rawResponse = invocationResult;
+    if (
+      invocationResult &&
+      typeof invocationResult === 'object' &&
+      'response' in invocationResult
+    ) {
+      const fetchEventResult = invocationResult as EdgeFetchEventResultLike;
+      rawResponse = fetchEventResult.response;
+      if (fetchEventResult.waitUntil) {
+        waitUntilTasks.push(fetchEventResult.waitUntil);
+      }
+    }
+
+    for (const waitable of waitUntilTasks) {
+      void waitable.catch(() => undefined);
+    }
+
+    let response: Response;
+    if (isEdgeResponseLike(rawResponse)) {
+      response = await toHostResponse(rawResponse);
+    } else if (rawResponse instanceof Response) {
+      response = rawResponse;
+    } else if (rawResponse !== undefined && rawResponse !== null) {
+      response = asResponse(rawResponse as Response | LambdaLikeResult);
+    } else {
+      throw new Error(
+        `Edge function handler for output "${sandbox.outputId}" returned no response`
+      );
+    }
+
+    return normalizeEdgeResponseHeaders(response);
+  } finally {
+    applyHostEdgeGlobals(hostSnapshot);
+  }
 }
 
 export function createEdgeFunctionArtifactInvoker({
@@ -789,10 +771,6 @@ export function createEdgeMiddlewareInvoker({
   let sandbox: EdgeSandboxDefinition | undefined;
 
   return async (ctx: MiddlewareContext): Promise<RouterMiddlewareResult> => {
-    if (!shouldInvokeMiddlewareForRequest(output, ctx)) {
-      return {};
-    }
-
     sandbox ??= buildEdgeSandboxDefinition({
       output,
       adapterDir,
@@ -803,11 +781,25 @@ export function createEdgeMiddlewareInvoker({
       },
     });
 
+    const customMethod = (
+      ctx as MiddlewareContext & { method?: string }
+    ).method;
+    const middlewareMethod = (
+      customMethod ??
+      ctx.headers.get('x-adapter-original-method') ??
+      'GET'
+    ).toUpperCase();
+    const middlewareBody =
+      middlewareMethod === 'GET' || middlewareMethod === 'HEAD'
+        ? undefined
+        : ctx.requestBody;
+
     const response = await invokeEdgeRuntimeHandler({
       sandbox,
       request: new Request(ctx.url.toString(), {
-        method: 'GET',
+        method: middlewareMethod,
         headers: ctx.headers,
+        body: middlewareBody,
       }),
       signal: AbortSignal.timeout(30_000),
       incrementalCache: undefined,

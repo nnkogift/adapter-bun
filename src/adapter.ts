@@ -8,7 +8,6 @@ import {
   buildDeploymentManifest,
   buildRouterManifest,
   collectOutputPathnames,
-  mergePathnamesWithStaticAssets,
 } from './manifest.ts';
 import { SCHEMA_SQL } from './runtime/sqlite-cache.ts';
 import {
@@ -221,6 +220,39 @@ function resetNextFetchPatchState() {
   globalThis[NEXT_PATCH_SYMBOL] = false;
 }
 
+function normalizeLocationHeaderForRequest(headers, requestUrl) {
+  const locationHeader = headers.get('location');
+  if (!locationHeader) {
+    return;
+  }
+
+  let locationUrl;
+  try {
+    locationUrl = new URL(locationHeader, requestUrl);
+  } catch {
+    return;
+  }
+
+  if (locationUrl.hostname !== requestUrl.hostname) {
+    return;
+  }
+
+  if (locationUrl.port.length > 0 || requestUrl.port.length === 0) {
+    return;
+  }
+
+  const defaultPort = locationUrl.protocol === 'https:' ? '443' : '80';
+  if (requestUrl.port === defaultPort) {
+    return;
+  }
+
+  // Preserve the external listen port for same-host absolute redirects.
+  // Next's internal function invocation can otherwise emit localhost URLs
+  // without the port, which breaks browser redirect follow-ups.
+  locationUrl.port = requestUrl.port;
+  headers.set('location', locationUrl.toString());
+}
+
 const server = Bun.serve({
   port: parseInt(process.env.PORT || '0', 10) || manifest.server.port,
   hostname: manifest.server.hostname,
@@ -274,6 +306,12 @@ const server = Bun.serve({
         pathname: url.pathname,
         search: url.search,
         originalMethodHeader: originalMethod,
+        requestHostHeader: request.headers.get('host'),
+        normalizedUrlHost: url.host,
+        rsc: request.headers.get('rsc'),
+        nextRouterPrefetch: request.headers.get('next-router-prefetch'),
+        nextRouterStateTree: request.headers.get('next-router-state-tree'),
+        nextRouterSegmentPrefetch: request.headers.get('next-router-segment-prefetch'),
       });
     }
     if (debugBlogNav) {
@@ -309,18 +347,25 @@ const server = Bun.serve({
           search: url.search,
           status: response.status,
           contentType: response.headers.get('content-type'),
+          routeKind: response.headers.get('x-bun-route-kind'),
+          routeId: response.headers.get('x-bun-route-id'),
+          bunCache: response.headers.get('x-bun-cache'),
+          nextCache: response.headers.get('x-nextjs-cache'),
         });
       }
       const responseHeaders = new Headers(response.headers);
+      normalizeLocationHeaderForRequest(responseHeaders, url);
       if (
         url.pathname.startsWith(\`/_next/data/\${manifest.build.buildId}/\`) &&
         url.pathname.endsWith('.json') &&
         !responseHeaders.has('x-nextjs-deployment-id')
       ) {
-        responseHeaders.set(
-          'x-nextjs-deployment-id',
-          process.env.NEXT_DEPLOYMENT_ID || \`bun-adapter-\${manifest.build.buildId}\`
-        );
+        const clientDeploymentId =
+          process.env.VERCEL_IMMUTABLE_ASSET_TOKEN ??
+          process.env.IMMUTABLE_ASSET_TOKEN ??
+          process.env.NEXT_DEPLOYMENT_ID ??
+          \`bun-adapter-\${manifest.build.buildId}\`;
+        responseHeaders.set('x-nextjs-deployment-id', clientDeploymentId);
       }
       responseHeaders.set('connection', 'close');
       return new Response(response.body, {
@@ -336,6 +381,43 @@ const server = Bun.serve({
           url: url.toString(),
         },
       });
+      let errorMessage = '';
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      } else if (
+        typeof error === 'object' &&
+        error !== null &&
+        'message' in error &&
+        typeof error.message === 'string'
+      ) {
+        errorMessage = error.message;
+      }
+      const contentType = request.headers.get('content-type')?.toLowerCase() ?? '';
+      const isMpaActionSubmission =
+        request.method.toUpperCase() === 'POST' &&
+        !request.headers.has('next-action') &&
+        contentType.startsWith('multipart/form-data');
+      if (
+        errorMessage.includes('Failed to find Server Action') &&
+        isMpaActionSubmission
+      ) {
+        if (debugRequests) {
+          console.log('[adapter-bun][request:response]', {
+            method: request.method,
+            pathname: url.pathname,
+            search: url.search,
+            status: 405,
+            contentType: 'text/html; charset=utf-8',
+          });
+        }
+        return new Response('<!DOCTYPE html><html><body>Method Not Allowed</body></html>', {
+          status: 405,
+          headers: {
+            allow: 'GET, HEAD',
+            'content-type': 'text/html; charset=utf-8',
+          },
+        });
+      }
       if (debugRequests) {
         console.log('[adapter-bun][request:response]', {
           method: request.method,
@@ -658,7 +740,7 @@ async function onBuildComplete(
   await mkdir(outDir, { recursive: true });
 
   const generatedAt = new Date().toISOString();
-  const outputPathnames = collectOutputPathnames(ctx.outputs);
+  const pathnames = collectOutputPathnames(ctx.outputs);
 
   const [staticAssets, functionMap, prerenderSeeds] = await Promise.all([
     stageStaticAssets({
@@ -678,8 +760,6 @@ async function onBuildComplete(
       outDir,
     }),
   ]);
-  const pathnames = mergePathnamesWithStaticAssets(outputPathnames, staticAssets);
-
   const routerManifestPath = 'router-manifest.json';
   const routerManifest = buildRouterManifest({
     ctx,

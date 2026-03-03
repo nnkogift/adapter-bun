@@ -108,6 +108,68 @@ function outputAssetPathToBundlePath({
   });
 }
 
+function hasBunExportCondition(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some((entry) => hasBunExportCondition(entry));
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(record, 'bun')) {
+      return true;
+    }
+    return Object.values(record).some((entry) => hasBunExportCondition(entry));
+  }
+  return false;
+}
+
+function stripBunExportConditions(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => stripBunExportConditions(entry));
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const nextRecord: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(record)) {
+      if (key === 'bun') {
+        continue;
+      }
+      nextRecord[key] = stripBunExportConditions(entry);
+    }
+    return nextRecord;
+  }
+  return value;
+}
+
+function resolveDirectNodeModulesPackageRoot(
+  relativePath: string
+): string | null {
+  if (!relativePath.endsWith('/package.json')) {
+    return null;
+  }
+
+  const segments = normalizeRelativePath(relativePath).split('/');
+  if (segments.includes('.pnpm')) {
+    return null;
+  }
+  const nodeModulesIndex = segments.lastIndexOf('node_modules');
+  if (
+    nodeModulesIndex === -1 ||
+    nodeModulesIndex + 2 >= segments.length ||
+    segments[nodeModulesIndex + 1] === '.pnpm'
+  ) {
+    return null;
+  }
+
+  const packageNameStart = nodeModulesIndex + 1;
+  const isScoped = segments[packageNameStart]?.startsWith('@') ?? false;
+  const packageNameEnd = isScoped ? packageNameStart + 1 : packageNameStart;
+  if (packageNameEnd + 1 !== segments.length - 1) {
+    return null;
+  }
+
+  return segments.slice(0, packageNameEnd + 1).join('/');
+}
+
 function createBundleId(id: string): string {
   const slug = id
     .replace(/[^a-zA-Z0-9._-]+/g, '-')
@@ -462,6 +524,8 @@ export async function stageFunctionArtifacts({
 }): Promise<BunFunctionArtifact[]> {
   const artifacts: BunFunctionArtifact[] = [];
   const seenFiles = new Map<string, string>();
+  const bunConditionPackageRoots = new Set<string>();
+  const patchedPackageJsonPaths = new Set<string>();
   const bundleRoot = 'bundle';
 
   for (const output of sortByPathnameAndId(getFunctionOutputs(outputs))) {
@@ -499,6 +563,55 @@ export async function stageFunctionArtifacts({
         kind: 'asset',
         copyToBundle: !bundlePath.startsWith('node_modules/'),
       });
+
+      const packageRoot = resolveDirectNodeModulesPackageRoot(bundlePath);
+      if (packageRoot && !bunConditionPackageRoots.has(packageRoot)) {
+        let packageJsonText: string;
+        try {
+          packageJsonText = await Bun.file(absoluteSourcePath).text();
+        } catch {
+          continue;
+        }
+
+        const packageJson = JSON.parse(packageJsonText) as {
+          exports?: unknown;
+        };
+        if (!hasBunExportCondition(packageJson.exports)) {
+          continue;
+        }
+
+        await addFunctionFile({
+          seenFiles,
+          files,
+          outDir,
+          bundleRoot,
+          relativePath: packageRoot,
+          sourcePath: path.dirname(absoluteSourcePath),
+          kind: 'asset',
+          copyToBundle: !packageRoot.startsWith('node_modules/'),
+        });
+        bunConditionPackageRoots.add(packageRoot);
+
+        const stagedPackageJsonRelativePath = packageRoot.startsWith('node_modules/')
+          ? path.posix.join(packageRoot, 'package.json')
+          : path.posix.join(bundleRoot, packageRoot, 'package.json');
+        const stagedPackageJsonPath = resolveInside(
+          outDir,
+          stagedPackageJsonRelativePath
+        );
+        if (patchedPackageJsonPaths.has(stagedPackageJsonPath)) {
+          continue;
+        }
+
+        packageJson.exports = stripBunExportConditions(packageJson.exports);
+        await mkdir(path.dirname(stagedPackageJsonPath), { recursive: true });
+        await writeFile(
+          stagedPackageJsonPath,
+          `${JSON.stringify(packageJson, null, 2)}\n`,
+          'utf8'
+        );
+        patchedPackageJsonPaths.add(stagedPackageJsonPath);
+      }
     }
 
     for (const [wasmName, wasmPath] of Object.entries(output.wasmAssets ?? {})) {

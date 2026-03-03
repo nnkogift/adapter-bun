@@ -3,9 +3,8 @@ set -euo pipefail
 
 cd "$NEXT_TEST_DIR"
 
-# 1. Pick random available ports for external proxy and internal Bun server
+# 1. Pick a random available port
 PORT=$(node -e "const s=require('net').createServer();s.listen(0,()=>{console.log(s.address().port);s.close()})")
-INTERNAL_PORT=$(node -e "const s=require('net').createServer();s.listen(0,()=>{console.log(s.address().port);s.close()})")
 
 # 2. Add adapter-bun as file: dependency
 node -e "
@@ -17,6 +16,15 @@ require('fs').writeFileSync('package.json',JSON.stringify(pkg,null,2));
 
 # 3. Install dependencies
 bun install --no-frozen-lockfile >&2
+
+# Bun type packages can conflict with Next.js global typings in fixtures
+# without explicit tsconfig "types". Remove them for deploy test builds.
+if [ -d "node_modules/bun-types" ]; then
+  rm -rf "node_modules/bun-types"
+fi
+if [ -d "node_modules/@types/bun" ]; then
+  rm -rf "node_modules/@types/bun"
+fi
 
 # Trim local-fixture trees from file:adapter installs. They are not needed for
 # deploy tests and can create ENAMETOOLONG paths during test cleanup.
@@ -50,35 +58,33 @@ if has_script "setup"; then
   bun run setup >&2
 fi
 
+# Ensure static HTML generated during build includes immutable asset query params.
+export VERCEL_IMMUTABLE_ASSET_TOKEN="bun-adapter-token"
+export IMMUTABLE_ASSET_TOKEN="$VERCEL_IMMUTABLE_ASSET_TOKEN"
+export NEXT_DEPLOYMENT_ID="$VERCEL_IMMUTABLE_ASSET_TOKEN"
+
 bun --bun next build 2>&1 | tee -a "$NEXT_TEST_DIR/.adapter-build.log" >&2
 
 if has_script "post-build"; then
   bun run post-build >&2
 fi
 
-# 6. Generate build ID markers for logs script
+# 6. Generate build ID markers for logs script and runtime env
 BUILD_ID=$(cat ".next/BUILD_ID" 2>/dev/null || echo "unknown")
+export NEXT_DEPLOYMENT_ID="bun-adapter-$BUILD_ID"
 echo "BUILD_ID: $BUILD_ID" >> "$NEXT_TEST_DIR/.adapter-build.log"
-echo "DEPLOYMENT_ID: bun-adapter-$BUILD_ID" >> "$NEXT_TEST_DIR/.adapter-build.log"
-echo "IMMUTABLE_ASSET_TOKEN: bun-adapter-token" >> "$NEXT_TEST_DIR/.adapter-build.log"
+echo "DEPLOYMENT_ID: $NEXT_DEPLOYMENT_ID" >> "$NEXT_TEST_DIR/.adapter-build.log"
+echo "IMMUTABLE_ASSET_TOKEN: $IMMUTABLE_ASSET_TOKEN" >> "$NEXT_TEST_DIR/.adapter-build.log"
 
-# 7. Start Bun server on an internal port
-PORT=$INTERNAL_PORT bun bun-dist/server.js >> "$NEXT_TEST_DIR/.adapter-server.log" 2>&1 &
-BUN_SERVER_PID=$!
+# 7. Start Bun server on selected port
+PORT=$PORT bun bun-dist/server.js >> "$NEXT_TEST_DIR/.adapter-server.log" 2>&1 &
+SERVER_PID=$!
+echo "$SERVER_PID" > "$NEXT_TEST_DIR/.adapter-server.pid"
 
-# 8. Start a small Node proxy on the external port.
-# Bun currently drops OPTIONS request bodies, so the proxy remaps
-# OPTIONS-with-body to POST and forwards the original method via headers.
-node "$ADAPTER_BUN_DIR/scripts/e2e-method-proxy.mjs" \
-  "$INTERNAL_PORT" "$PORT" >> "$NEXT_TEST_DIR/.adapter-server.log" 2>&1 &
-PROXY_PID=$!
-
-printf "%s\n%s\n" "$PROXY_PID" "$BUN_SERVER_PID" > "$NEXT_TEST_DIR/.adapter-server.pid"
-
-# 9. Wait for server to be ready
+# 8. Wait for server to be ready
 for i in $(seq 1 30); do
   if curl -sf -o /dev/null "http://localhost:${PORT}/" 2>/dev/null; then break; fi
-  if ! kill -0 "$BUN_SERVER_PID" 2>/dev/null || ! kill -0 "$PROXY_PID" 2>/dev/null; then
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
       echo "Server died. Logs:" >&2
       cat "$NEXT_TEST_DIR/.adapter-server.log" >&2
       exit 1
@@ -86,5 +92,5 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-# 10. Output URL (only thing on stdout)
+# 9. Output URL (only thing on stdout)
 echo "http://localhost:${PORT}"

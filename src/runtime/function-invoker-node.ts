@@ -25,7 +25,6 @@ import {
   defaultLoadModule,
   resolveOutputEntrypointPath,
   resolveRouteHandlerExport,
-  shouldInvokeMiddlewareForRequest,
   type ArtifactRouteHandler,
   type CreateFunctionArtifactInvokerOptions,
   type LoadedModule,
@@ -75,6 +74,7 @@ const observedFetchTags = new Map<string, Set<string>>();
 
 const nodeRequire = createRequire(import.meta.url);
 const NEXT_PATCH_SYMBOL = Symbol.for('next-patch');
+let didPatchReactDomServerForBun = false;
 
 function createOnceCallback(callback: () => void): () => void {
   let didRun = false;
@@ -165,6 +165,10 @@ function clearNodeFetchMemoryCache(): void {
   fileSystemCache.memoryCache = undefined;
 }
 
+function isImplicitCacheTag(tag: string): boolean {
+  return tag.startsWith('_N_T_');
+}
+
 function ensureFileSystemCacheFetchTagMismatchReturnsMiss(): void {
   if (didPatchFileSystemCacheFetchTagMismatch) {
     return;
@@ -179,36 +183,23 @@ function ensureFileSystemCacheFetchTagMismatchReturnsMiss(): void {
   const originalGet = prototype.get;
   prototype.get = async function patchedGet(...args: unknown[]): Promise<unknown> {
     const result = await originalGet.apply(this, args);
-    const ctxWithDebug = args[1] as {
-      fetchUrl?: unknown;
-      tags?: unknown;
-      kind?: unknown;
-    } | undefined;
-    if (
-      process.env.ADAPTER_BUN_DEBUG_NODE === '1' &&
-      typeof ctxWithDebug?.fetchUrl === 'string' &&
-      ctxWithDebug.fetchUrl.includes('sam=iam')
-    ) {
-      const debugValue =
-        result && typeof result === 'object'
-          ? (result as { value?: { kind?: unknown; tags?: unknown } }).value
-          : undefined;
-      console.log('[adapter-bun][node][fetch-cache:get]', {
-        kind: ctxWithDebug.kind,
-        fetchUrl: ctxWithDebug.fetchUrl,
-        requestedTags: ctxWithDebug.tags,
-        valueKind: debugValue?.kind,
-        storedTags: debugValue?.tags,
-      });
-    }
-
     if (!result || typeof result !== 'object') {
       return result;
     }
 
     const ctx = args[1] as { tags?: unknown } | undefined;
+    const fetchUrl =
+      ctx &&
+      typeof (ctx as { fetchUrl?: unknown }).fetchUrl === 'string'
+        ? ((ctx as { fetchUrl: string }).fetchUrl as string)
+        : null;
     const requestedTags = Array.isArray(ctx?.tags)
-      ? ctx.tags.filter((tag): tag is string => typeof tag === 'string' && tag.length > 0)
+      ? ctx.tags.filter(
+          (tag): tag is string =>
+            typeof tag === 'string' &&
+            tag.length > 0 &&
+            !isImplicitCacheTag(tag)
+        )
       : [];
     if (requestedTags.length === 0) {
       return result;
@@ -220,8 +211,23 @@ function ensureFileSystemCacheFetchTagMismatchReturnsMiss(): void {
     }
 
     const storedTags = Array.isArray(value.tags)
-      ? value.tags.filter((tag): tag is string => typeof tag === 'string')
+      ? value.tags.filter(
+          (tag): tag is string =>
+            typeof tag === 'string' && !isImplicitCacheTag(tag)
+        )
       : [];
+    if (
+      process.env.ADAPTER_BUN_DEBUG_NODE === '1' &&
+      typeof fetchUrl === 'string' &&
+      fetchUrl.includes('next-data-api-endpoint.vercel.app/api/random?page')
+    ) {
+      console.log('[adapter-bun][node][fetch-cache:get]', {
+        fetchUrl,
+        requestedTags,
+        storedTags,
+        valueKind: value.kind,
+      });
+    }
     for (const tag of requestedTags) {
       if (!storedTags.includes(tag)) {
         return null;
@@ -256,7 +262,12 @@ function toFetchTagList(init: RequestInit | undefined): string[] {
   if (!Array.isArray(tags)) {
     return [];
   }
-  return tags.filter((tag): tag is string => typeof tag === 'string' && tag.length > 0);
+  return tags.filter(
+    (tag): tag is string =>
+      typeof tag === 'string' &&
+      tag.length > 0 &&
+      !isImplicitCacheTag(tag)
+  );
 }
 
 function withTagEvolutionBuster(resource: string | URL | Request, init?: RequestInit): {
@@ -268,7 +279,9 @@ function withTagEvolutionBuster(resource: string | URL | Request, init?: Request
     return { resource, init };
   }
 
-  const method = (init?.method ?? (resource instanceof Request ? resource.method : 'GET')).toUpperCase();
+  const method = (
+    init?.method ?? (resource instanceof Request ? resource.method : 'GET')
+  ).toUpperCase();
   if (method !== 'GET' && method !== 'HEAD') {
     return { resource, init };
   }
@@ -303,6 +316,17 @@ function withTagEvolutionBuster(resource: string | URL | Request, init?: Request
     '__adapter_bun_tag_bust',
     String(++fetchTagEvolutionCounter)
   );
+  if (
+    process.env.ADAPTER_BUN_DEBUG_NODE === '1' &&
+    rewrittenUrl.toString().includes('next-data-api-endpoint.vercel.app/api/random?page')
+  ) {
+    console.log('[adapter-bun][node][fetch-cache:tag-bust]', {
+      originalUrl,
+      rewrittenUrl: rewrittenUrl.toString(),
+      tags,
+      observedTags: [...previousTags],
+    });
+  }
   if (typeof resource === 'string') {
     return { resource: rewrittenUrl.toString(), init };
   }
@@ -320,6 +344,105 @@ function createTagEvolutionGuardFetch(baseFetch: typeof fetch): typeof fetch {
     const maybeRewritten = withTagEvolutionBuster(resource, init);
     return baseFetch(maybeRewritten.resource, maybeRewritten.init);
   }, baseFetch);
+}
+
+function ensureReactDomServerNodeCompatibility(
+  requireFromEntrypoint: ReturnType<typeof createRequire>
+): void {
+  if (didPatchReactDomServerForBun) {
+    return;
+  }
+
+  let reactDomServer: Record<string, unknown> | null = null;
+  try {
+    reactDomServer = requireFromEntrypoint('react-dom/server') as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    return;
+  }
+
+  if (!reactDomServer || typeof reactDomServer !== 'object') {
+    return;
+  }
+  if (typeof reactDomServer.renderToPipeableStream === 'function') {
+    didPatchReactDomServerForBun = true;
+    return;
+  }
+  if (typeof reactDomServer.renderToReadableStream !== 'function') {
+    return;
+  }
+
+  const renderToReadableStream = reactDomServer
+    .renderToReadableStream as (...args: unknown[]) => Promise<ReadableStream> | ReadableStream;
+
+  reactDomServer.renderToPipeableStream = function renderToPipeableStream(
+    ...args: unknown[]
+  ) {
+    const [reactNode, rawOptions] = args;
+    const options =
+      rawOptions && typeof rawOptions === 'object'
+        ? ({ ...(rawOptions as Record<string, unknown>) } as Record<string, unknown>)
+        : {};
+
+    const abortController = new AbortController();
+    if (!('signal' in options)) {
+      options.signal = abortController.signal;
+    }
+
+    const readablePromise = Promise.resolve(
+      renderToReadableStream(reactNode, options)
+    );
+
+    return {
+      pipe(destination: NodeJS.WritableStream): NodeJS.WritableStream {
+        void readablePromise
+          .then(async (webStream) => {
+            const streamWithReady = webStream as ReadableStream & {
+              allReady?: Promise<unknown>;
+            };
+            if (streamWithReady.allReady) {
+              try {
+                await streamWithReady.allReady;
+              } catch {
+                // Let stream piping surface the render error.
+              }
+            }
+            const nodeReadable = Readable.fromWeb(
+              webStream as globalThis.ReadableStream<Uint8Array>
+            );
+            nodeReadable.on('error', (error) => {
+              if (typeof (destination as { emit?: unknown }).emit === 'function') {
+                (destination as { emit: (event: string, value: unknown) => void }).emit(
+                  'error',
+                  error
+                );
+              }
+            });
+            nodeReadable.pipe(destination as NodeJS.WritableStream);
+          })
+          .catch((error) => {
+            if (typeof (destination as { emit?: unknown }).emit === 'function') {
+              (destination as { emit: (event: string, value: unknown) => void }).emit(
+                'error',
+                error
+              );
+            }
+          });
+        return destination;
+      },
+      abort(reason?: unknown): void {
+        try {
+          abortController.abort(reason as Error | undefined);
+        } catch {
+          abortController.abort();
+        }
+      },
+    };
+  };
+
+  didPatchReactDomServerForBun = true;
 }
 
 type BunRequestLike = Request & {
@@ -342,12 +465,71 @@ async function readRequestBodyBuffer(request: Request): Promise<Buffer> {
 function toOutgoingHttpHeaders(headers: Headers): OutgoingHttpHeaders {
   const outgoing: OutgoingHttpHeaders = {};
   for (const [key, value] of headers.entries()) {
-    if (key.toLowerCase() === 'host') {
+    const normalizedKey = key.toLowerCase();
+    if (
+      normalizedKey === 'host' ||
+      normalizedKey === 'connection' ||
+      normalizedKey === 'keep-alive' ||
+      normalizedKey === 'proxy-connection' ||
+      normalizedKey === 'transfer-encoding' ||
+      normalizedKey === 'upgrade' ||
+      normalizedKey === 'te' ||
+      normalizedKey === 'trailer' ||
+      normalizedKey === 'expect'
+    ) {
       continue;
     }
     outgoing[key] = value;
   }
   return outgoing;
+}
+
+function hasOutgoingHeader(
+  headers: OutgoingHttpHeaders & Record<string, string | string[] | number | undefined>,
+  expectedKey: string
+): boolean {
+  const lowerExpectedKey = expectedKey.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === lowerExpectedKey) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function readErrorMessage(error: unknown): string {
+  if (error instanceof Error && typeof error.message === 'string') {
+    return error.message;
+  }
+  if (
+    error &&
+    typeof error === 'object' &&
+    typeof (error as { message?: unknown }).message === 'string'
+  ) {
+    return (error as { message: string }).message;
+  }
+  return '';
+}
+
+function isUnrecognizedServerActionError(error: unknown): boolean {
+  return readErrorMessage(error).includes('Failed to find Server Action');
+}
+
+function isMpaActionSubmissionRequest({
+  request,
+  requestMethod,
+}: {
+  request: Request;
+  requestMethod: string;
+}): boolean {
+  if (requestMethod.toUpperCase() !== 'POST') {
+    return false;
+  }
+  if (request.headers.has('next-action')) {
+    return false;
+  }
+  const contentType = request.headers.get('content-type')?.toLowerCase() ?? '';
+  return contentType.startsWith('multipart/form-data');
 }
 
 function toResponseHeaders(headers: IncomingHttpHeaders): Headers {
@@ -375,6 +557,33 @@ function toResponseHeaders(headers: IncomingHttpHeaders): Headers {
     normalized.set(key, value);
   }
   return normalized;
+}
+
+function readContentTypeHeader(
+  headers: IncomingHttpHeaders
+): string | null {
+  const value = headers['content-type'] as string | string[] | undefined;
+  if (typeof value === 'string') {
+    return value.toLowerCase();
+  }
+  if (Array.isArray(value) && value.length > 0) {
+    return value[0]?.toLowerCase() ?? null;
+  }
+  return null;
+}
+
+function readSingleHeaderValue(
+  headers: IncomingHttpHeaders,
+  name: string
+): string | null {
+  const value = headers[name] as string | string[] | undefined;
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (Array.isArray(value) && value.length > 0) {
+    return value[0] ?? null;
+  }
+  return null;
 }
 
 function splitSetCookieHeaderValue(value: string): string[] {
@@ -570,25 +779,36 @@ function toStreamingResponse(
   });
 }
 
-async function toBufferedResponse(clientResponse: IncomingMessage): Promise<Response> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of clientResponse) {
-    if (typeof chunk === 'string') {
-      chunks.push(Buffer.from(chunk));
-      continue;
-    }
-    chunks.push(Buffer.from(chunk));
+async function toBufferedResponse(
+  clientResponse: IncomingMessage,
+  requestMethod: string,
+  onBodyComplete: () => void
+): Promise<Response> {
+  const isHeadRequest = requestMethod.toUpperCase() === 'HEAD';
+  if (isHeadRequest || !clientResponse.readable) {
+    onBodyComplete();
+    return new Response(null, {
+      status: clientResponse.statusCode ?? 200,
+      statusText: clientResponse.statusMessage,
+      headers: toResponseHeaders(clientResponse.headers),
+    });
   }
 
-  return new Response(Buffer.concat(chunks), {
+  const chunks: Buffer[] = [];
+  try {
+    for await (const chunk of clientResponse) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+  } finally {
+    onBodyComplete();
+  }
+
+  const body = chunks.length > 0 ? Buffer.concat(chunks) : null;
+  return new Response(body, {
     status: clientResponse.statusCode ?? 200,
     statusText: clientResponse.statusMessage,
     headers: toResponseHeaders(clientResponse.headers),
   });
-}
-
-function shouldUseStreamingBridge(pathname: string): boolean {
-  return pathname.startsWith('/stale-cache-serving/');
 }
 
 async function invokeNodeRuntimeHandler({
@@ -616,6 +836,8 @@ async function invokeNodeRuntimeHandler({
       matchedPathname: context.matchedPathname,
       pathname: requestUrl.pathname,
       method: requestMethod,
+      requestHostHeader: context.request.headers.get('host'),
+      requestUrlHost: requestUrl.host,
     });
   }
   const body = await readRequestBodyBuffer(context.request);
@@ -641,6 +863,29 @@ async function invokeNodeRuntimeHandler({
     ...toOutgoingHttpHeaders(context.request.headers),
   } as OutgoingHttpHeaders & Record<string, string | string[] | number | undefined>;
   delete requestHeaders['x-adapter-original-method'];
+  const forwardedProto = requestUrl.protocol.replace(/:$/, '') || 'http';
+  if (!hasOutgoingHeader(requestHeaders, 'x-forwarded-host')) {
+    requestHeaders['x-forwarded-host'] = requestUrl.host;
+  }
+  if (!hasOutgoingHeader(requestHeaders, 'x-forwarded-port')) {
+    requestHeaders['x-forwarded-port'] =
+      requestUrl.port ||
+      (forwardedProto === 'https' ? '443' : '80');
+  }
+  if (!hasOutgoingHeader(requestHeaders, 'x-forwarded-proto')) {
+    requestHeaders['x-forwarded-proto'] = forwardedProto;
+  }
+  if (debugNodeInvoke) {
+    console.log('[adapter-bun][node][invoke:request-headers]', {
+      outputId: context.output.id,
+      pathname: requestUrl.pathname,
+      method: requestMethod,
+      host: requestHeaders.host,
+      xForwardedHost: requestHeaders['x-forwarded-host'],
+      xForwardedPort: requestHeaders['x-forwarded-port'],
+      xForwardedProto: requestHeaders['x-forwarded-proto'],
+    });
+  }
 
   return new Promise<Response>((resolve, reject) => {
     let settled = false;
@@ -679,9 +924,22 @@ async function invokeNodeRuntimeHandler({
             return;
           }
         } catch (error) {
+          const shouldReturnMethodNotAllowed =
+            isUnrecognizedServerActionError(error) &&
+            isMpaActionSubmissionRequest({
+              request: context.request,
+              requestMethod,
+            });
           if (!res.headersSent) {
-            res.statusCode = 500;
-            res.end('Internal Server Error');
+            if (shouldReturnMethodNotAllowed) {
+              res.statusCode = 405;
+              res.setHeader('allow', 'GET, HEAD');
+              res.setHeader('content-type', 'text/html; charset=utf-8');
+              res.end('<!DOCTYPE html><html><body>Method Not Allowed</body></html>');
+            } else {
+              res.statusCode = 500;
+              res.end('Internal Server Error');
+            }
           } else if (!res.writableEnded) {
             res.end();
           }
@@ -740,16 +998,45 @@ async function invokeNodeRuntimeHandler({
           port: address.port,
           method: internalMethod,
           path: `${requestUrl.pathname}${requestUrl.search}`,
-          headers: requestHeaders,
+          headers: {
+            ...requestHeaders,
+            connection: 'close',
+          },
+          agent: false,
         },
         (clientResponse) => {
-          if (shouldUseStreamingBridge(requestUrl.pathname)) {
-            const closeServer = createOnceCallback(() => {
-              server.close(() => undefined);
-            });
-            clientResponse.once('close', closeServer);
-            clientResponse.once('error', closeServer);
+          const closeServer = createOnceCallback(() => {
+            server.close(() => undefined);
+          });
+          clientResponse.once('close', closeServer);
+          clientResponse.once('error', closeServer);
+          const contentType = readContentTypeHeader(clientResponse.headers);
+          const varyHeader = readSingleHeaderValue(
+            clientResponse.headers,
+            'vary'
+          )?.toLowerCase();
+          const transferEncoding = readSingleHeaderValue(
+            clientResponse.headers,
+            'transfer-encoding'
+          )?.toLowerCase();
+          const isHtmlResponse =
+            typeof contentType === 'string' && contentType.startsWith('text/html');
+          const isRscResponse =
+            typeof contentType === 'string' &&
+            contentType.startsWith('text/x-component');
+          const isChunkedResponse = transferEncoding === 'chunked';
+          const isChunkedRouterStateResponse =
+            isChunkedResponse &&
+            typeof varyHeader === 'string' &&
+            varyHeader.includes('next-router-state-tree');
+          const shouldStreamResponse =
+            (requestMethod.toUpperCase() === 'GET' ||
+              requestMethod.toUpperCase() === 'HEAD') &&
+            (isRscResponse ||
+              isChunkedRouterStateResponse ||
+              (isChunkedResponse && !isHtmlResponse));
 
+          if (shouldStreamResponse) {
             const response = toStreamingResponse(
               clientResponse,
               internalMethod,
@@ -757,12 +1044,13 @@ async function invokeNodeRuntimeHandler({
             );
             if (debugNodeInvoke) {
               console.log('[adapter-bun][node][invoke:response]', {
-                  outputId: context.output.id,
-                  pathname: requestUrl.pathname,
-                  method: requestMethod,
-                  status: clientResponse.statusCode ?? 200,
-                  mode: 'stream',
-                });
+                outputId: context.output.id,
+                pathname: requestUrl.pathname,
+                method: requestMethod,
+                status: clientResponse.statusCode ?? 200,
+                mode: 'stream',
+                headers: clientResponse.headers,
+              });
             }
             settle(() => {
               resolve(response);
@@ -770,9 +1058,8 @@ async function invokeNodeRuntimeHandler({
             return;
           }
 
-          void (async () => {
-            try {
-              const response = await toBufferedResponse(clientResponse);
+          void toBufferedResponse(clientResponse, internalMethod, closeServer)
+            .then((response) => {
               if (debugNodeInvoke) {
                 console.log('[adapter-bun][node][invoke:response]', {
                   outputId: context.output.id,
@@ -780,19 +1067,18 @@ async function invokeNodeRuntimeHandler({
                   method: requestMethod,
                   status: clientResponse.statusCode ?? 200,
                   mode: 'buffer',
+                  headers: clientResponse.headers,
                 });
               }
               settle(() => {
-                server.close(() => resolve(response));
+                resolve(response);
               });
-            } catch (error) {
+            })
+            .catch((error) => {
               settle(() => {
-                server.close(() =>
-                  reject(error instanceof Error ? error : new Error(String(error)))
-                );
+                reject(error);
               });
-            }
-          })();
+            });
         }
       );
 
@@ -806,7 +1092,8 @@ async function invokeNodeRuntimeHandler({
           });
         }
         settle(() => {
-          server.close(() => reject(error));
+          reject(error);
+          server.close(() => undefined);
         });
       });
 
@@ -934,6 +1221,8 @@ export function createNodeFunctionArtifactInvoker({
         await ensureNextNodeEnvironment({
           entrypointPath,
         });
+        const requireFromEntrypoint = createRequire(entrypointPath);
+        ensureReactDomServerNodeCompatibility(requireFromEntrypoint);
         const rawLoadedModule = await loadModule(entrypointPath);
         const loadedModule = await normalizeLoadedNodeModule(
           rawLoadedModule as LoadedModule
@@ -999,10 +1288,6 @@ export function createNodeMiddlewareInvoker({
   let modulePromise: Promise<NodeMiddlewareModule> | undefined;
 
   return async (ctx: MiddlewareContext): Promise<RouterMiddlewareResult> => {
-    if (!shouldInvokeMiddlewareForRequest(output, ctx)) {
-      return {};
-    }
-
     modulePromise ??= (async () => {
       const entrypointPath = resolveOutputEntrypointPath(
         output,
@@ -1031,19 +1316,31 @@ export function createNodeMiddlewareInvoker({
     }
 
     const handler = mod.proxy ?? mod.middleware ?? mod.default;
+    const customMethod = (
+      ctx as MiddlewareContext & { method?: string }
+    ).method;
+    const middlewareMethod = (
+      customMethod ??
+      ctx.headers.get('x-adapter-original-method') ??
+      'GET'
+    ).toUpperCase();
+    const middlewareBody =
+      middlewareMethod === 'GET' || middlewareMethod === 'HEAD'
+        ? undefined
+        : ctx.requestBody;
 
     const result = await adapterFn({
       handler,
       request: {
         headers: Object.fromEntries(ctx.headers.entries()),
-        method: 'GET',
+        method: middlewareMethod,
         nextConfig: {
           basePath: manifest.build.basePath,
           i18n: manifest.build.i18n,
         },
         url: ctx.url.toString(),
         page: {},
-        body: undefined,
+        body: middlewareBody,
         signal: AbortSignal.timeout(30_000),
         waitUntil: () => {},
       },

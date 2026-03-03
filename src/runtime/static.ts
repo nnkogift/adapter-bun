@@ -80,9 +80,12 @@ export function createBunStaticHandler({
     const etag = `"${stat.size.toString(36)}-${stat.lastModified.toString(36)}"`;
     headers.set('etag', etag);
 
-    // Conditional request support
+    // Only emit 304 for non-document assets. For HTML/doc responses we always
+    // return a full body so browser navigations never end up with an empty
+    // document when cache validation is misaligned across contexts.
+    const supportsConditionalRequest = !contentType.startsWith('text/html');
     const ifNoneMatch = ctx.request.headers.get('if-none-match');
-    if (ifNoneMatch && ifNoneMatch === etag) {
+    if (supportsConditionalRequest && ifNoneMatch && ifNoneMatch === etag) {
       return new Response(null, {
         status: 304,
         headers,
