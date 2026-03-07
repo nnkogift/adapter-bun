@@ -42,20 +42,25 @@ if [ -z "${NEXT_PRIVATE_TEST_MODE:-}" ] && [ -n "${NEXT_TEST_MODE:-}" ]; then
 fi
 
 # 5. Build (NEXT_ADAPTER_PATH tells Next.js to use our adapter).
-# Run fixture setup/post-build hooks when present, but always execute the core
-# Next build through Bun so adapter hooks can use Bun-only APIs.
+# The Next.js test harness always wires a `build` script in package.json.
+# Execute that script, but force `next build` segments to run through Bun.
 : > "$NEXT_TEST_DIR/.adapter-build.log"
 
-has_script() {
-  local script_name="$1"
+BUILD_SCRIPT="$(
   node -e "
-const pkg=JSON.parse(require('fs').readFileSync('package.json','utf8'));
-process.exit(pkg.scripts && pkg.scripts['$script_name'] ? 0 : 1);
-" >/dev/null 2>&1
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+const build = pkg?.scripts?.build;
+if (typeof build === 'string' && build.trim().length > 0) {
+  const normalized = build.replace(/\\bnext\\s+build\\b/g, 'bun --bun next build');
+  console.log(normalized);
 }
+" 2>/dev/null || true
+)"
 
-if has_script "setup"; then
-  bun run setup >&2
+if [ -z "$BUILD_SCRIPT" ]; then
+  echo 'Missing package.json scripts.build in deploy test dir' >&2
+  exit 1
 fi
 
 # Generate a stable deployment ID before the build so it is baked into
@@ -73,11 +78,7 @@ if [ -n "${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS:-}" ]; then
   export __NEXT_CACHE_COMPONENTS="${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS}"
 fi
 
-bun --bun next build 2>&1 | tee -a "$NEXT_TEST_DIR/.adapter-build.log" >&2
-
-if has_script "post-build"; then
-  bun run post-build >&2
-fi
+bash -lc "$BUILD_SCRIPT" 2>&1 | tee -a "$NEXT_TEST_DIR/.adapter-build.log" >&2
 
 # 6. Record build ID markers for logs script
 BUILD_ID=$(cat ".next/BUILD_ID" 2>/dev/null || echo "unknown")
@@ -85,21 +86,46 @@ echo "BUILD_ID: $BUILD_ID" >> "$NEXT_TEST_DIR/.adapter-build.log"
 echo "DEPLOYMENT_ID: $NEXT_DEPLOYMENT_ID" >> "$NEXT_TEST_DIR/.adapter-build.log"
 echo "IMMUTABLE_ASSET_TOKEN: $IMMUTABLE_ASSET_TOKEN" >> "$NEXT_TEST_DIR/.adapter-build.log"
 
-# 7. Start Bun server on selected port
+# 7. Start server on selected port
+# Use bun (without --bun) for better Node.js API compatibility with Next.js internals
 PORT=$PORT NEXT_DEPLOYMENT_ID="$NEXT_DEPLOYMENT_ID" VERCEL_IMMUTABLE_ASSET_TOKEN="$VERCEL_IMMUTABLE_ASSET_TOKEN" IMMUTABLE_ASSET_TOKEN="$IMMUTABLE_ASSET_TOKEN" bun bun-dist/server.js >> "$NEXT_TEST_DIR/.adapter-server.log" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$NEXT_TEST_DIR/.adapter-server.pid"
 
-# 8. Wait for server to be ready
+# 8. Wait for server to be ready.
+# Use a plain TCP probe instead of an HTTP route probe so middleware fixtures
+# are not exercised during readiness checks.
+server_ready=0
 for i in $(seq 1 30); do
-  if curl -sf -o /dev/null "http://localhost:${PORT}/" 2>/dev/null; then break; fi
+  if PORT="$PORT" node -e "
+const net = require('node:net');
+const port = Number(process.env.PORT);
+const socket = net.connect({ host: '127.0.0.1', port });
+const done = (ok) => {
+  socket.destroy();
+  process.exit(ok ? 0 : 1);
+};
+socket.once('connect', () => done(true));
+socket.once('error', () => done(false));
+setTimeout(() => done(false), 750);
+" >/dev/null 2>&1; then
+    server_ready=1
+    break
+  fi
+
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-      echo "Server died. Logs:" >&2
-      cat "$NEXT_TEST_DIR/.adapter-server.log" >&2
-      exit 1
-    fi
+    echo "Server died. Logs:" >&2
+    cat "$NEXT_TEST_DIR/.adapter-server.log" >&2
+    exit 1
+  fi
   sleep 1
 done
+
+if [ "$server_ready" -ne 1 ]; then
+  echo "Server did not become ready within timeout. Logs:" >&2
+  cat "$NEXT_TEST_DIR/.adapter-server.log" >&2
+  exit 1
+fi
 
 # 9. Output URL (only thing on stdout)
 echo "http://localhost:${PORT}"

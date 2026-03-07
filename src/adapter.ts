@@ -1,26 +1,21 @@
-import { createHash } from 'node:crypto';
-import { copyFile, cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
+import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Database } from 'bun:sqlite';
 import type { NextAdapter } from 'next';
+import type { AdapterOutput } from 'next';
 import {
   buildDeploymentManifest,
-  buildRouterManifest,
   collectOutputPathnames,
 } from './manifest.ts';
 import { SCHEMA_SQL } from './runtime/sqlite-cache.ts';
 import {
-  stageFunctionArtifacts,
-  stagePrerenderSeeds,
   stageStaticAssets,
   writeJsonFile,
 } from './staging.ts';
 import type {
   BunAdapterOptions,
   BunDeploymentManifest,
-  BunFunctionArtifact,
-  BunPrerenderSeed,
   BuildCompleteContext,
 } from './types.ts';
 
@@ -28,6 +23,14 @@ export const ADAPTER_NAME = 'bun';
 export const DEFAULT_BUN_ADAPTER_OUT_DIR = 'bun-dist';
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = '0.0.0.0';
+const RUNTIME_NEXT_CONFIG_FILE = 'runtime-next-config.json';
+const CACHE_RUNTIME_MODULES = [
+  'cache-handler.js',
+  'incremental-cache-handler.js',
+  'cache-store.js',
+  'sqlite-cache.js',
+  'isr.js',
+];
 
 type PreviewProps = NonNullable<
   NonNullable<BunDeploymentManifest['runtime']>['previewProps']
@@ -94,366 +97,394 @@ async function readPreviewProps(
   }
 }
 
+function toJsonRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+}
+
+function createRuntimeNextConfig(
+  config: BuildCompleteContext['config']
+): Record<string, unknown> {
+  let cloned: unknown;
+  try {
+    cloned = JSON.parse(JSON.stringify(config));
+  } catch {
+    cloned = {};
+  }
+
+  const configRecord = toJsonRecord(cloned);
+  delete configRecord.outputFileTracingRoot;
+  delete configRecord.cacheHandler;
+
+  const cacheHandlersValue = configRecord.cacheHandlers;
+  if (cacheHandlersValue && typeof cacheHandlersValue === 'object') {
+    const cacheHandlers = {
+      ...(cacheHandlersValue as Record<string, unknown>),
+    };
+    delete cacheHandlers.remote;
+    configRecord.cacheHandlers = cacheHandlers;
+  }
+
+  const experimentalValue = configRecord.experimental;
+  if (experimentalValue && typeof experimentalValue === 'object') {
+    const experimental = {
+      ...(experimentalValue as Record<string, unknown>),
+    };
+    delete experimental.adapterPath;
+    configRecord.experimental = experimental;
+  }
+
+  return configRecord;
+}
+
+async function writeRuntimeNextConfig(
+  outDir: string,
+  config: BuildCompleteContext['config']
+): Promise<void> {
+  const runtimeNextConfig = createRuntimeNextConfig(config);
+  await writeJsonFile(path.join(outDir, RUNTIME_NEXT_CONFIG_FILE), runtimeNextConfig);
+}
+
 const SERVER_ENTRY_TEMPLATE = `import path from 'node:path';
-import { createRouterRuntime } from './runtime/router.js';
-import { createFunctionArtifactInvoker, createMiddlewareInvoker } from './runtime/function-invoker.js';
-import { createBunStaticHandler } from './runtime/static.js';
-import { createBunRevalidateQueue } from './runtime/revalidate.js';
-import { createSqliteCacheStores } from './runtime/sqlite-cache.js';
-import { createBunImageHandler } from './runtime/image.js';
-import { bridgeNextTagManifest } from './runtime/tag-manifest-bridge.js';
-import { createEdgeIncrementalCache } from './runtime/incremental-cache-bridge.js';
+import http from 'node:http';
+import { Readable } from 'node:stream';
 
 const adapterDir = import.meta.dirname;
 const manifestPath = path.join(adapterDir, 'deployment-manifest.json');
 const manifest = await Bun.file(manifestPath).json();
-const previewProps = manifest.runtime?.previewProps;
-if (previewProps) {
-  process.env.__NEXT_PREVIEW_MODE_ID ??= previewProps.previewModeId;
-  process.env.__NEXT_PREVIEW_MODE_SIGNING_KEY ??= previewProps.previewModeSigningKey;
-  process.env.__NEXT_PREVIEW_MODE_ENCRYPTION_KEY ??=
-    previewProps.previewModeEncryptionKey;
-}
 
-const { prerenderCacheStore, imageCacheStore } = createSqliteCacheStores({
-  adapterDir,
-});
-const edgeIncrementalCache = createEdgeIncrementalCache({ prerenderCacheStore });
+// NEXT_ADAPTER_PATH is required at build-time to activate adapter hooks, but
+// keeping it at runtime changes Next.js request handling branches in ways that
+// conflict with this standalone server entry.
+delete process.env.NEXT_ADAPTER_PATH;
 
-await bridgeNextTagManifest(prerenderCacheStore);
+// Tell the cache handler where to find cache.db
+process.env.BUN_ADAPTER_CACHE_DB_PATH = path.join(adapterDir, 'cache.db');
 
-const invokeFunction = createFunctionArtifactInvoker({
-  manifest,
-  adapterDir,
-  incrementalCache: edgeIncrementalCache,
-});
+// Resolve project directory (parent of bun-dist/)
+const projectDir = process.env.NEXT_PROJECT_DIR || path.resolve(adapterDir, '..');
 
-const serveStatic = createBunStaticHandler({
-  manifest,
-  adapterDir,
-});
+const requestedPort = Number.parseInt(process.env.PORT || '', 10);
+const port =
+  Number.isFinite(requestedPort) && requestedPort > 0
+    ? requestedPort
+    : manifest.server.port;
+const listenHostname = manifest.server.hostname;
+const isWildcardHostname = (value) => value === '0.0.0.0' || value === '::';
+const configuredHostname = process.env.NEXT_HOSTNAME || '';
+const appHostname =
+  configuredHostname &&
+  !isWildcardHostname(configuredHostname)
+    ? configuredHostname
+    : !isWildcardHostname(listenHostname)
+      ? listenHostname
+      : 'localhost';
+const protocol = process.env.__NEXT_EXPERIMENTAL_HTTPS === '1' ? 'https' : 'http';
 
-const revalidateQueue = createBunRevalidateQueue({
-  manifest,
-  invokeFunction,
-  prerenderCacheStore,
-  requestOrigin: process.env.BUN_ADAPTER_REVALIDATE_ORIGIN ??
-    \`http://localhost:\${process.env.PORT || manifest.server.port}\`,
-});
+// Next's forwarded action/redirect fetches rely on this internal origin.
+process.env.__NEXT_PRIVATE_ORIGIN = protocol + '://' + appHostname + ':' + port;
 
-const invokeImageFunction = createBunImageHandler({
-  manifest,
-  adapterDir,
-});
+async function loadRuntimeNextConfig() {
+  const runtimeNextConfigPath = path.join(
+    adapterDir,
+    '${RUNTIME_NEXT_CONFIG_FILE}'
+  );
 
-const invokeMiddleware = await createMiddlewareInvoker({
-  manifest,
-  adapterDir,
-  incrementalCache: edgeIncrementalCache,
-});
-
-const runtime = createRouterRuntime({
-  manifest,
-  serveStatic,
-  invokeFunction,
-  invokeMiddleware,
-  invokeImageFunction,
-  async handleExternalRewrite({ request, targetUrl }) {
-    const headers = new Headers(request.headers);
-    headers.delete('host');
-    const res = await fetch(new Request(targetUrl, {
-      method: request.method,
-      headers,
-      body: request.body,
-      redirect: 'manual',
-    }));
-    // fetch() auto-decompresses the body, so strip encoding headers
-    // to avoid the browser trying to decompress again.
-    const responseHeaders = new Headers(res.headers);
-    responseHeaders.delete('content-encoding');
-    responseHeaders.delete('content-length');
-    return new Response(res.body, {
-      status: res.status,
-      statusText: res.statusText,
-      headers: responseHeaders,
-    });
-  },
-  prerenderCache: {
-    store: prerenderCacheStore,
-    revalidateQueue,
-  },
-  imageCache: {
-    store: imageCacheStore,
-  },
-});
-
-const NEXT_PATCH_SYMBOL = Symbol.for('next-patch');
-const nativeFetch = globalThis.fetch;
-let listenAuthority = '';
-
-// Next.js res.revalidate() hardcodes https:// when trustHostHeader is true.
-// Intercept self-referencing HTTPS fetches and rewrite to HTTP so on-demand
-// ISR works without TLS.
-const adapterBaseFetch = Object.assign(function adapterBaseFetch(input, init) {
-  if (listenAuthority.length > 0) {
-    const httpsOrigin = \`https://\${listenAuthority}\`;
-    const httpOrigin = \`http://\${listenAuthority}\`;
-    if (typeof input === 'string' && input.startsWith(httpsOrigin)) {
-      input = httpOrigin + input.slice(httpsOrigin.length);
-    } else if (input instanceof URL && input.origin === httpsOrigin) {
-      const rewritten = new URL(input);
-      rewritten.protocol = 'http:';
-      input = rewritten;
-    } else if (input instanceof Request) {
-      const u = new URL(input.url);
-      if (u.origin === httpsOrigin) {
-        u.protocol = 'http:';
-        input = new Request(u, input);
-      }
-    }
-  }
-  return nativeFetch(input, init);
-}, nativeFetch);
-
-function resetNextFetchPatchState() {
-  globalThis.fetch = adapterBaseFetch;
-  globalThis[NEXT_PATCH_SYMBOL] = false;
-}
-
-function normalizeLocationHeaderForRequest(headers, requestUrl) {
-  const locationHeader = headers.get('location');
-  if (!locationHeader) {
-    return;
-  }
-
-  let locationUrl;
+  let serializedConfig = {};
   try {
-    locationUrl = new URL(locationHeader, requestUrl);
-  } catch {
-    return;
+    const loadedConfig = await Bun.file(runtimeNextConfigPath).json();
+    if (loadedConfig && typeof loadedConfig === 'object') {
+      serializedConfig = loadedConfig;
+    }
+  } catch (error) {
+    console.warn(
+      '[adapter-bun] failed to load adapter runtime next config:',
+      error
+    );
   }
 
-  if (locationUrl.hostname !== requestUrl.hostname) {
-    return;
-  }
+  const configRecord =
+    serializedConfig && typeof serializedConfig === 'object' ? serializedConfig : {};
+  const distDir =
+    typeof configRecord.distDir === 'string' && configRecord.distDir.length > 0
+      ? configRecord.distDir
+      : typeof manifest.build?.distDir === 'string' && manifest.build.distDir.length > 0
+        ? manifest.build.distDir
+        : '.next';
+  const runtimeCacheHandlerPath = path.join(
+    adapterDir,
+    'runtime',
+    'incremental-cache-handler.js'
+  );
+  const runtimeRemoteCacheHandlerPath = path.join(
+    adapterDir,
+    'runtime',
+    'cache-handler.js'
+  );
+  const existingCacheHandlers =
+    configRecord.cacheHandlers && typeof configRecord.cacheHandlers === 'object'
+      ? configRecord.cacheHandlers
+      : {};
 
-  if (locationUrl.port.length > 0 || requestUrl.port.length === 0) {
-    return;
-  }
-
-  const defaultPort = locationUrl.protocol === 'https:' ? '443' : '80';
-  if (requestUrl.port === defaultPort) {
-    return;
-  }
-
-  // Preserve the external listen port for same-host absolute redirects.
-  // Next's internal function invocation can otherwise emit localhost URLs
-  // without the port, which breaks browser redirect follow-ups.
-  locationUrl.port = requestUrl.port;
-  headers.set('location', locationUrl.toString());
+  return {
+    ...configRecord,
+    distDir,
+    cacheHandler: runtimeCacheHandlerPath,
+    cacheHandlers: {
+      ...existingCacheHandlers,
+      remote: runtimeRemoteCacheHandlerPath,
+    },
+  };
 }
 
-const server = Bun.serve({
-  port: parseInt(process.env.PORT || '0', 10) || manifest.server.port,
-  hostname: manifest.server.hostname,
-  // Keep upstream keep-alive sockets stable across long e2e browser gaps.
-  idleTimeout: 120,
-  async fetch(request) {
-    resetNextFetchPatchState();
-    const url = new URL(request.url);
-    url.protocol = 'http:';
-    const incomingHost = request.headers.get('host');
-    const requestAuthority =
-      typeof incomingHost === 'string' && incomingHost.length > 0
-        ? incomingHost
-        : listenAuthority;
-    url.host = requestAuthority;
-    const headers = new Headers(request.headers);
-    headers.set('host', requestAuthority);
-    const originalMethod = headers.get('x-adapter-original-method');
-    let runtimeBody = request.body;
+const runtimeNextConfig = await loadRuntimeNextConfig();
+const createNext = (await import('next')).default;
+const app = createNext({
+  dir: projectDir,
+  dev: false,
+  quiet: false,
+  hostname: appHostname,
+  port,
+  conf: runtimeNextConfig
+});
+await app.prepare();
+const handle = app.getRequestHandler();
+
+function getSingleHeaderValue(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+async function prepareActionRequestBodyForBun(req) {
+  if (req.method !== 'POST') {
+    return;
+  }
+
+  const actionId = getSingleHeaderValue(req.headers['next-action']);
+  if (typeof actionId !== 'string' || actionId.length === 0) {
+    return;
+  }
+
+  const chunks = [];
+  for await (const chunk of req) {
+    if (chunk === undefined || chunk === null) {
+      continue;
+    }
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const requestBody = Buffer.concat(chunks);
+
+  // Bun's IncomingMessage can complete before Next attaches stream listeners
+  // for forwarded Server Actions. Replaying a buffered body keeps request
+  // consumption semantics stable while letting Next own action routing.
+  if (requestBody.length > 0) {
+    req.headers['content-length'] = String(requestBody.length);
+  } else {
+    req.headers['content-length'] = '0';
+  }
+  delete req.headers['transfer-encoding'];
+
+  const replayStream = Readable.from(requestBody);
+  const originalOn = req.on.bind(req);
+  const originalOnce = req.once.bind(req);
+  const originalRemoveListener = req.removeListener.bind(req);
+
+  req.on = (event, listener) => {
+    if (event === 'data' || event === 'end' || event === 'error' || event === 'readable') {
+      replayStream.on(event, listener);
+      return req;
+    }
+    return originalOn(event, listener);
+  };
+
+  req.once = (event, listener) => {
+    if (event === 'data' || event === 'end' || event === 'error' || event === 'readable') {
+      replayStream.once(event, listener);
+      return req;
+    }
+    return originalOnce(event, listener);
+  };
+
+  req.removeListener = (event, listener) => {
+    if (event === 'data' || event === 'end' || event === 'error' || event === 'readable') {
+      replayStream.removeListener(event, listener);
+      return req;
+    }
+    return originalRemoveListener(event, listener);
+  };
+
+  req.pipe = replayStream.pipe.bind(replayStream);
+  req.read = replayStream.read.bind(replayStream);
+  req.pause = replayStream.pause.bind(replayStream);
+  req.resume = replayStream.resume.bind(replayStream);
+  req.setEncoding = replayStream.setEncoding.bind(replayStream);
+  req.unshift = replayStream.unshift.bind(replayStream);
+  req[Symbol.asyncIterator] = replayStream[Symbol.asyncIterator].bind(replayStream);
+}
+
+function getHeaderValue(headers, name) {
+  if (!headers || typeof headers !== 'object') {
+    return undefined;
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof key === 'string' && key.toLowerCase() === name.toLowerCase()) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeCacheControlHeader(req, value, nextCacheHeaderValue) {
+  const raw = Array.isArray(value) ? value.join(', ') : String(value ?? '');
+  const normalized = raw.trim();
+  if (normalized.length === 0) return raw;
+
+  const lower = normalized.toLowerCase();
+  const hasNextCacheMarker =
+    typeof nextCacheHeaderValue === 'string' && nextCacheHeaderValue.length > 0;
+  const isDataRequest =
+    typeof req.url === 'string' && req.url.includes('/_next/data/');
+
+  if (
+    hasNextCacheMarker &&
+    !isDataRequest &&
+    lower === 'private, no-cache, no-store, max-age=0, must-revalidate'
+  ) {
+    // Pages-router fallback HTML responses in deploy mode still flow through
+    // Next's private no-store branch on the first MISS. Deployed environments
+    // expose these as public must-revalidate responses instead.
+    return 'public, max-age=0, must-revalidate';
+  }
+
+  if (lower.includes('immutable')) {
+    return normalized;
+  }
+
+  if (lower.includes('s-maxage=')) {
+    return 'public, max-age=0, must-revalidate';
+  }
+
+  return normalized;
+}
+
+function patchCacheControlHeader(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return;
+  }
+
+  const originalSetHeader = res.setHeader.bind(res);
+  res.setHeader = (name, value) => {
+    if (typeof name === 'string' && name.toLowerCase() === 'cache-control') {
+      return originalSetHeader(
+        name,
+        normalizeCacheControlHeader(req, value, res.getHeader('x-nextjs-cache'))
+      );
+    }
+    return originalSetHeader(name, value);
+  };
+
+  const originalWriteHead = res.writeHead.bind(res);
+  res.writeHead = (statusCode, statusMessage, headers) => {
+    let resolvedStatusMessage = statusMessage;
+    let resolvedHeaders = headers;
+
     if (
-      runtimeBody === null &&
-      request.method !== 'GET' &&
-      request.method !== 'HEAD' &&
-      request.headers.get('content-length') !== null
+      resolvedHeaders === undefined &&
+      resolvedStatusMessage &&
+      typeof resolvedStatusMessage === 'object' &&
+      !Array.isArray(resolvedStatusMessage)
     ) {
-      const requestWithBytes = request;
-      if (typeof requestWithBytes.bytes === 'function') {
-        try {
-          const bytes = await requestWithBytes.bytes();
-          if (bytes.byteLength > 0) {
-            runtimeBody = bytes;
-          }
-        } catch {
-          // Fall back to the original body stream.
+      resolvedHeaders = resolvedStatusMessage;
+      resolvedStatusMessage = undefined;
+    }
+
+    if (resolvedHeaders && typeof resolvedHeaders === 'object') {
+      const nextCacheHeaderValue =
+        getHeaderValue(resolvedHeaders, 'x-nextjs-cache') ??
+        res.getHeader('x-nextjs-cache');
+      for (const key of Object.keys(resolvedHeaders)) {
+        if (key.toLowerCase() !== 'cache-control') {
+          continue;
         }
+        resolvedHeaders[key] = normalizeCacheControlHeader(
+          req,
+          resolvedHeaders[key],
+          nextCacheHeaderValue
+        );
       }
     }
-    if (
-      runtimeBody === null &&
-      request.method === 'OPTIONS' &&
-      request.headers.get('content-length') !== null &&
-      url.pathname.endsWith('/advanced/body/json')
-    ) {
-      // Work around Bun dropping OPTIONS request bodies for JSON payloads.
-      runtimeBody = JSON.stringify({ name: 'bar' });
+
+    if (resolvedStatusMessage === undefined) {
+      return originalWriteHead(statusCode, resolvedHeaders);
     }
-    const runtimeRequest = new Request(url, {
-      method: request.method,
-      headers,
-      body: runtimeBody,
-      signal: request.signal,
-    });
-    const debugBlogNav =
-      process.env.ADAPTER_BUN_DEBUG_BLOG_NAV === '1' &&
-      url.pathname.startsWith('/blog/');
-    const debugRequests = process.env.ADAPTER_BUN_DEBUG_REQUESTS === '1';
-    if (debugRequests) {
-      console.log('[adapter-bun][request:start]', {
-        method: request.method,
-        pathname: url.pathname,
-        search: url.search,
-        originalMethodHeader: originalMethod,
-        requestHostHeader: request.headers.get('host'),
-        normalizedUrlHost: url.host,
-        rsc: request.headers.get('rsc'),
-        nextRouterPrefetch: request.headers.get('next-router-prefetch'),
-        nextRouterStateTree: request.headers.get('next-router-state-tree'),
-        nextRouterSegmentPrefetch: request.headers.get('next-router-segment-prefetch'),
-      });
+
+    return originalWriteHead(statusCode, resolvedStatusMessage, resolvedHeaders);
+  };
+}
+
+const server = http.createServer(async (req, res) => {
+  // Normalize Bun's incoming headers into a plain mutable object so Next can
+  // safely patch/strip headers during RSC/action flows.
+  req.headers = { ...req.headers };
+  patchCacheControlHeader(req, res);
+
+  const userAgent =
+    typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
+  if (userAgent.includes('node-fetch')) {
+    // node-fetch@2 can reuse a keep-alive socket across mixed request methods
+    // and hit ECONNRESET against the Bun->Node bridge. Force connection close
+    // for its requests so each request gets a fresh socket.
+    req.headers.connection = 'close';
+    res.setHeader('connection', 'close');
+  }
+
+  // Some Bun fetch requests use Accept: */* for RSC refetches. Force the
+  // expected RSC accept header so Next serves Flight payloads instead of HTML.
+  if (req.headers['rsc'] === '1') {
+    if (!req.headers.accept || req.headers.accept === '*/*') {
+      req.headers.accept = 'text/x-component';
     }
-    if (debugBlogNav) {
-      console.log('[adapter-bun][blog-nav][request]', {
-        method: request.method,
-        url: url.toString(),
-        rsc: headers.get('rsc'),
-        nextRouterStateTree: headers.get('next-router-state-tree'),
-        nextRouterPrefetch: headers.get('next-router-prefetch'),
-        nextRouterSegmentPrefetch: headers.get('next-router-segment-prefetch'),
-        accept: headers.get('accept'),
-      });
+    // Forwarded action redirects can inherit POST content-type on GET.
+    if (req.method === 'GET' && typeof req.headers['content-type'] === 'string') {
+      delete req.headers['content-type'];
     }
-    try {
-      const response = await runtime.handleRequest(runtimeRequest);
-      if (debugBlogNav) {
-        console.log('[adapter-bun][blog-nav][response]', {
-          method: request.method,
-          url: url.toString(),
-          status: response.status,
-          contentType: response.headers.get('content-type'),
-          vary: response.headers.get('vary'),
-          routeKind: response.headers.get('x-bun-route-kind'),
-          routeId: response.headers.get('x-bun-route-id'),
-          bunCache: response.headers.get('x-bun-cache'),
-          nextjsCache: response.headers.get('x-nextjs-cache'),
-        });
-      }
-      if (debugRequests) {
-        console.log('[adapter-bun][request:response]', {
-          method: request.method,
-          pathname: url.pathname,
-          search: url.search,
-          status: response.status,
-          contentType: response.headers.get('content-type'),
-          routeKind: response.headers.get('x-bun-route-kind'),
-          routeId: response.headers.get('x-bun-route-id'),
-          bunCache: response.headers.get('x-bun-cache'),
-          nextCache: response.headers.get('x-nextjs-cache'),
-        });
-      }
-      const responseHeaders = new Headers(response.headers);
-      normalizeLocationHeaderForRequest(responseHeaders, url);
-      if (
-        url.pathname.startsWith(\`/_next/data/\${manifest.build.buildId}/\`) &&
-        url.pathname.endsWith('.json') &&
-        !responseHeaders.has('x-nextjs-deployment-id')
-      ) {
-        const clientDeploymentId =
-          process.env.VERCEL_IMMUTABLE_ASSET_TOKEN ??
-          process.env.IMMUTABLE_ASSET_TOKEN ??
-          process.env.NEXT_DEPLOYMENT_ID ??
-          \`bun-adapter-\${manifest.build.buildId}\`;
-        responseHeaders.set('x-nextjs-deployment-id', clientDeploymentId);
-      }
-      responseHeaders.set('connection', 'close');
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders,
-      });
-    } catch (error) {
-      console.error('[adapter-bun] request handler error', {
-        error,
-        request: {
-          method: request.method,
-          url: url.toString(),
-        },
-      });
-      let errorMessage = '';
-      if (error instanceof Error) {
-        errorMessage = error.message;
-      } else if (
-        typeof error === 'object' &&
-        error !== null &&
-        'message' in error &&
-        typeof error.message === 'string'
-      ) {
-        errorMessage = error.message;
-      }
-      const contentType = request.headers.get('content-type')?.toLowerCase() ?? '';
-      const isMpaActionSubmission =
-        request.method.toUpperCase() === 'POST' &&
-        !request.headers.has('next-action') &&
-        contentType.startsWith('multipart/form-data');
-      if (
-        errorMessage.includes('Failed to find Server Action') &&
-        isMpaActionSubmission
-      ) {
-        if (debugRequests) {
-          console.log('[adapter-bun][request:response]', {
-            method: request.method,
-            pathname: url.pathname,
-            search: url.search,
-            status: 405,
-            contentType: 'text/html; charset=utf-8',
-          });
-        }
-        return new Response('<!DOCTYPE html><html><body>Method Not Allowed</body></html>', {
-          status: 405,
-          headers: {
-            allow: 'GET, HEAD',
-            'content-type': 'text/html; charset=utf-8',
-          },
-        });
-      }
-      if (debugRequests) {
-        console.log('[adapter-bun][request:response]', {
-          method: request.method,
-          pathname: url.pathname,
-          search: url.search,
-          status: 500,
-          contentType: 'text/plain;charset=UTF-8',
-        });
-      }
-      return new Response('Internal Server Error', { status: 500 });
+  }
+
+  try {
+    await prepareActionRequestBodyForBun(req);
+    await handle(req, res);
+  } catch (err) {
+    console.error('[adapter-bun] error handling request:', err);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'content-type': 'text/plain' });
     }
-  },
+    res.end('Internal Server Error');
+  }
 });
 
-const listenHost = server.hostname === '0.0.0.0' || server.hostname === '::'
-  ? 'localhost'
-  : server.hostname;
-listenAuthority = \`\${listenHost}:\${server.port}\`;
+const handleListening = () => {
+  const addr = server.address();
+  const listenPort = typeof addr === 'object' && addr ? addr.port : port;
+  const formattedHostname =
+    typeof addr === 'object' && addr && typeof addr.address === 'string'
+      ? addr.address
+      : listenHostname;
+  console.log(
+    \`\\n  Next.js (\\x1b[36m\${manifest.build.nextVersion}\\x1b[0m) \\x1b[2m|\\x1b[0m adapter-bun\\n\` +
+    \`  Listening on http://\${formattedHostname}:\${listenPort}\\n\` +
+    \`  Build ID: \${manifest.build.buildId}\\n\`
+  );
+};
 
-console.log(
-  \`\\n  Next.js (\\x1b[36m\${manifest.build.nextVersion}\\x1b[0m) \\x1b[2m|\\x1b[0m adapter-bun\\n\` +
-  \`  Listening on http://\${server.hostname}:\${server.port}\\n\` +
-  \`  Build ID: \${manifest.build.buildId}\\n\` +
-  \`  Functions: \${manifest.summary.functionsTotal} (node: \${manifest.summary.nodeFunctions}, edge: \${manifest.summary.edgeFunctions})\\n\` +
-  \`  Static assets: \${manifest.summary.staticAssetsTotal}\\n\` +
-  \`  Prerender seeds: \${manifest.summary.prerenderSeedsTotal}\\n\`
-);
+if (isWildcardHostname(listenHostname)) {
+  // Let Node choose an unspecified address so IPv6/IPv4 dual-stack works when available.
+  server.listen(port, handleListening);
+} else {
+  server.listen(port, listenHostname, handleListening);
+}
 `;
 
 async function writeServerEntry(outDir: string): Promise<void> {
@@ -473,130 +504,10 @@ async function copyRuntimeModule(
   );
 }
 
-async function stageRuntimeModules(
-  outDir: string,
-  hasEdgeOutputs: boolean
-): Promise<void> {
-  // Copy compiled .js runtime modules (import.meta.dirname points to dist/src/)
-  const runtimeModules = [
-    'types.js',
-    'router.js',
-    'next-routing.js',
-    'function-invoker.js',
-    'function-invoker-node.js',
-    'function-invoker-shared.js',
-    'middleware-matcher.js',
-    'invocation-coordinator.js',
-    'static.js',
-    'isr.js',
-    'image.js',
-    'revalidate.js',
-    'sqlite-cache.js',
-    'tag-manifest-bridge.js',
-    'incremental-cache-bridge.js',
-  ];
-
-  if (hasEdgeOutputs) {
-    runtimeModules.push('function-invoker-edge.js');
-  }
-
+async function stageRuntimeModules(outDir: string): Promise<void> {
   await Promise.all(
-    runtimeModules.map((mod) => copyRuntimeModule(outDir, mod))
+    CACHE_RUNTIME_MODULES.map((mod) => copyRuntimeModule(outDir, mod))
   );
-
-  // Also copy types.js from src/ for the server entry to import
-  await copyFile(
-    path.join(import.meta.dirname, 'types.js'),
-    path.join(outDir, 'types.js')
-  );
-}
-
-async function copyDirectoryRecursive(src: string, dest: string): Promise<void> {
-  await mkdir(dest, { recursive: true });
-  const entries = await readdir(src, { withFileTypes: true });
-  await Promise.all(entries.map(async (entry) => {
-    const srcPath = path.join(src, entry.name);
-    const destPath = path.join(dest, entry.name);
-    if (entry.isDirectory()) {
-      await copyDirectoryRecursive(srcPath, destPath);
-    } else {
-      await copyFile(srcPath, destPath);
-    }
-  }));
-}
-
-async function stageTracedDependencies({
-  outDir,
-  functionMap,
-}: {
-  outDir: string;
-  functionMap: BunFunctionArtifact[];
-}): Promise<void> {
-  // Collect unique node_modules/ relative paths and their source paths
-  const traced = new Map<string, string>(); // relativePath → sourcePath
-  for (const fn of functionMap) {
-    for (const file of fn.files) {
-      if (file.kind === 'asset' && file.relativePath.startsWith('node_modules/')) {
-        if (!traced.has(file.relativePath)) {
-          traced.set(file.relativePath, file.sourcePath);
-        }
-      }
-    }
-  }
-
-  // Copy each traced file to {outDir}/node_modules/...
-  await Promise.all([...traced.entries()].map(async ([relativePath, sourcePath]) => {
-    const destPath = path.join(outDir, relativePath);
-    await mkdir(path.dirname(destPath), { recursive: true });
-    await cp(sourcePath, destPath, {
-      recursive: true,
-      dereference: false,
-      force: true,
-      errorOnExist: false,
-    });
-  }));
-}
-
-function resolvePackageDir(packageName: string, resolveFrom: string): string {
-  const req = createRequire(path.join(resolveFrom, 'noop.js'));
-  return path.dirname(req.resolve(`${packageName}/package.json`));
-}
-
-async function stageAdapterDependencies({
-  outDir,
-  adapterDir,
-  hasEdgeOutputs,
-}: {
-  outDir: string;
-  adapterDir: string;
-  hasEdgeOutputs: boolean;
-}): Promise<void> {
-  const copied = new Set<string>();
-
-  async function copyPackageTree(packageName: string, resolveFrom: string): Promise<void> {
-    if (copied.has(packageName)) return;
-    copied.add(packageName);
-
-    const pkgDir = resolvePackageDir(packageName, resolveFrom);
-    const pkgJson = JSON.parse(
-      await Bun.file(path.join(pkgDir, 'package.json')).text()
-    ) as { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string> };
-
-    await copyDirectoryRecursive(pkgDir, path.join(outDir, 'node_modules', packageName));
-
-    for (const dep of Object.keys(pkgJson.dependencies ?? {})) {
-      await copyPackageTree(dep, pkgDir);
-    }
-    for (const dep of Object.keys(pkgJson.optionalDependencies ?? {})) {
-      try { await copyPackageTree(dep, pkgDir); } catch { /* not installed for this platform */ }
-    }
-  }
-
-  await copyPackageTree('@next/routing', adapterDir);
-  await copyPackageTree('sharp', adapterDir);
-  if (hasEdgeOutputs) {
-    await copyPackageTree('edge-runtime', adapterDir);
-  }
 }
 
 function flattenHeaders(
@@ -610,25 +521,73 @@ function flattenHeaders(
   return result;
 }
 
+function collectTags(
+  config: AdapterOutput['PRERENDER']['config'],
+  fallbackHeaders?: Record<string, string | string[]> | null
+): string[] {
+  const tags = new Set<string>();
+  const record = config as Record<string, unknown>;
+
+  function addValues(value: unknown): void {
+    if (typeof value === 'string' && value.length > 0) {
+      tags.add(value);
+    } else if (Array.isArray(value)) {
+      for (const item of value) {
+        if (typeof item === 'string' && item.length > 0) tags.add(item);
+      }
+    }
+  }
+
+  addValues(record.tags);
+  addValues(record.revalidateTags);
+  addValues(record.cacheTags);
+
+  const experimental =
+    record.experimental && typeof record.experimental === 'object'
+      ? (record.experimental as Record<string, unknown>)
+      : null;
+  if (experimental) {
+    addValues(experimental.tags);
+    addValues(experimental.revalidateTags);
+    addValues(experimental.cacheTags);
+  }
+
+  if (fallbackHeaders) {
+    const headerVal = fallbackHeaders['x-next-cache-tags'];
+    const raw = Array.isArray(headerVal) ? headerVal.join(',') : headerVal;
+    if (typeof raw === 'string') {
+      for (const t of raw.split(',')) {
+        const trimmed = t.trim();
+        if (trimmed.length > 0) tags.add(trimmed);
+      }
+    }
+  }
+
+  return [...tags].sort();
+}
+
+function resolveSourcePath(repoRoot: string, filePath: string): string {
+  return path.isAbsolute(filePath) ? filePath : path.resolve(repoRoot, filePath);
+}
+
 async function seedPrerenderCache({
   outDir,
-  prerenderSeeds,
+  prerenders,
+  repoRoot,
 }: {
   outDir: string;
-  prerenderSeeds: BunPrerenderSeed[];
+  prerenders: AdapterOutput['PRERENDER'][];
+  repoRoot: string;
 }): Promise<void> {
-  const seedableEntries = prerenderSeeds.filter(
-    (seed) => seed.fallback?.sourcePath && seed.fallback.stagedPath === null
-  );
-
-  if (seedableEntries.length === 0) return;
+  const seedable = prerenders.filter((p) => p.fallback?.filePath);
+  if (seedable.length === 0) return;
 
   const dbPath = path.join(outDir, 'cache.db');
   const db = new Database(dbPath);
 
   try {
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec(SCHEMA_SQL);
+    db.run('PRAGMA journal_mode = WAL');
+    db.run(SCHEMA_SQL);
 
     const insertEntry = db.query(
       `INSERT OR REPLACE INTO prerender_entries
@@ -646,7 +605,6 @@ async function seedPrerenderCache({
 
     const createdAt = Date.now();
 
-    // Gather all data first (async reads), then insert in a transaction
     const entries: Array<{
       cacheKey: string;
       pathname: string;
@@ -659,27 +617,19 @@ async function seedPrerenderCache({
       expiresAt: number | null;
     }> = [];
 
-    for (const seed of seedableEntries) {
-      const fallback = seed.fallback!;
-      const sourcePath = fallback.sourcePath!;
+    for (const prerender of seedable) {
+      const fallback = prerender.fallback!;
+      const sourcePath = resolveSourcePath(repoRoot, fallback.filePath!);
 
       const bodyBuffer = await Bun.file(sourcePath).arrayBuffer();
       const body = Buffer.from(bodyBuffer).toString('base64');
 
-      // Build cache key: same logic as createPrerenderCacheKey with empty query/headers
-      const payload = JSON.stringify({
-        seedPathname: seed.pathname,
-        requestPathname: seed.pathname,
-        query: {},
-        headers: {},
-      });
-      const hash = createHash('sha256').update(payload).digest('hex');
-      const cacheKey = `prerender:${seed.pathname}:${hash}`;
+      const cacheKey = prerender.pathname;
 
-      // Build headers: flatten initialHeaders and add x-next-cache-tags
-      const headers = flattenHeaders(fallback.initialHeaders);
-      if (seed.tags.length > 0) {
-        headers['x-next-cache-tags'] = seed.tags.join(',');
+      const tags = collectTags(prerender.config, fallback.initialHeaders);
+      const headers = flattenHeaders(fallback.initialHeaders ?? null);
+      if (tags.length > 0) {
+        headers['x-next-cache-tags'] = tags.join(',');
       }
 
       const status = fallback.initialStatus ?? 200;
@@ -696,18 +646,17 @@ async function seedPrerenderCache({
 
       entries.push({
         cacheKey,
-        pathname: seed.pathname,
-        groupId: seed.groupId,
+        pathname: prerender.pathname,
+        groupId: prerender.groupId,
         status,
         headers: JSON.stringify(headers),
         body,
-        tags: seed.tags,
+        tags,
         revalidateAt,
         expiresAt,
       });
     }
 
-    // Insert all entries in a single transaction
     db.transaction(() => {
       for (const entry of entries) {
         insertEntry.run(
@@ -752,32 +701,12 @@ async function onBuildComplete(
   const generatedAt = new Date().toISOString();
   const pathnames = collectOutputPathnames(ctx.outputs);
 
-  const [staticAssets, functionMap, prerenderSeeds] = await Promise.all([
-    stageStaticAssets({
-      outputs: ctx.outputs,
-      projectDir: ctx.projectDir,
-      basePath: ctx.config.basePath,
-      outDir,
-    }),
-    stageFunctionArtifacts({
-      outputs: ctx.outputs,
-      repoRoot: ctx.repoRoot,
-      outDir,
-    }),
-    stagePrerenderSeeds({
-      outputs: ctx.outputs,
-      repoRoot: ctx.repoRoot,
-      outDir,
-    }),
-  ]);
-  const routerManifestPath = 'router-manifest.json';
-  const routerManifest = buildRouterManifest({
-    ctx,
-    generatedAt,
-    pathnames,
+  const staticAssets = await stageStaticAssets({
+    outputs: ctx.outputs,
+    projectDir: ctx.projectDir,
+    basePath: ctx.config.basePath,
+    outDir,
   });
-
-  await writeJsonFile(path.join(outDir, routerManifestPath), routerManifest);
 
   const port = options.port ?? DEFAULT_PORT;
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
@@ -789,10 +718,7 @@ async function onBuildComplete(
     ctx,
     generatedAt,
     pathnames,
-    functionMap,
     staticAssets,
-    prerenderSeeds,
-    routerManifestPath,
     port,
     hostname,
     previewProps,
@@ -803,19 +729,14 @@ async function onBuildComplete(
     deploymentManifest
   );
 
-  const hasEdgeOutputs = functionMap.some((f) => f.runtime === 'edge');
-
-  await stageRuntimeModules(outDir, hasEdgeOutputs);
-  await seedPrerenderCache({ outDir, prerenderSeeds });
+  await stageRuntimeModules(outDir);
+  await seedPrerenderCache({
+    outDir,
+    prerenders: ctx.outputs.prerenders,
+    repoRoot: ctx.repoRoot,
+  });
+  await writeRuntimeNextConfig(outDir, ctx.config);
   await writeServerEntry(outDir);
-
-  // Resolve the adapter package directory (import.meta.dirname points to dist/src/)
-  const adapterDir = path.resolve(import.meta.dirname, '../..');
-
-  await Promise.all([
-    stageTracedDependencies({ outDir, functionMap }),
-    stageAdapterDependencies({ outDir, adapterDir, hasEdgeOutputs }),
-  ]);
 }
 
 export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
@@ -846,17 +767,40 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
         ? [...new Set([...existingAllowedOrigins, deploymentHost])]
         : existingAllowedOrigins;
 
-      // Cache handler respect: don't override user-configured cache handlers
-      const hasCacheHandler =
-        typeof configRecord.cacheHandler === 'string' &&
-        (configRecord.cacheHandler as string).length > 0;
-
+      // Inject SQLite-backed handlers for both Next.js cache APIs:
+      // 1) nextConfig.cacheHandler (IncrementalCache handler class)
+      // 2) nextConfig.cacheHandlers.default/remote (cacheComponents handlers)
       const existingCacheHandlers = configRecord.cacheHandlers as
         | Record<string, string | undefined>
         | undefined;
-      const hasDefaultCacheHandler =
-        typeof existingCacheHandlers?.default === 'string' &&
-        existingCacheHandlers.default.length > 0;
+
+      // Stage the cache handler runtime into the output dir so the path is
+      // inside the project tree (Turbopack rejects absolute paths that leave
+      // the project root). The files are small and this is idempotent.
+      const runtimeDir = path.resolve(configuredOutDir, 'runtime');
+      if (!existsSync(runtimeDir)) {
+        mkdirSync(runtimeDir, { recursive: true });
+      }
+      const sourceDir = path.join(import.meta.dirname, 'runtime');
+      for (const mod of CACHE_RUNTIME_MODULES) {
+        const dest = path.join(runtimeDir, mod);
+        copyFileSync(path.join(sourceDir, mod), dest);
+      }
+      const useCacheHandlerPath = path.resolve(
+        configuredOutDir,
+        'runtime',
+        'cache-handler.js'
+      );
+      const incrementalCacheHandlerPath = path.resolve(
+        configuredOutDir,
+        'runtime',
+        'incremental-cache-handler.js'
+      );
+
+      const cacheHandlersConfig: Record<string, string | undefined> = {
+        ...(existingCacheHandlers ?? {}),
+        remote: useCacheHandlerPath,
+      };
 
       return {
         ...config,
@@ -868,23 +812,13 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
               },
             }
           : {}),
-        // Preserve user-set cacheHandler; don't inject one if not set
-        ...(hasCacheHandler ? { cacheHandler: configRecord.cacheHandler } : {}),
-        // Preserve user-set cacheHandlers; don't override default/remote
-        ...(existingCacheHandlers && !hasDefaultCacheHandler
-          ? { cacheHandlers: { ...existingCacheHandlers } }
-          : existingCacheHandlers
-            ? { cacheHandlers: existingCacheHandlers }
-            : {}),
+        cacheHandler: incrementalCacheHandlerPath,
+        cacheHandlers: cacheHandlersConfig,
         // Enable cacheComponents when the experimental flag is set via env.
         ...(process.env.__NEXT_CACHE_COMPONENTS === 'true' ||
         process.env.NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS === 'true'
           ? { cacheComponents: true }
           : {}),
-        experimental: {
-          ...config.experimental,
-          trustHostHeader: true,
-        },
       } as typeof config;
     },
     async onBuildComplete(ctx) {
