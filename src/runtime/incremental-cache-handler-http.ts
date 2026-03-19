@@ -1,7 +1,16 @@
-import type { PrerenderTagManifestUpdate } from './isr.js';
-import cacheHandler from './cache-handler.js';
+import { createFetchPrerenderCacheStore } from './cache-http-client.js';
+import cacheHandler from './cache-handler-http.js';
 import { registerGlobalCacheHandlers } from './cache-handler-registration.js';
-import { getSharedPrerenderCacheStore } from './cache-store.js';
+import type { PrerenderTagManifestUpdate } from './isr.js';
+import {
+  decodeCacheValue,
+  decodeStoredBodyBuffer,
+  decodeStoredBodyText,
+  encodeCacheValue,
+  isCacheValue,
+  isNullCacheValue,
+  NULL_CACHE_ENTRY_MARKER,
+} from './incremental-cache-codec.js';
 import type {
   CacheHandler as NextIncrementalCacheHandler,
   CacheHandlerContext,
@@ -15,17 +24,8 @@ import type {
   SetIncrementalResponseCacheContext,
 } from 'next/dist/server/response-cache';
 
-const MAP_MARKER = '__adapter_bun_type';
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
-const NULL_CACHE_ENTRY_MARKER = '__adapter_bun_null_cache_entry';
-const KNOWN_CACHE_KINDS = new Set([
-  'APP_PAGE',
-  'APP_ROUTE',
-  'PAGES',
-  'FETCH',
-  'REDIRECT',
-  'IMAGE',
-]);
+const store = createFetchPrerenderCacheStore();
 
 registerGlobalCacheHandlers(cacheHandler);
 
@@ -63,13 +63,9 @@ function readStringArray(value: unknown): string[] {
   return tags;
 }
 
-function addHeaderTags(
-  target: Set<string>,
-  headersInput: unknown
-): void {
+function addHeaderTags(target: Set<string>, headersInput: unknown): void {
   if (!headersInput || typeof headersInput !== 'object') return;
   const headers = headersInput as Record<string, unknown>;
-
   const value = headers['x-next-cache-tags'];
   const raw =
     Array.isArray(value)
@@ -145,86 +141,7 @@ function resolveRevalidateSeconds(
   return null;
 }
 
-function encodeCacheValue(value: IncrementalCacheValue): string {
-  return JSON.stringify(value, (_key, input) => {
-    if (input instanceof Map) {
-      return {
-        [MAP_MARKER]: 'Map',
-        entries: [...input.entries()],
-      };
-    }
-    return input;
-  });
-}
-
-function decodeCacheValue(payload: string): unknown {
-  return JSON.parse(payload, (_key, input) => {
-    if (
-      input &&
-      typeof input === 'object' &&
-      'type' in input &&
-      input.type === 'Buffer' &&
-      'data' in input &&
-      Array.isArray(input.data)
-    ) {
-      return Buffer.from(input.data);
-    }
-    if (
-      input &&
-      typeof input === 'object' &&
-      MAP_MARKER in input &&
-      input[MAP_MARKER] === 'Map' &&
-      'entries' in input &&
-      Array.isArray(input.entries)
-    ) {
-      return new Map(input.entries);
-    }
-    return input;
-  });
-}
-
-function decodeStoredBodyBytes(row: {
-  body: Uint8Array | string;
-  bodyEncoding: 'binary' | 'base64';
-}): Uint8Array {
-  if (row.bodyEncoding === 'binary') {
-    return row.body instanceof Uint8Array
-      ? row.body
-      : new TextEncoder().encode(row.body);
-  }
-
-  const encodedBody =
-    typeof row.body === 'string' ? row.body : Buffer.from(row.body).toString('utf8');
-  return Buffer.from(encodedBody, 'base64');
-}
-
-function decodeStoredBodyBuffer(row: {
-  body: Uint8Array | string;
-  bodyEncoding: 'binary' | 'base64';
-}): Buffer {
-  return Buffer.from(decodeStoredBodyBytes(row));
-}
-
-function decodeStoredBodyText(row: {
-  body: Uint8Array | string;
-  bodyEncoding: 'binary' | 'base64';
-}): string {
-  return Buffer.from(decodeStoredBodyBytes(row)).toString('utf8');
-}
-
-function isCacheValue(value: unknown): value is IncrementalCacheValue {
-  if (!value || typeof value !== 'object') return false;
-  const record = value as Record<string, unknown>;
-  return typeof record.kind === 'string' && KNOWN_CACHE_KINDS.has(record.kind);
-}
-
-function isNullCacheValue(value: unknown): boolean {
-  if (!value || typeof value !== 'object') return false;
-  const record = value as Record<string, unknown>;
-  return record[NULL_CACHE_ENTRY_MARKER] === true;
-}
-
-function decodeSeededPrerenderValue(
+async function decodeSeededPrerenderValue(
   cacheKey: string,
   row: {
     body: Uint8Array | string;
@@ -232,9 +149,8 @@ function decodeSeededPrerenderValue(
     headers: Record<string, string>;
     status: number;
   },
-  ctx: GetIncrementalFetchCacheContext | GetIncrementalResponseCacheContext,
-  store: ReturnType<typeof getSharedPrerenderCacheStore>
-): IncrementalCacheValue | null {
+  ctx: GetIncrementalFetchCacheContext | GetIncrementalResponseCacheContext
+): Promise<IncrementalCacheValue | null> {
   if (ctx.kind === 'APP_ROUTE') {
     return {
       kind: 'APP_ROUTE',
@@ -246,9 +162,10 @@ function decodeSeededPrerenderValue(
 
   if (ctx.kind === 'APP_PAGE') {
     const html = decodeStoredBodyText(row);
-    const rscRow = store.get(`${cacheKey}.rsc`);
+    const rscRow = await store.get(`${cacheKey}.rsc`);
     const rscData = rscRow ? decodeStoredBodyBuffer(rscRow) : undefined;
-    const segmentRows = store.findByPrefix(`${cacheKey}.segments/`);
+    const segmentRows =
+      (await store.findByPrefix?.(`${cacheKey}.segments/`)) ?? [];
     const segmentData = new Map<string, Buffer>();
 
     for (const segmentRow of segmentRows) {
@@ -277,10 +194,9 @@ function decodeSeededPrerenderValue(
   }
 
   if (ctx.kind === 'PAGES') {
-    const html = decodeStoredBodyText(row);
     return {
       kind: 'PAGES',
-      html,
+      html: decodeStoredBodyText(row),
       pageData: {},
       headers: row.headers,
       status: row.status,
@@ -295,18 +211,15 @@ async function updateTagManifests(
   update: PrerenderTagManifestUpdate & { now: number }
 ): Promise<void> {
   if (tags.length === 0) return;
-  const store = getSharedPrerenderCacheStore();
-  store.updateTagManifest?.(tags, update);
+  await store.updateTagManifest?.(tags, update);
 }
 
-export default class BunSqliteIncrementalCacheHandler
+export default class FetchIncrementalCacheHandler
   implements NextIncrementalCacheHandler
 {
   constructor(_ctx: CacheHandlerContext) {}
 
-  resetRequestCache(): void {
-    // Request-local behavior is already managed by Next.js.
-  }
+  resetRequestCache(): void {}
 
   async revalidateTag(
     tagsInput: string | string[],
@@ -335,8 +248,7 @@ export default class BunSqliteIncrementalCacheHandler
     cacheKey: string,
     ctx: GetIncrementalFetchCacheContext | GetIncrementalResponseCacheContext
   ): Promise<CacheHandlerValue | null> {
-    const store = getSharedPrerenderCacheStore();
-    const row = store.get(cacheKey);
+    const row = await store.get(cacheKey);
     if (!row) {
       return null;
     }
@@ -346,7 +258,7 @@ export default class BunSqliteIncrementalCacheHandler
     const tagsToCheck = normalizeTags([...queryTags, ...storedTags]);
 
     if (tagsToCheck.length > 0) {
-      const tagEntries = store.getTagManifestEntries?.(tagsToCheck);
+      const tagEntries = await store.getTagManifestEntries?.(tagsToCheck);
       if (tagEntries) {
         for (const tag of tagsToCheck) {
           const tagEntry = tagEntries[tag];
@@ -376,7 +288,7 @@ export default class BunSqliteIncrementalCacheHandler
     } catch {}
 
     if (!decoded) {
-      const seeded = decodeSeededPrerenderValue(cacheKey, row, ctx, store);
+      const seeded = await decodeSeededPrerenderValue(cacheKey, row, ctx);
       if (!seeded) {
         return null;
       }
@@ -394,14 +306,12 @@ export default class BunSqliteIncrementalCacheHandler
     data: IncrementalCacheValue | null,
     ctx: SetIncrementalFetchCacheContext | SetIncrementalResponseCacheContext
   ): Promise<void> {
-    const store = getSharedPrerenderCacheStore();
-
     if (data === null || data === undefined) {
       const now = Date.now();
       const markerPayload = JSON.stringify({
         [NULL_CACHE_ENTRY_MARKER]: true,
       });
-      store.set(cacheKey, {
+      await store.set(cacheKey, {
         cacheKey,
         pathname: cacheKey,
         groupId: 0,
@@ -431,7 +341,7 @@ export default class BunSqliteIncrementalCacheHandler
         ? ctx.cacheControl.expire
         : null;
 
-    store.set(cacheKey, {
+    await store.set(cacheKey, {
       cacheKey,
       pathname: cacheKey,
       groupId: 0,
