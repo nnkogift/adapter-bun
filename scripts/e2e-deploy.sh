@@ -44,6 +44,19 @@ if [ "$adapter_pack_lock_acquired" -ne 1 ]; then
   exit 1
 fi
 
+# Native deps (for example sqlite3 in fixtures) may need node-gyp + Python.
+PYTHON_FOR_NODE_GYP=""
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_FOR_NODE_GYP="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_FOR_NODE_GYP="$(command -v python)"
+fi
+if [ -n "$PYTHON_FOR_NODE_GYP" ]; then
+  export PYTHON="$PYTHON_FOR_NODE_GYP"
+  export npm_config_python="$PYTHON_FOR_NODE_GYP"
+  export NODE_GYP_FORCE_PYTHON="$PYTHON_FOR_NODE_GYP"
+fi
+
 # Test jobs restore adapter-bun from cache. If dist artifacts are missing,
 # rebuild in-place so NEXT_ADAPTER_PATH always points at a valid module.
 if [ ! -f "$ADAPTER_BUN_DIST_INDEX" ]; then
@@ -72,6 +85,11 @@ PACK_RESULT="$(
 ADAPTER_BUN_TARBALL="$NEXT_TEST_DIR/$(
   node -e "const result = JSON.parse(process.argv[1]); console.log(result[0].filename)" "$PACK_RESULT"
 )"
+ADAPTER_BUN_TARBALL_UNIQUE="${NEXT_TEST_DIR}/adapter-bun-$(
+  node -e "process.stdout.write(Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10))"
+).tgz"
+mv "$ADAPTER_BUN_TARBALL" "$ADAPTER_BUN_TARBALL_UNIQUE"
+ADAPTER_BUN_TARBALL="$ADAPTER_BUN_TARBALL_UNIQUE"
 cleanup_adapter_pack_lock
 
 # 3. Add adapter-bun as dependency
@@ -80,6 +98,28 @@ const pkg=JSON.parse(require('fs').readFileSync('package.json','utf8'));
 pkg.dependencies=pkg.dependencies||{};
 pkg.dependencies['adapter-bun']='file:${ADAPTER_BUN_TARBALL}';
 require('fs').writeFileSync('package.json',JSON.stringify(pkg,null,2));
+" >&2
+
+# sqlite3@5.0.2 falls back to node-gyp@3.8 on Node 22 (Python 2 syntax).
+# Bump only this legacy fixture version to a Node-22-compatible release.
+node -e "
+const fs = require('fs');
+const pkgPath = 'package.json';
+const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+let changed = false;
+for (const section of ['dependencies', 'devDependencies', 'optionalDependencies']) {
+  const record = pkg[section];
+  if (!record || typeof record !== 'object') continue;
+  const current = record.sqlite3;
+  if (typeof current === 'string' && /(^|[^0-9])5\\.0\\.2([^0-9]|$)/.test(current)) {
+    record.sqlite3 = '6.0.1';
+    changed = true;
+  }
+}
+if (changed) {
+  fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+  console.error('Updated sqlite3 dependency to 6.0.1 for Node 22 compatibility');
+}
 " >&2
 
 # 4. Install dependencies

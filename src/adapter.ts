@@ -16,6 +16,7 @@ import {
 import type {
   BunAdapterOptions,
   BunDeploymentManifest,
+  BunRuntimeFunctionOutput,
   BuildCompleteContext,
 } from './types.ts';
 
@@ -48,6 +49,11 @@ type PreviewProps = NonNullable<
 type CacheRuntimeConfig = NonNullable<
   NonNullable<BunDeploymentManifest['runtime']>['cache']
 >;
+type RuntimeRoutingConfig = NonNullable<
+  NonNullable<BunDeploymentManifest['runtime']>['routing']
+>;
+type BuildRoute = BuildCompleteContext['routing']['beforeFiles'][number];
+type BuildRouteHas = NonNullable<BuildRoute['has']>[number];
 
 function normalizeDeploymentHost(value: string | undefined): string | null {
   if (typeof value !== 'string') {
@@ -278,6 +284,129 @@ function collectTags(
   return [...tags].sort();
 }
 
+function cloneRouteHas(
+  value: BuildRouteHas
+): NonNullable<RuntimeRoutingConfig['beforeFiles'][number]['has']>[number] {
+  if (value.type === 'host') {
+    return {
+      type: 'host',
+      value: value.value,
+    };
+  }
+
+  return {
+    type: value.type,
+    key: value.key,
+    value: value.value,
+  };
+}
+
+function cloneRoute(route: BuildRoute): RuntimeRoutingConfig['beforeFiles'][number] {
+  return {
+    sourceRegex: route.sourceRegex,
+    ...(typeof route.destination === 'string'
+      ? { destination: route.destination }
+      : {}),
+    ...(route.headers ? { headers: { ...route.headers } } : {}),
+    ...(route.has ? { has: route.has.map(cloneRouteHas) } : {}),
+    ...(route.missing ? { missing: route.missing.map(cloneRouteHas) } : {}),
+    ...(typeof route.status === 'number' ? { status: route.status } : {}),
+  };
+}
+
+function toRuntimeI18nConfig(
+  value: BuildCompleteContext['config']['i18n']
+): RuntimeRoutingConfig['i18n'] {
+  if (!value) {
+    return null;
+  }
+
+  return {
+    defaultLocale: value.defaultLocale,
+    locales: [...value.locales],
+    ...(value.localeDetection === false ? { localeDetection: false } : {}),
+    ...(value.domains
+      ? {
+          domains: value.domains.map((domain) => ({
+            defaultLocale: domain.defaultLocale,
+            domain: domain.domain,
+            ...(domain.http ? { http: true } : {}),
+            ...(domain.locales ? { locales: [...domain.locales] } : {}),
+          })),
+        }
+      : {}),
+  };
+}
+
+function toRuntimeRoutingConfig(ctx: BuildCompleteContext): RuntimeRoutingConfig {
+  return {
+    i18n: toRuntimeI18nConfig(ctx.config.i18n),
+    beforeMiddleware: ctx.routing.beforeMiddleware.map(cloneRoute),
+    beforeFiles: ctx.routing.beforeFiles.map(cloneRoute),
+    afterFiles: ctx.routing.afterFiles.map(cloneRoute),
+    dynamicRoutes: ctx.routing.dynamicRoutes.map(cloneRoute),
+    onMatch: ctx.routing.onMatch.map(cloneRoute),
+    fallback: ctx.routing.fallback.map(cloneRoute),
+    shouldNormalizeNextData: Boolean(ctx.routing.shouldNormalizeNextData),
+  };
+}
+
+function toRuntimeFunctionOutput({
+  output,
+  includeAssets,
+}: {
+  output:
+    | AdapterOutput['PAGES']
+    | AdapterOutput['PAGES_API']
+    | AdapterOutput['APP_PAGE']
+    | AdapterOutput['APP_ROUTE']
+    | AdapterOutput['MIDDLEWARE'];
+  includeAssets: boolean;
+}): BunRuntimeFunctionOutput {
+  const serializedAssets =
+    includeAssets && output.assets
+      ? [...new Set([output.filePath, ...Object.values(output.assets)])]
+      : undefined;
+  const env = output.config.env;
+
+  return {
+    id: output.id,
+    pathname: output.pathname,
+    sourcePage: output.sourcePage,
+    runtime: output.runtime,
+    filePath: output.filePath,
+    ...(output.edgeRuntime
+      ? {
+          edgeRuntime: {
+            modulePath: output.edgeRuntime.modulePath,
+            entryKey: output.edgeRuntime.entryKey,
+            handlerExport: output.edgeRuntime.handlerExport,
+          },
+        }
+      : {}),
+    ...(serializedAssets && serializedAssets.length > 0
+      ? { assets: serializedAssets }
+      : {}),
+    ...(env && Object.keys(env).length > 0 ? { env: { ...env } } : {}),
+  };
+}
+
+function collectRuntimeFunctionOutputs(
+  outputs: BuildCompleteContext['outputs']
+): BunRuntimeFunctionOutput[] {
+  return [
+    ...outputs.pages,
+    ...outputs.pagesApi,
+    ...outputs.appPages,
+    ...outputs.appRoutes,
+  ].map((output) =>
+    toRuntimeFunctionOutput({
+      output,
+      includeAssets: output.runtime === 'edge',
+    })
+  );
+}
+
 function resolveSourcePath(repoRoot: string, filePath: string): string {
   return path.isAbsolute(filePath) ? filePath : path.resolve(repoRoot, filePath);
 }
@@ -423,6 +552,14 @@ async function onBuildComplete(
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
   const previewProps = await readPreviewProps(ctx);
   const cacheRuntime = createRuntimeCacheConfig(options);
+  const runtimeRouting = toRuntimeRoutingConfig(ctx);
+  const runtimeFunctionOutputs = collectRuntimeFunctionOutputs(ctx.outputs);
+  const runtimeMiddleware = ctx.outputs.middleware
+    ? toRuntimeFunctionOutput({
+        output: ctx.outputs.middleware,
+        includeAssets: ctx.outputs.middleware.runtime === 'edge',
+      })
+    : undefined;
 
   const deploymentManifest = buildDeploymentManifest({
     adapterName: ADAPTER_NAME,
@@ -435,6 +572,9 @@ async function onBuildComplete(
     hostname,
     previewProps,
     cacheRuntime,
+    routing: runtimeRouting,
+    middlewareOutput: runtimeMiddleware,
+    functionOutputs: runtimeFunctionOutputs,
   });
 
   await writeJsonFile(

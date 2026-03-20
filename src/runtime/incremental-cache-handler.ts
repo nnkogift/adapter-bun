@@ -212,6 +212,51 @@ function decodeStoredBodyText(row: {
   return Buffer.from(decodeStoredBodyBytes(row)).toString('utf8');
 }
 
+function toSeededDataCacheKey(cacheKey: string): string | null {
+  const buildId = process.env.__NEXT_BUILD_ID;
+  if (typeof buildId !== 'string' || buildId.length === 0) {
+    return null;
+  }
+
+  if (!cacheKey.startsWith('/')) {
+    return null;
+  }
+
+  const normalizedPath = cacheKey === '/' ? '/index' : cacheKey;
+  return `/_next/data/${buildId}${normalizedPath}.json`;
+}
+
+function readSeededPagesPageData(
+  cacheKey: string,
+  store: ReturnType<typeof getSharedPrerenderCacheStore>
+): unknown {
+  const dataCacheKey = toSeededDataCacheKey(cacheKey);
+  if (!dataCacheKey) {
+    return null;
+  }
+
+  const dataRow = store.get(dataCacheKey);
+  if (!dataRow) {
+    return null;
+  }
+
+  const payload = decodeStoredBodyText(dataRow);
+
+  try {
+    const decodedValue = decodeCacheValue(payload);
+    if (isCacheValue(decodedValue) && decodedValue.kind === 'PAGES') {
+      const pageData = (decodedValue as { pageData?: unknown }).pageData;
+      return pageData ?? {};
+    }
+  } catch {}
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
 function isCacheValue(value: unknown): value is IncrementalCacheValue {
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
@@ -278,10 +323,11 @@ function decodeSeededPrerenderValue(
 
   if (ctx.kind === 'PAGES') {
     const html = decodeStoredBodyText(row);
+    const pageData = readSeededPagesPageData(cacheKey, store);
     return {
       kind: 'PAGES',
       html,
-      pageData: {},
+      pageData: pageData ?? {},
       headers: row.headers,
       status: row.status,
     } as IncrementalCacheValue;

@@ -5,6 +5,7 @@
     "": {
       "name": "adapter-bun",
       "dependencies": {
+        "@next/routing": "16.2.0-canary.89",
         "sharp": "^0.33.0",
       },
       "devDependencies": {
@@ -70,6 +71,8 @@
     "@img/sharp-win32-x64": ["@img/sharp-win32-x64@0.33.5", "", { "os": "win32", "cpu": "x64" }, "sha512-MpY/o8/8kj+EcnxwvrP4aTJSWw/aZ7JIGR4aBeZkZw5B7/Jn+tY9/VNwtcoGmdT7GfggGIU4kygOMSbYnOrAbg=="],
 
     "@next/env": ["@next/env@16.2.0", "", {}, "sha512-OZIbODWWAi0epQRCRjNe1VO45LOFBzgiyqmTLzIqWq6u1wrxKnAyz1HH6tgY/Mc81YzIjRPoYsPAEr4QV4l9TA=="],
+
+    "@next/routing": ["@next/routing@16.2.0-canary.89", "", {}, "sha512-WHusto0Hl56vXzYxB25sCkoILYPX6Xm6gZLHdRPAzopPszqUuIyV4uVN0KahY7Lcpu/P0uJmVaz8MHuOcZTA6A=="],
 
     "@next/swc-darwin-arm64": ["@next/swc-darwin-arm64@16.2.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-/JZsqKzKt01IFoiLLAzlNqys7qk2F3JkcUhj50zuRhKDQkZNOz9E5N6wAQWprXdsvjRP4lTFj+/+36NSv5AwhQ=="],
 

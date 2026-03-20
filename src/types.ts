@@ -51,6 +51,65 @@ export interface BunStaticAsset {
   cacheControl: string | null;
 }
 
+export type BunRuntimeRouteHas =
+  | {
+      type: 'header' | 'cookie' | 'query';
+      key: string;
+      value?: string;
+    }
+  | {
+      type: 'host';
+      key?: undefined;
+      value: string;
+    };
+
+export interface BunRuntimeRoute {
+  sourceRegex: string;
+  destination?: string;
+  headers?: Record<string, string>;
+  has?: BunRuntimeRouteHas[];
+  missing?: BunRuntimeRouteHas[];
+  status?: number;
+}
+
+export interface BunRuntimeI18nConfig {
+  defaultLocale: string;
+  locales: string[];
+  localeDetection?: false;
+  domains?: Array<{
+    defaultLocale: string;
+    domain: string;
+    http?: true;
+    locales?: string[];
+  }>;
+}
+
+export interface BunRuntimeRouting {
+  i18n?: BunRuntimeI18nConfig | null;
+  beforeMiddleware: BunRuntimeRoute[];
+  beforeFiles: BunRuntimeRoute[];
+  afterFiles: BunRuntimeRoute[];
+  dynamicRoutes: BunRuntimeRoute[];
+  onMatch: BunRuntimeRoute[];
+  fallback: BunRuntimeRoute[];
+  shouldNormalizeNextData: boolean;
+}
+
+export interface BunRuntimeFunctionOutput {
+  id: string;
+  pathname: string;
+  sourcePage: string;
+  runtime: 'nodejs' | 'edge';
+  filePath: string;
+  edgeRuntime?: {
+    modulePath: string;
+    entryKey: string;
+    handlerExport: string;
+  };
+  assets?: string[];
+  env?: Record<string, string>;
+}
+
 export interface BunDeploymentManifest {
   schemaVersion: 1;
   generatedAt: string;
@@ -84,6 +143,9 @@ export interface BunDeploymentManifest {
       endpointPath: string;
       authToken: string | null;
     } | null;
+    routing?: BunRuntimeRouting | null;
+    middleware?: BunRuntimeFunctionOutput | null;
+    functions?: BunRuntimeFunctionOutput[];
   };
   staticAssets: BunStaticAsset[];
   summary: {

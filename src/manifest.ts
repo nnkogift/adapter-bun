@@ -42,6 +42,9 @@ export function buildDeploymentManifest({
   hostname,
   previewProps,
   cacheRuntime,
+  routing,
+  middlewareOutput,
+  functionOutputs,
 }: {
   adapterName: string;
   adapterOutDir: string;
@@ -53,6 +56,9 @@ export function buildDeploymentManifest({
   hostname: string;
   previewProps?: NonNullable<BunDeploymentManifest['runtime']>['previewProps'];
   cacheRuntime?: NonNullable<BunDeploymentManifest['runtime']>['cache'];
+  routing?: NonNullable<BunDeploymentManifest['runtime']>['routing'];
+  middlewareOutput?: NonNullable<BunDeploymentManifest['runtime']>['middleware'];
+  functionOutputs?: NonNullable<BunDeploymentManifest['runtime']>['functions'];
 }): BunDeploymentManifest {
   return {
     schemaVersion: 1,
@@ -79,6 +85,9 @@ export function buildDeploymentManifest({
     runtime: {
       previewProps: previewProps ?? null,
       cache: cacheRuntime ?? null,
+      routing: routing ?? null,
+      middleware: middlewareOutput ?? null,
+      functions: functionOutputs ?? [],
     },
     staticAssets,
     summary: {
