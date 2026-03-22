@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
+import './early-timers.js';
 // Must run before loading @next/routing/route handlers so AsyncLocalStorage
 // and other Next.js node polyfills are available in Bun runtime.
 import 'next/dist/build/adapter/setup-node-env.external.js';
@@ -25,6 +26,7 @@ import {
   RSC_HEADER,
 } from 'next/dist/client/components/app-router-headers.js';
 import { normalizeNextQueryParam } from 'next/dist/server/web/utils.js';
+import { createOpaqueFallbackRouteParams } from 'next/dist/server/request/fallback-params.js';
 import { setCacheBustingSearchParamWithHash } from 'next/dist/client/components/router-reducer/set-cache-busting-search-param.js';
 import { computeCacheBustingSearchParam } from 'next/dist/shared/lib/router/utils/cache-busting-search-param.js';
 import { isDynamicRoute } from 'next/dist/shared/lib/router/utils/is-dynamic.js';
@@ -53,6 +55,9 @@ type RuntimeRouteHandlerContext = {
 type RuntimeRequestMetaValue = string | string[] | undefined;
 type RuntimeRequestMetaQuery = Record<string, RuntimeRequestMetaValue>;
 type RuntimeRequestMetaParams = Record<string, RuntimeRequestMetaValue>;
+type RuntimeFallbackParams = NonNullable<
+  ReturnType<typeof createOpaqueFallbackRouteParams>
+>;
 type RuntimeRevalidateHeaders = Record<string, string | string[]>;
 type RuntimeInternalRevalidate = (config: {
   urlPath: string;
@@ -65,6 +70,8 @@ type RuntimeDynamicRouteMatcher = (
 ) => RuntimeDynamicRouteMatcherResult | false;
 
 interface RuntimeRequestMeta {
+  initURL?: string;
+  initProtocol?: string;
   invokePath?: string;
   invokeOutput?: string;
   invokeQuery?: RuntimeRequestMetaQuery;
@@ -79,6 +86,8 @@ interface RuntimeRequestMeta {
   cacheBustingSearchParam?: string;
   isNextDataReq?: true;
   revalidate?: RuntimeInternalRevalidate;
+  fallbackParams?: RuntimeFallbackParams;
+  renderFallbackShell?: boolean;
 }
 
 type NodeRouteHandler = (
@@ -120,6 +129,20 @@ interface RuntimeRoute {
   status?: number;
 }
 
+interface RuntimeFallbackRouteParam {
+  paramName: string;
+  paramType: string;
+}
+
+interface RuntimePrerenderManifestDynamicRoute {
+  fallback?: string | null | false;
+  fallbackRouteParams?: RuntimeFallbackRouteParam[];
+}
+
+interface RuntimePrerenderManifest {
+  dynamicRoutes?: Record<string, RuntimePrerenderManifestDynamicRoute>;
+}
+
 interface RuntimeI18nConfig {
   defaultLocale: string;
   locales: string[];
@@ -141,6 +164,29 @@ interface RuntimeRoutingConfig {
   onMatch: RuntimeRoute[];
   fallback: RuntimeRoute[];
   shouldNormalizeNextData: boolean;
+}
+
+interface RuntimeNextImageConfig {
+  loader?: string;
+  unoptimized?: boolean;
+  dangerouslyAllowLocalIP?: boolean;
+  maximumResponseBody?: number;
+}
+
+interface RuntimeNextExperimentalConfig {
+  imgOptConcurrency?: number | null;
+  imgOptMaxInputPixels?: number;
+  imgOptSequentialRead?: boolean | null;
+  imgOptSkipMetadata?: boolean | null;
+  imgOptTimeoutInSeconds?: number;
+  isrFlushToDisk?: boolean;
+}
+
+interface RuntimeNextConfig {
+  output?: string;
+  basePath?: string;
+  images?: RuntimeNextImageConfig;
+  experimental?: RuntimeNextExperimentalConfig;
 }
 
 interface RuntimeEdgeOutput {
@@ -175,6 +221,15 @@ interface RuntimeMiddlewareManifestEntry {
 interface RuntimeMiddlewareManifest {
   middleware?: Record<string, RuntimeMiddlewareManifestEntry>;
   functions?: Record<string, RuntimeMiddlewareManifestEntry>;
+}
+
+interface RuntimeFunctionsConfigManifestEntry {
+  runtime?: string;
+  matchers?: RuntimeMiddlewareRouteMatcher[];
+}
+
+interface RuntimeFunctionsConfigManifest {
+  functions?: Record<string, RuntimeFunctionsConfigManifestEntry>;
 }
 
 interface RuntimeFunctionOutput {
@@ -298,6 +353,13 @@ function isRedirectStatusCode(value: number | undefined): boolean {
   return typeof value === 'number' && value >= 300 && value < 400;
 }
 
+function markConnectionClose(res: ServerResponse): void {
+  res.shouldKeepAlive = false;
+  if (!res.headersSent) {
+    res.setHeader('connection', 'close');
+  }
+}
+
 function isExternalDestinationUrl(value: string): boolean {
   return value.startsWith('http://') || value.startsWith('https://');
 }
@@ -305,7 +367,8 @@ function isExternalDestinationUrl(value: string): boolean {
 function replaceRouteDestinationCaptures(
   destination: string,
   regexMatch: RegExpMatchArray,
-  routeMatches?: Record<string, string>
+  routeMatches?: Record<string, string>,
+  conditionCaptures?: Record<string, string>
 ): string {
   let nextDestination = destination;
 
@@ -328,13 +391,314 @@ function replaceRouteDestinationCaptures(
     }
   }
 
-  if (routeMatches) {
-    for (const [key, value] of Object.entries(routeMatches)) {
-      nextDestination = nextDestination.replace(new RegExp(`\\$${key}`, 'g'), value);
+  const allNamedCaptures = {
+    ...(conditionCaptures ?? {}),
+    ...(routeMatches ?? {}),
+  };
+  for (const [key, value] of Object.entries(allNamedCaptures)) {
+    if (typeof value !== 'string') {
+      continue;
     }
+    nextDestination = nextDestination.replace(new RegExp(`\\$${key}`, 'g'), value);
   }
 
   return nextDestination;
+}
+
+function matchRouteConditionValue(
+  actualValue: string | undefined,
+  expectedValue: string | undefined
+): {
+  matched: boolean;
+  capturedValue?: string;
+  namedCaptures?: Record<string, string>;
+} {
+  if (actualValue === undefined) {
+    return { matched: false };
+  }
+  if (expectedValue === undefined) {
+    return {
+      matched: true,
+      capturedValue: actualValue,
+    };
+  }
+  try {
+    const matcher = new RegExp(expectedValue);
+    const match = actualValue.match(matcher);
+    if (match) {
+      const namedCaptures: Record<string, string> = {};
+      const groupedMatches = (
+        match as RegExpMatchArray & { groups?: Record<string, string | undefined> }
+      ).groups;
+      if (groupedMatches) {
+        for (const [key, value] of Object.entries(groupedMatches)) {
+          if (typeof value === 'string' && value.length > 0) {
+            namedCaptures[key] = value;
+          }
+        }
+      }
+      return {
+        matched: true,
+        capturedValue: match[0],
+        ...(Object.keys(namedCaptures).length > 0 ? { namedCaptures } : {}),
+      };
+    }
+  } catch {
+    // Fall through to exact match for invalid regex values.
+  }
+  if (actualValue === expectedValue) {
+    return {
+      matched: true,
+      capturedValue: actualValue,
+    };
+  }
+  return { matched: false };
+}
+
+function normalizeRouteConditionCaptureKey(key: string): string {
+  return key.replace(/[^a-zA-Z]/g, '');
+}
+
+function getRouteConditionValue(
+  condition: RuntimeRouteHas,
+  requestUrl: URL,
+  requestHeaders: Headers
+): string | undefined {
+  switch (condition.type) {
+    case 'header':
+      return requestHeaders.get(condition.key) ?? undefined;
+    case 'cookie': {
+      const cookieHeader = requestHeaders.get('cookie');
+      if (!cookieHeader) {
+        return undefined;
+      }
+      const cookies = cookieHeader.split(';').reduce<Record<string, string>>((acc, item) => {
+        const [rawKey, ...rawValueParts] = item.trim().split('=');
+        if (!rawKey) {
+          return acc;
+        }
+        acc[rawKey] = rawValueParts.join('=');
+        return acc;
+      }, {});
+      return cookies[condition.key];
+    }
+    case 'query':
+      return requestUrl.searchParams.get(condition.key) ?? undefined;
+    case 'host':
+      return requestUrl.hostname;
+  }
+}
+
+function checkRouteHasConditions(
+  conditions: RuntimeRouteHas[] | undefined,
+  requestUrl: URL,
+  requestHeaders: Headers
+): {
+  matched: boolean;
+  captures: Record<string, string>;
+} {
+  if (!conditions || conditions.length === 0) {
+    return {
+      matched: true,
+      captures: {},
+    };
+  }
+
+  const captures: Record<string, string> = {};
+  for (const condition of conditions) {
+    const conditionValue = getRouteConditionValue(condition, requestUrl, requestHeaders);
+    const match = matchRouteConditionValue(
+      conditionValue,
+      'value' in condition ? condition.value : undefined
+    );
+    if (!match.matched) {
+      return {
+        matched: false,
+        captures: {},
+      };
+    }
+    if (match.capturedValue !== undefined && condition.type !== 'host') {
+      const captureKey = normalizeRouteConditionCaptureKey(
+        'key' in condition ? condition.key : ''
+      );
+      if (captureKey) {
+        captures[captureKey] = match.capturedValue;
+      }
+    }
+    if (match.namedCaptures) {
+      for (const [key, value] of Object.entries(match.namedCaptures)) {
+        captures[key] = value;
+      }
+    }
+  }
+
+  return {
+    matched: true,
+    captures,
+  };
+}
+
+function checkRouteMissingConditions(
+  conditions: RuntimeRouteHas[] | undefined,
+  requestUrl: URL,
+  requestHeaders: Headers
+): boolean {
+  if (!conditions || conditions.length === 0) {
+    return true;
+  }
+
+  for (const condition of conditions) {
+    const conditionValue = getRouteConditionValue(condition, requestUrl, requestHeaders);
+    const match = matchRouteConditionValue(
+      conditionValue,
+      'value' in condition ? condition.value : undefined
+    );
+    if (match.matched) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function matchRoutingRule(
+  route: RuntimeRoute,
+  requestUrl: URL,
+  requestHeaders: Headers,
+  caseInsensitive: boolean = false
+):
+  | { matched: false }
+  | {
+      matched: true;
+      regexMatch: RegExpMatchArray;
+      conditionCaptures: Record<string, string>;
+    } {
+  const sourceRegex = caseInsensitive
+    ? new RegExp(route.sourceRegex, 'i')
+    : new RegExp(route.sourceRegex);
+  const regexMatch = requestUrl.pathname.match(sourceRegex);
+  if (!regexMatch) {
+    return { matched: false };
+  }
+
+  const hasCheck = checkRouteHasConditions(route.has, requestUrl, requestHeaders);
+  if (!hasCheck.matched) {
+    return { matched: false };
+  }
+  if (!checkRouteMissingConditions(route.missing, requestUrl, requestHeaders)) {
+    return { matched: false };
+  }
+
+  return {
+    matched: true,
+    regexMatch,
+    conditionCaptures: hasCheck.captures,
+  };
+}
+
+function applyInternalRouteDestination(requestUrl: URL, destination: string): URL {
+  const nextUrl = new URL(requestUrl.toString());
+  const destinationParts = destination.split('?');
+  const destinationPathname = destinationParts[0] || '';
+  const destinationSearch = destinationParts[1];
+  nextUrl.pathname = destinationPathname;
+  if (destinationSearch) {
+    const destinationSearchParams = new URLSearchParams(destinationSearch);
+    for (const [key, value] of destinationSearchParams.entries()) {
+      nextUrl.searchParams.set(key, value);
+    }
+  }
+
+  return nextUrl;
+}
+
+function resolveCaseInsensitiveRoutingFallback(
+  requestUrl: URL,
+  requestHeaders: IncomingHttpHeaders,
+  routingConfig: RuntimeRoutingConfig
+): ResolveRoutesResult | null {
+  const routeGroups: RuntimeRoute[][] = [
+    routingConfig.beforeMiddleware,
+    routingConfig.beforeFiles,
+    routingConfig.afterFiles,
+    routingConfig.fallback,
+  ];
+  const routingHeaders = toRequestHeaders(requestHeaders);
+  const resolvedHeaders = new Headers();
+  let status: number | undefined;
+  let currentUrl = new URL(requestUrl.toString());
+
+  for (const routes of routeGroups) {
+    for (const route of routes) {
+      const routeMatch = matchRoutingRule(route, currentUrl, routingHeaders, true);
+      if (!routeMatch.matched) {
+        continue;
+      }
+
+      if (route.headers) {
+        for (const [headerKey, headerValue] of Object.entries(route.headers)) {
+          const resolvedHeaderKey = replaceRouteDestinationCaptures(
+            headerKey,
+            routeMatch.regexMatch,
+            undefined,
+            routeMatch.conditionCaptures
+          );
+          const resolvedHeaderValue = replaceRouteDestinationCaptures(
+            headerValue,
+            routeMatch.regexMatch,
+            undefined,
+            routeMatch.conditionCaptures
+          );
+          resolvedHeaders.set(resolvedHeaderKey, resolvedHeaderValue);
+        }
+      }
+
+      if (typeof route.status === 'number') {
+        status = route.status;
+      }
+
+      if (!route.destination) {
+        continue;
+      }
+
+      const destination = replaceRouteDestinationCaptures(
+        route.destination,
+        routeMatch.regexMatch,
+        undefined,
+        routeMatch.conditionCaptures
+      );
+      if (isRedirectStatusCode(route.status)) {
+        const redirectUrl = isExternalDestinationUrl(destination)
+          ? new URL(destination)
+          : applyInternalRouteDestination(currentUrl, destination);
+        return {
+          redirect: {
+            url: redirectUrl,
+            status: route.status as number,
+          },
+          resolvedHeaders,
+          ...(typeof status === 'number' ? { status } : {}),
+        };
+      }
+      if (isExternalDestinationUrl(destination)) {
+        return {
+          externalRewrite: new URL(destination),
+          resolvedHeaders,
+          ...(typeof status === 'number' ? { status } : {}),
+        };
+      }
+      currentUrl = applyInternalRouteDestination(currentUrl, destination);
+      if (currentUrl.origin !== requestUrl.origin) {
+        return {
+          externalRewrite: currentUrl,
+          resolvedHeaders,
+          ...(typeof status === 'number' ? { status } : {}),
+        };
+      }
+    }
+  }
+
+  return null;
 }
 
 function pathnameEqualsWithRootAlias(leftPathname: string, rightPathname: string): boolean {
@@ -402,11 +766,45 @@ function pathnameMatchesRoutePathname(
   return Boolean(matcher(candidatePathname));
 }
 
+function getRouteCapturesForPathname(
+  candidatePathname: string,
+  routePathname: string
+): Record<string, string> {
+  if (!isDynamicRoute(routePathname)) {
+    return {};
+  }
+
+  const matcher = getRouteMatcher(
+    getNamedRouteRegex(normalizePathnameForRouteMatching(routePathname), {
+      prefixRouteKeys: false,
+      includeSuffix: true,
+    })
+  ) as RuntimeDynamicRouteMatcher;
+  const matched = matcher(candidatePathname);
+  if (!matched) {
+    return {};
+  }
+
+  const captures: Record<string, string> = {};
+  for (const [key, value] of Object.entries(matched)) {
+    if (typeof value === 'string' && value.length > 0) {
+      captures[key] = value;
+      continue;
+    }
+    if (Array.isArray(value) && value.length > 0) {
+      captures[key] = value.join('/');
+    }
+  }
+
+  return captures;
+}
+
 function applyDestinationQueryFromRoutingRules(
-  requestPathname: string,
+  requestUrl: URL,
   matchedPathname: string,
   query: URLSearchParams,
   routingConfig: RuntimeRoutingConfig | null,
+  requestHeaders: IncomingHttpHeaders,
   routeMatches?: Record<string, string>
 ): URLSearchParams {
   const nextQuery = new URLSearchParams(query);
@@ -420,8 +818,9 @@ function applyDestinationQueryFromRoutingRules(
     routingConfig.afterFiles,
     routingConfig.fallback,
   ];
+  const routingHeaders = toRequestHeaders(requestHeaders);
+  let currentUrl = new URL(requestUrl.toString());
 
-  let currentPathname = requestPathname;
   for (const routes of routeGroups) {
     for (const route of routes) {
       if (!route.destination) {
@@ -431,23 +830,23 @@ function applyDestinationQueryFromRoutingRules(
         continue;
       }
 
-      const sourceRegex = new RegExp(route.sourceRegex);
-      const regexMatch = currentPathname.match(sourceRegex);
-      if (!regexMatch) {
+      const routeMatch = matchRoutingRule(route, currentUrl, routingHeaders);
+      if (!routeMatch.matched) {
         continue;
       }
 
       const destination = replaceRouteDestinationCaptures(
         route.destination,
-        regexMatch,
-        routeMatches
+        routeMatch.regexMatch,
+        routeMatches,
+        routeMatch.conditionCaptures
       );
       if (isExternalDestinationUrl(destination)) {
         continue;
       }
 
       const destinationUrl = new URL(destination, 'http://n');
-      currentPathname = destinationUrl.pathname;
+      currentUrl = applyInternalRouteDestination(currentUrl, destination);
       if (
         !destination.includes('?') ||
         !pathnameMatchesRoutePathname(destinationUrl.pathname, matchedPathname) ||
@@ -470,10 +869,91 @@ function applyDestinationQueryFromRoutingRules(
   return nextQuery;
 }
 
-function extractRewriteSourceParamsFromRoutingRules(
-  requestPathname: string,
+function resolveDestinationPathnameFromRoutingRules(
+  requestUrl: URL,
   matchedPathname: string,
   routingConfig: RuntimeRoutingConfig | null,
+  requestHeaders: IncomingHttpHeaders,
+  routeMatches?: Record<string, string>
+):
+  | {
+      pathname: string;
+      captures: Record<string, string>;
+    }
+  | null {
+  if (!routingConfig) {
+    return null;
+  }
+
+  const routeGroups: RuntimeRoute[][] = [
+    routingConfig.beforeMiddleware,
+    routingConfig.beforeFiles,
+    routingConfig.afterFiles,
+    routingConfig.dynamicRoutes,
+    routingConfig.fallback,
+  ];
+  const routingHeaders = toRequestHeaders(requestHeaders);
+  let currentUrl = new URL(requestUrl.toString());
+
+  for (const routes of routeGroups) {
+    for (const route of routes) {
+      if (!route.destination) {
+        continue;
+      }
+      if (isRedirectStatusCode(route.status)) {
+        continue;
+      }
+
+      const routeMatch = matchRoutingRule(route, currentUrl, routingHeaders);
+      if (!routeMatch.matched) {
+        continue;
+      }
+
+      const destination = replaceRouteDestinationCaptures(
+        route.destination,
+        routeMatch.regexMatch,
+        routeMatches,
+        routeMatch.conditionCaptures
+      );
+      if (isExternalDestinationUrl(destination)) {
+        continue;
+      }
+
+      const destinationUrl = new URL(destination, 'http://n');
+      currentUrl = applyInternalRouteDestination(currentUrl, destination);
+      if (!pathnameMatchesRoutePathname(destinationUrl.pathname, matchedPathname)) {
+        continue;
+      }
+
+      const captures: Record<string, string> = {
+        ...routeMatch.conditionCaptures,
+      };
+      const groups = (
+        routeMatch.regexMatch as RegExpMatchArray & { groups?: Record<string, string | undefined> }
+      ).groups;
+      if (groups) {
+        for (const [key, value] of Object.entries(groups)) {
+          if (typeof value === 'string' && value.length > 0) {
+            captures[key] = value;
+          }
+        }
+      }
+
+      return {
+        pathname: destinationUrl.pathname,
+        captures,
+      };
+    }
+  }
+
+  return null;
+}
+
+function extractRewriteSourceParamsFromRoutingRules(
+  requestUrl: URL,
+  matchedPathname: string,
+  routingConfig: RuntimeRoutingConfig | null,
+  requestHeaders: IncomingHttpHeaders,
   routeMatches?: Record<string, string>
 ): Record<string, string> {
   if (!routingConfig) {
@@ -496,6 +976,7 @@ function extractRewriteSourceParamsFromRoutingRules(
         })
       )
     : null;
+  const routingHeaders = toRequestHeaders(requestHeaders);
 
   const areParamsCompatible = (
     destinationParams: RuntimeRequestMetaParams | undefined
@@ -529,7 +1010,7 @@ function extractRewriteSourceParamsFromRoutingRules(
   };
 
   let firstDynamicParams: Record<string, string> | null = null;
-  let currentPathname = requestPathname;
+  let currentUrl = new URL(requestUrl.toString());
 
   for (const routes of routeGroups) {
     for (const route of routes) {
@@ -540,23 +1021,23 @@ function extractRewriteSourceParamsFromRoutingRules(
         continue;
       }
 
-      const sourceRegex = new RegExp(route.sourceRegex);
-      const regexMatch = currentPathname.match(sourceRegex);
-      if (!regexMatch) {
+      const routeMatch = matchRoutingRule(route, currentUrl, routingHeaders);
+      if (!routeMatch.matched) {
         continue;
       }
 
       const destination = replaceRouteDestinationCaptures(
         route.destination,
-        regexMatch,
-        routeMatches
+        routeMatch.regexMatch,
+        routeMatches,
+        routeMatch.conditionCaptures
       );
       if (isExternalDestinationUrl(destination)) {
         continue;
       }
 
       const destinationUrl = new URL(destination, 'http://n');
-      currentPathname = destinationUrl.pathname;
+      currentUrl = applyInternalRouteDestination(currentUrl, destination);
       if (!pathnameMatchesRoutePathname(destinationUrl.pathname, matchedPathname)) {
         continue;
       }
@@ -571,7 +1052,7 @@ function extractRewriteSourceParamsFromRoutingRules(
 
       const sourceParams: Record<string, string> = {};
       const groups = (
-        regexMatch as RegExpMatchArray & { groups?: Record<string, string | undefined> }
+        routeMatch.regexMatch as RegExpMatchArray & { groups?: Record<string, string | undefined> }
       ).groups;
       if (groups) {
         for (const [key, value] of Object.entries(groups)) {
@@ -600,7 +1081,8 @@ function extractRewriteSourceParamsFromRoutingRules(
 function getNextDataNormalizedPathname(
   requestPathname: string,
   buildId: string,
-  basePath: string
+  basePath: string,
+  decodeSquareBrackets: boolean = true
 ): string | null {
   if (!buildId) {
     return null;
@@ -616,16 +1098,34 @@ function getNextDataNormalizedPathname(
     return null;
   }
   normalizedPath = normalizedPath.slice(0, -'.json'.length);
-  // Preserve encoded slashes (%2F) for dynamic segment matching, but decode
-  // encoded square brackets so static paths like /dynamic/[first] match.
-  normalizedPath = normalizedPath
-    .replace(/%5B/gi, '[')
-    .replace(/%5D/gi, ']');
+  if (decodeSquareBrackets) {
+    // Preserve encoded slashes (%2F) for dynamic segment matching, but decode
+    // encoded square brackets so static paths like /dynamic/[first] match.
+    normalizedPath = normalizedPath
+      .replace(/%5B/gi, '[')
+      .replace(/%5D/gi, ']');
+  }
   return `${basePath}${basePath ? '/' : '/'}${normalizedPath}`;
+}
+
+function toNextDataPathname(
+  pathname: string,
+  buildId: string,
+  basePath: string
+): string | null {
+  if (!buildId) {
+    return null;
+  }
+
+  const withoutBasePath = getPathnameWithoutBasePath(pathname, basePath);
+  const normalizedPathname = removePathnameTrailingSlash(withoutBasePath);
+  const dataRoutePathname = normalizedPathname === '/' ? '/index' : normalizedPathname;
+  return `${basePath}/_next/data/${buildId}${dataRoutePathname}.json`;
 }
 
 const ENABLE_DEBUG_ROUTING = process.env.ADAPTER_BUN_DEBUG_ROUTING === '1';
 const ENABLE_DEBUG_CONNECTIONS = process.env.ADAPTER_BUN_DEBUG_CONNECTIONS === '1';
+const ENABLE_DEBUG_TIMERS = process.env.ADAPTER_BUN_DEBUG_TIMERS === '1';
 let nextDebugSocketId = 1;
 const debugSocketIds = new WeakMap<IncomingMessage['socket'], number>();
 
@@ -833,7 +1333,42 @@ function patchCacheControlHeader(req: IncomingMessage, res: ServerResponse): voi
   };
 }
 
-function patchRscContentTypeHeader(res: ServerResponse): void {
+function patchResponseAppendHeader(res: ServerResponse): void {
+  if (typeof res.appendHeader !== 'function') {
+    return;
+  }
+
+  const originalAppendHeader = res.appendHeader.bind(res) as (
+    ...args: unknown[]
+  ) => ServerResponse;
+  const mutableRes = res as unknown as {
+    appendHeader: (...args: unknown[]) => ServerResponse;
+  };
+  mutableRes.appendHeader = (name: unknown, value: unknown) => {
+    if (typeof name !== 'string' || typeof value !== 'string') {
+      return originalAppendHeader(name as string, value as never);
+    }
+
+    const existingValue = res.getHeader(name);
+    const existingValues =
+      existingValue === undefined
+        ? []
+        : Array.isArray(existingValue)
+          ? existingValue.map((item) => String(item))
+          : [String(existingValue)];
+
+    if (!existingValues.includes(value)) {
+      res.setHeader(name, [...existingValues, value]);
+    }
+
+    return res;
+  };
+}
+
+function patchRscContentTypeHeader(
+  res: ServerResponse,
+  shouldRewrite: () => boolean = () => true
+): void {
   const mutableRes = res as unknown as {
     setHeader: (...args: unknown[]) => ServerResponse;
     writeHead: (...args: unknown[]) => ServerResponse;
@@ -841,6 +1376,9 @@ function patchRscContentTypeHeader(res: ServerResponse): void {
   };
 
   const normalizeContentTypeValue = (value: unknown): unknown => {
+    if (!shouldRewrite()) {
+      return value;
+    }
     const raw = Array.isArray(value) ? value[0] : value;
     if (typeof raw !== 'string') {
       return value;
@@ -926,6 +1464,51 @@ function patchRscContentTypeHeader(res: ServerResponse): void {
   };
 }
 
+function getNormalizedHostHeader(
+  value: string | string[] | undefined
+): string | undefined {
+  const host = Array.isArray(value) ? value[0] : value;
+  if (!host || typeof host !== 'string') {
+    return undefined;
+  }
+  const normalizedHost = host.split(',')[0]?.trim();
+  return normalizedHost && normalizedHost.length > 0 ? normalizedHost : undefined;
+}
+
+function applyHostHeaderToUrl(url: URL, hostHeader: string | string[] | undefined): URL {
+  const normalizedHost = getNormalizedHostHeader(hostHeader);
+  if (!normalizedHost) {
+    return url;
+  }
+
+  try {
+    const nextUrl = new URL(url.toString());
+    nextUrl.host = normalizedHost;
+    return nextUrl;
+  } catch {
+    return url;
+  }
+}
+
+function ensureForwardedRequestHeaders(
+  req: IncomingMessage,
+  requestUrl: URL
+): void {
+  const normalizedHost = getNormalizedHostHeader(req.headers.host);
+  const effectiveHost = normalizedHost ?? requestUrl.host;
+  if (effectiveHost && effectiveHost.length > 0) {
+    req.headers.host = effectiveHost;
+    req.headers['x-forwarded-host'] = effectiveHost;
+  }
+
+  const forwardedProto = requestUrl.protocol.replace(/:$/, '') || 'http';
+  req.headers['x-forwarded-proto'] = forwardedProto;
+
+  const forwardedPort =
+    requestUrl.port || (forwardedProto === 'https' ? '443' : '80');
+  req.headers['x-forwarded-port'] = forwardedPort;
+}
+
 async function waitForResponseFinish(
   res: ServerResponse,
   timeoutMs: number = 10_000
@@ -964,6 +1547,15 @@ function canRequestHaveBody(method: string | undefined): boolean {
 
 function installReplayStream(req: IncomingMessage, body: Uint8Array): void {
   const replayStream = Readable.from(body);
+  // Preserve request metadata for consumers (for example `request` package)
+  // that infer outbound method/headers from the stream source during `pipe()`.
+  (replayStream as Readable & {
+    method?: string;
+    headers?: IncomingHttpHeaders;
+    url?: string;
+  }).method = req.method;
+  (replayStream as Readable & { headers?: IncomingHttpHeaders }).headers = req.headers;
+  (replayStream as Readable & { url?: string }).url = req.url;
   const mutableReq = req as any;
   const originalOn = req.on.bind(req);
   const originalOnce = req.once.bind(req);
@@ -1170,6 +1762,33 @@ function mergeVaryHeaderValues(
 
 function removePathnameTrailingSlash(pathname: string): string {
   return pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+}
+
+function shouldPreservePathnameWithoutTrailingSlash(pathname: string): boolean {
+  const lastSegment = pathname.split('/').pop() ?? '';
+  return lastSegment.includes('.');
+}
+
+function applyConfiguredTrailingSlash(pathname: string): string {
+  if (!trailingSlash || pathname === '/' || pathname.endsWith('/')) {
+    return pathname;
+  }
+  if (shouldPreservePathnameWithoutTrailingSlash(pathname)) {
+    return pathname;
+  }
+  return `${pathname}/`;
+}
+
+function resolveTrailingSlashPathnameFallback(
+  pathname: string,
+  pathnames: Set<string>
+): string | null {
+  if (!pathname.endsWith('/') || pathname === '/') {
+    return null;
+  }
+
+  const withoutTrailingSlash = removePathnameTrailingSlash(pathname);
+  return pathnames.has(withoutTrailingSlash) ? withoutTrailingSlash : null;
 }
 
 function toRoutingRouteHas(value: RuntimeRouteHas): RouteHas {
@@ -1442,6 +2061,37 @@ function findMiddlewareManifestEntry(
   return null;
 }
 
+function findFunctionsConfigManifestEntry(
+  manifestValue: RuntimeFunctionsConfigManifest | null,
+  middleware: RuntimeFunctionOutput
+): RuntimeFunctionsConfigManifestEntry | null {
+  if (!manifestValue?.functions) {
+    return null;
+  }
+
+  const directCandidates = [
+    manifestValue.functions[middleware.sourcePage],
+    manifestValue.functions[middleware.pathname],
+    manifestValue.functions[middleware.id],
+    manifestValue.functions['/_middleware'],
+    manifestValue.functions['/'],
+  ];
+  for (const candidate of directCandidates) {
+    if (candidate?.matchers && candidate.matchers.length > 0) {
+      return candidate;
+    }
+  }
+
+  for (const candidate of Object.values(manifestValue.functions)) {
+    if (!candidate?.matchers || candidate.matchers.length === 0) {
+      continue;
+    }
+    return candidate;
+  }
+
+  return null;
+}
+
 async function loadMiddlewareMatcher(
   distDir: string | undefined,
   middleware: RuntimeFunctionOutput | null
@@ -1455,28 +2105,58 @@ async function loadMiddlewareMatcher(
 
   const middlewareManifestPath = path.join(distDir, 'server', 'middleware-manifest.json');
   const middlewareManifestFile = Bun.file(middlewareManifestPath);
-  if (!(await middlewareManifestFile.exists())) {
+  if (await middlewareManifestFile.exists()) {
+    let middlewareManifestValue: RuntimeMiddlewareManifest | null = null;
+    try {
+      middlewareManifestValue =
+        (await middlewareManifestFile.json()) as RuntimeMiddlewareManifest;
+    } catch {
+      middlewareManifestValue = null;
+    }
+
+    const middlewareManifestEntry = findMiddlewareManifestEntry(
+      middlewareManifestValue,
+      middleware
+    );
+    if (middlewareManifestEntry?.matchers && middlewareManifestEntry.matchers.length > 0) {
+      return getMiddlewareRouteMatcher(
+        middlewareManifestEntry.matchers as Parameters<typeof getMiddlewareRouteMatcher>[0]
+      ) as (
+        pathname: string,
+        req: { headers: IncomingHttpHeaders },
+        query: Record<string, string | string[]>
+      ) => boolean;
+    }
+  }
+
+  const functionsConfigManifestPath = path.join(
+    distDir,
+    'server',
+    'functions-config-manifest.json'
+  );
+  const functionsConfigManifestFile = Bun.file(functionsConfigManifestPath);
+  if (!(await functionsConfigManifestFile.exists())) {
     return null;
   }
 
-  let middlewareManifestValue: RuntimeMiddlewareManifest | null = null;
+  let functionsConfigManifestValue: RuntimeFunctionsConfigManifest | null = null;
   try {
-    middlewareManifestValue =
-      (await middlewareManifestFile.json()) as RuntimeMiddlewareManifest;
+    functionsConfigManifestValue =
+      (await functionsConfigManifestFile.json()) as RuntimeFunctionsConfigManifest;
   } catch {
     return null;
   }
 
-  const middlewareManifestEntry = findMiddlewareManifestEntry(
-    middlewareManifestValue,
+  const functionsConfigManifestEntry = findFunctionsConfigManifestEntry(
+    functionsConfigManifestValue,
     middleware
   );
-  if (!middlewareManifestEntry?.matchers || middlewareManifestEntry.matchers.length === 0) {
+  if (!functionsConfigManifestEntry?.matchers || functionsConfigManifestEntry.matchers.length === 0) {
     return null;
   }
 
   return getMiddlewareRouteMatcher(
-    middlewareManifestEntry.matchers as Parameters<typeof getMiddlewareRouteMatcher>[0]
+    functionsConfigManifestEntry.matchers as Parameters<typeof getMiddlewareRouteMatcher>[0]
   ) as (
     pathname: string,
     req: { headers: IncomingHttpHeaders },
@@ -1519,6 +2199,14 @@ async function writeFetchResponse(
   res.end();
 }
 
+function isStaticMetadataTextAssetPathname(pathname: string): boolean {
+  return (
+    pathname.endsWith('/robots.txt') ||
+    pathname.endsWith('/manifest.webmanifest') ||
+    pathname.endsWith('/sitemap.xml')
+  );
+}
+
 async function serveStaticAsset(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1544,6 +2232,8 @@ async function serveStaticAsset(
 
   if (asset.cacheControl) {
     res.setHeader('cache-control', asset.cacheControl);
+  } else if (isStaticMetadataTextAssetPathname(asset.pathname)) {
+    res.setHeader('cache-control', 'public, max-age=0, must-revalidate');
   }
 
   res.setHeader('content-length', String(body.byteLength));
@@ -1615,6 +2305,59 @@ function decodeRouteMatchValue(value: string): string {
   } catch {
     return value;
   }
+}
+
+function isSyntheticRouteMatchPlaceholder(value: string): boolean {
+  if (value.startsWith('$nxtP') || value.startsWith('%24nxtP')) {
+    return true;
+  }
+  return decodeRouteMatchValue(value).startsWith('$nxtP');
+}
+
+function resolveRouteMatchPlaceholderValue(
+  value: string,
+  captures: Record<string, string>
+): string {
+  const decodedValue = decodeRouteMatchValue(value);
+  const placeholderMatch = decodedValue.match(/^\$([a-zA-Z][a-zA-Z0-9_]*)$/);
+  if (!placeholderMatch) {
+    return value;
+  }
+
+  const captureKey = placeholderMatch[1];
+  if (!captureKey) {
+    return value;
+  }
+  const normalizedCaptureKey = normalizeNextQueryParam(captureKey) ?? captureKey;
+  const resolvedValue = captures[captureKey] ?? captures[normalizedCaptureKey];
+  return typeof resolvedValue === 'string' && resolvedValue.length > 0
+    ? resolvedValue
+    : value;
+}
+
+function resolveRouteMatchPlaceholders(
+  routeMatches: Record<string, string> | undefined,
+  captures: Record<string, string>
+): Record<string, string> | undefined {
+  if (!routeMatches || Object.keys(captures).length === 0) {
+    return routeMatches;
+  }
+
+  let didUpdate = false;
+  const resolvedMatches: Record<string, string> = {};
+  for (const [key, value] of Object.entries(routeMatches)) {
+    if (typeof value !== 'string') {
+      resolvedMatches[key] = value;
+      continue;
+    }
+    const resolvedValue = resolveRouteMatchPlaceholderValue(value, captures);
+    if (resolvedValue !== value) {
+      didUpdate = true;
+    }
+    resolvedMatches[key] = resolvedValue;
+  }
+
+  return didUpdate ? resolvedMatches : routeMatches;
 }
 
 type DynamicRouteParamKind = 'single' | 'catchall' | 'optional-catchall';
@@ -1755,6 +2498,53 @@ function mergeDecodedParamsIntoQuery(
   return query;
 }
 
+function removeSyntheticRoutePlaceholderQueryValues(
+  query: RuntimeRequestMetaQuery
+): RuntimeRequestMetaQuery {
+  const stripInternalParamQueryKeys =
+    process.env.ADAPTER_BUN_STRIP_INTERNAL_PARAM_QUERY === '1';
+  for (const [key, value] of Object.entries(query)) {
+    if (stripInternalParamQueryKeys && normalizeNextQueryParam(key)) {
+      delete query[key];
+      continue;
+    }
+
+    if (typeof value === 'string') {
+      if (isSyntheticRouteMatchPlaceholder(value)) {
+        delete query[key];
+      }
+      continue;
+    }
+    if (!Array.isArray(value)) {
+      continue;
+    }
+
+    const filteredValues = value.filter(
+      (entry) => !isSyntheticRouteMatchPlaceholder(entry)
+    );
+    if (filteredValues.length === 0) {
+      delete query[key];
+    } else if (filteredValues.length === 1) {
+      query[key] = filteredValues[0];
+    } else if (filteredValues.length !== value.length) {
+      query[key] = filteredValues;
+    }
+  }
+
+  return query;
+}
+
+function removeInternalRouteParamQueryValues(
+  query: RuntimeRequestMetaQuery
+): RuntimeRequestMetaQuery {
+  for (const key of Object.keys(query)) {
+    if (normalizeNextQueryParam(key)) {
+      delete query[key];
+    }
+  }
+  return query;
+}
+
 function getDynamicRouteParamKindsForPathname(
   pathname: string | undefined
 ): Map<string, DynamicRouteParamKind> | null {
@@ -1793,6 +2583,7 @@ function mergeRouteMatchesIntoQuery(
     if (
       !normalizedKey ||
       typeof value !== 'string' ||
+      isSyntheticRouteMatchPlaceholder(value) ||
       !dynamicParamKinds.has(normalizedKey)
     ) {
       continue;
@@ -1871,7 +2662,31 @@ function shouldMergeRouteMatchesIntoRequestQuery(
   return true;
 }
 
+function isAppFunctionOutput(output: RuntimeFunctionOutput | undefined): boolean {
+  if (!output) {
+    return false;
+  }
+
+  const normalizedFilePath = output.filePath.replace(/\\/g, '/');
+  if (normalizedFilePath.includes('/server/app/')) {
+    return true;
+  }
+  if (normalizedFilePath.includes('/server/pages/')) {
+    return false;
+  }
+
+  if (output.sourcePage.endsWith('/page')) {
+    return true;
+  }
+  if (output.sourcePage.endsWith('/route') && !output.sourcePage.startsWith('/api/')) {
+    return true;
+  }
+
+  return false;
+}
+
 function toRequestMeta({
+  requestUrl,
   matchedPathname,
   requestPathname,
   invokeOutput,
@@ -1879,7 +2694,10 @@ function toRequestMeta({
   query,
   params,
   revalidate,
+  fallbackParams,
+  renderFallbackShell,
 }: {
+  requestUrl: URL;
   matchedPathname: string;
   requestPathname: string;
   invokeOutput: string;
@@ -1887,12 +2705,20 @@ function toRequestMeta({
   query: RuntimeRequestMetaQuery;
   params?: RuntimeRequestMetaParams;
   revalidate?: RuntimeInternalRevalidate;
+  fallbackParams?: RuntimeFallbackParams;
+  renderFallbackShell?: boolean;
 }): RuntimeRequestMeta {
+  const forceMatchedInvokePath =
+    process.env.ADAPTER_BUN_FORCE_MATCHED_INVOKE_PATH === '1' &&
+    isDynamicRoute(matchedPathname);
   const useMatchedPathAsInvokePath =
-    matchedPathname !== requestPathname &&
-    matchedPathname.includes('(.') &&
-    !isDynamicRoute(matchedPathname);
+    forceMatchedInvokePath ||
+    (matchedPathname !== requestPathname &&
+      matchedPathname.includes('(.') &&
+      !isDynamicRoute(matchedPathname));
   const meta: RuntimeRequestMeta = {
+    initURL: requestUrl.toString(),
+    initProtocol: requestUrl.protocol.replace(/:$/, '') || 'http',
     // Static interception routes need the internal matched pathname (for
     // example `/(.)simple-page`) so Next renders the intercepted tree instead
     // of fast-pathing to the non-interception route.
@@ -1902,6 +2728,8 @@ function toRequestMeta({
     middlewareInvoke: false,
     query,
     ...(revalidate ? { revalidate } : {}),
+    ...(fallbackParams ? { fallbackParams } : {}),
+    ...(renderFallbackShell ? { renderFallbackShell } : {}),
   };
 
   if (typeof routeStatus === 'number') {
@@ -1922,6 +2750,28 @@ function toRequestMeta({
   }
 
   return meta;
+}
+
+function toRouteMatchesHeaderValue(
+  routeMatches: Record<string, string> | undefined
+): string | undefined {
+  if (!routeMatches) {
+    return undefined;
+  }
+
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(routeMatches)) {
+    if (typeof value !== 'string' || value.length === 0) {
+      continue;
+    }
+    if (!key.startsWith('nxtP') && !key.startsWith('nxtI')) {
+      continue;
+    }
+    params.set(key, value);
+  }
+
+  const serialized = params.toString();
+  return serialized.length > 0 ? serialized : undefined;
 }
 
 function applyRscRequestMeta(
@@ -1969,11 +2819,59 @@ function applyRscRequestMeta(
   return meta;
 }
 
+async function loadPrerenderDynamicRoutes(
+  distDir: string | undefined
+): Promise<Map<string, RuntimePrerenderManifestDynamicRoute>> {
+  const dynamicRoutes = new Map<string, RuntimePrerenderManifestDynamicRoute>();
+  if (!distDir) {
+    return dynamicRoutes;
+  }
+
+  const prerenderManifestPath = path.join(distDir, 'prerender-manifest.json');
+  const prerenderManifestFile = Bun.file(prerenderManifestPath);
+  if (!(await prerenderManifestFile.exists())) {
+    return dynamicRoutes;
+  }
+
+  try {
+    const prerenderManifestValue =
+      (await prerenderManifestFile.json()) as RuntimePrerenderManifest;
+    if (!isRecord(prerenderManifestValue.dynamicRoutes)) {
+      return dynamicRoutes;
+    }
+    for (const [pathname, routeValue] of Object.entries(
+      prerenderManifestValue.dynamicRoutes
+    )) {
+      if (!isRecord(routeValue)) {
+        continue;
+      }
+      dynamicRoutes.set(pathname, routeValue as RuntimePrerenderManifestDynamicRoute);
+    }
+  } catch {
+    return dynamicRoutes;
+  }
+
+  return dynamicRoutes;
+}
+
 const adapterDir = import.meta.dirname;
 const manifestPath = path.join(adapterDir, 'deployment-manifest.json');
 const manifest = (await Bun.file(manifestPath).json()) as DeploymentManifest;
 const buildId = typeof manifest.build?.buildId === 'string' ? manifest.build.buildId : '';
 const basePath = typeof manifest.build?.basePath === 'string' ? manifest.build.basePath : '';
+const trailingSlash = Boolean(manifest.build?.trailingSlash);
+const manifestDistDir =
+  typeof manifest.build?.distDir === 'string' ? manifest.build.distDir : undefined;
+const runtimeNextConfigPath = path.join(adapterDir, 'runtime-next-config.json');
+let runtimeNextConfig: RuntimeNextConfig = {};
+try {
+  const runtimeNextConfigValue = (await Bun.file(runtimeNextConfigPath).json()) as unknown;
+  if (isRecord(runtimeNextConfigValue)) {
+    runtimeNextConfig = runtimeNextConfigValue as RuntimeNextConfig;
+  }
+} catch {
+  runtimeNextConfig = {};
+}
 
 // NEXT_ADAPTER_PATH is required at build-time to activate adapter hooks, but
 // keeping it at runtime changes Next.js request handling branches in ways that
@@ -2056,10 +2954,11 @@ const runtimeRouting = runtimeRoutingConfig ? toRoutingRoutes(runtimeRoutingConf
 const runtimeI18n = toRoutingI18n(runtimeRoutingConfig?.i18n);
 const runtimeMiddleware = manifest.runtime?.middleware ?? null;
 const runtimeMiddlewareMatcher = await loadMiddlewareMatcher(
-  typeof manifest.build?.distDir === 'string' ? manifest.build.distDir : undefined,
+  manifestDistDir,
   runtimeMiddleware
 );
 const runtimeFunctionOutputs = manifest.runtime?.functions ?? [];
+const prerenderDynamicRoutes = await loadPrerenderDynamicRoutes(manifestDistDir);
 
 if (ENABLE_DEBUG_ROUTING) {
   debugRoutingLog(
@@ -2089,6 +2988,81 @@ for (const pathname of dynamicFunctionOutputPathnames) {
     pathname,
     getRouteMatcher(routeRegex) as RuntimeDynamicRouteMatcher
   );
+}
+
+function getFallbackParamsForOutput(
+  output: RuntimeFunctionOutput | undefined
+): RuntimeFallbackParams | undefined {
+  if (process.env.ADAPTER_BUN_DISABLE_FALLBACK_PARAMS === '1') {
+    return undefined;
+  }
+  if (!output) {
+    return undefined;
+  }
+
+  const routePathname = output.pathname.endsWith('.rsc')
+    ? output.pathname.slice(0, -'.rsc'.length)
+    : output.pathname;
+  const prerenderDynamicRoute = prerenderDynamicRoutes.get(routePathname);
+  if (!prerenderDynamicRoute) {
+    return undefined;
+  }
+
+  if (
+    prerenderDynamicRoute.fallback === undefined ||
+    prerenderDynamicRoute.fallback === null ||
+    prerenderDynamicRoute.fallback === false
+  ) {
+    return undefined;
+  }
+
+  if (
+    !Array.isArray(prerenderDynamicRoute.fallbackRouteParams) ||
+    prerenderDynamicRoute.fallbackRouteParams.length === 0
+  ) {
+    return undefined;
+  }
+
+  if (ENABLE_DEBUG_ROUTING && routePathname.includes('/with-fallback-params/')) {
+    debugRoutingLog(
+      'fallback-params-source',
+      routePathname,
+      JSON.stringify(prerenderDynamicRoute.fallbackRouteParams)
+    );
+  }
+
+  return (
+    createOpaqueFallbackRouteParams(
+      prerenderDynamicRoute.fallbackRouteParams as Parameters<
+        typeof createOpaqueFallbackRouteParams
+      >[0]
+    ) ?? undefined
+  );
+}
+
+function toInvokeOutputPathname(output: RuntimeFunctionOutput | undefined): string {
+  if (!output) {
+    return '';
+  }
+  const pathname = output.pathname.endsWith('.rsc')
+    ? output.pathname.slice(0, -'.rsc'.length)
+    : output.pathname;
+
+  if (pathname === '/index') {
+    return '/';
+  }
+  if (pathname.endsWith('/index')) {
+    const withoutIndex = pathname.slice(0, -'/index'.length);
+    return withoutIndex.length > 0 ? withoutIndex : '/';
+  }
+
+  return pathname;
+}
+
+function toMatcherPathname(pathname: string): string {
+  return pathname.endsWith('.rsc')
+    ? pathname.slice(0, -'.rsc'.length)
+    : pathname;
 }
 
 function toRequestMetaParamsFromMatcher(
@@ -2127,7 +3101,11 @@ function toRequestMetaParamsFromRouteMatches(
   const params: RuntimeRequestMetaParams = {};
   for (const [key, value] of Object.entries(routeMatches)) {
     const normalizedKey = normalizeRouteMatchKey(key);
-    if (!normalizedKey || typeof value !== 'string') {
+    if (
+      !normalizedKey ||
+      typeof value !== 'string' ||
+      isSyntheticRouteMatchPlaceholder(value)
+    ) {
       continue;
     }
     params[normalizedKey] = dynamicParamKinds
@@ -2330,13 +3308,24 @@ function getRoutingPathnameCandidates(pathnames: string[]): string[] {
   for (const pathname of pathnames) {
     addManifestPathnameCandidates(candidates, pathname);
   }
-  return Array.from(candidates);
+  const candidateList = Array.from(candidates);
+  try {
+    return getSortedRoutes(candidateList);
+  } catch {
+    return candidateList;
+  }
 }
 
 const routingPathnames = getRoutingPathnameCandidates([
   ...manifest.pathnames,
+  ...manifest.staticAssets.map((asset) => asset.pathname),
   ...runtimeFunctionOutputs.map((output) => output.pathname),
 ]);
+const routingPathnameSet = new Set(routingPathnames);
+
+function isNextInternalPathname(pathname: string): boolean {
+  return pathname === '/_next' || pathname.startsWith('/_next/');
+}
 
 function getFunctionOutputByPathname(pathname: string): RuntimeFunctionOutput | undefined {
   const candidates = new Set<string>();
@@ -2395,7 +3384,10 @@ function resolveFunctionOutput(
     getFunctionOutputByPathname(preferredMatchedPathname) ??
     getFunctionOutputByPathname(matchedPathname);
   if (exactOutput) {
-    const exactMatcher = dynamicFunctionMatchers.get(exactOutput.pathname);
+    const exactOutputMatcherPathname = toMatcherPathname(exactOutput.pathname);
+    const exactMatcher =
+      dynamicFunctionMatchers.get(exactOutputMatcherPathname) ??
+      dynamicFunctionMatchers.get(exactOutput.pathname);
     if (!exactMatcher) {
       return { output: preferRscFunctionOutput(exactOutput, preferRscOutput) };
     }
@@ -2406,7 +3398,7 @@ function resolveFunctionOutput(
       toRequestMetaParamsFromMatcher(exactMatcher(requestPathname));
     const routeMatchedParams = toRequestMetaParamsFromRouteMatches(
       routeMatches,
-      exactOutput.pathname
+      exactOutputMatcherPathname
     );
     const filteredRouteMatchedParams = routeMatchedParams
       ? filterRouteParamsForDynamicPathname(routeMatchedParams, exactOutput.pathname)
@@ -2434,21 +3426,47 @@ function resolveFunctionOutput(
     return { output: preferRscFunctionOutput(exactOutput, preferRscOutput) };
   }
 
-  if (filteredMatchedPathParams && isDynamicRoute(matchedPathname)) {
-    const concreteMatchedPathname = resolveDynamicPathnameWithParams(
-      matchedPathname,
-      filteredMatchedPathParams
-    );
-    if (concreteMatchedPathname) {
-      const concreteOutput = getFunctionOutputByPathname(
-        withOptionalSuffix(concreteMatchedPathname, rscSuffix)
-      ) ?? getFunctionOutputByPathname(concreteMatchedPathname);
-      if (concreteOutput && !isDynamicRoute(concreteOutput.pathname)) {
-        return {
-          output: preferRscFunctionOutput(concreteOutput, preferRscOutput),
-        };
+  if (isDynamicRoute(matchedPathname)) {
+    if (filteredMatchedPathParams) {
+      const concreteMatchedPathname = resolveDynamicPathnameWithParams(
+        matchedPathname,
+        filteredMatchedPathParams
+      );
+      if (concreteMatchedPathname) {
+        const concreteOutput = getFunctionOutputByPathname(
+          withOptionalSuffix(concreteMatchedPathname, rscSuffix)
+        ) ?? getFunctionOutputByPathname(concreteMatchedPathname);
+        if (concreteOutput && !isDynamicRoute(concreteOutput.pathname)) {
+          return {
+            output: preferRscFunctionOutput(concreteOutput, preferRscOutput),
+          };
+        }
       }
     }
+    const requestContainsLiteralBrackets =
+      requestPathname.includes('[') ||
+      requestPathname.includes(']') ||
+      /%5B|%5D/i.test(requestPathname);
+    if (requestContainsLiteralBrackets) {
+      // Requests like "/dynamic/[first]" can be routed to a concrete
+      // prerender pathname with no direct function output. Fall through so the
+      // dynamic matcher set can resolve the canonical handler (e.g. [slug]).
+    } else {
+      // When routing already selected a dynamic pathname but there is no
+      // corresponding runtime function output, treat it as non-function (for
+      // example pages-router dynamic routes served from static assets) instead
+      // of falling through to unrelated dynamic handlers.
+      return null;
+    }
+  }
+
+  const matchedWithoutBasePath = getPathnameWithoutBasePath(matchedPathname, basePath);
+  const requestWithoutBasePath = getPathnameWithoutBasePath(requestPathname, basePath);
+  if (
+    isNextInternalPathname(removePathnameTrailingSlash(matchedWithoutBasePath)) ||
+    isNextInternalPathname(removePathnameTrailingSlash(requestWithoutBasePath))
+  ) {
+    return null;
   }
 
   const candidatePathnames = new Set<string>();
@@ -2659,6 +3677,460 @@ const nodeMiddlewareHandlerCache = new Map<string, EdgeRouteHandler>();
 const nodeMiddlewareHandlerLoadPromises = new Map<string, Promise<EdgeRouteHandler>>();
 const edgeHandlerCache = new Map<string, EdgeRouteHandler>();
 const edgeChunkLoadPromises = new Map<string, Promise<void>>();
+type RuntimeImageOptimizerModule = typeof import('next/dist/server/image-optimizer.js');
+type RuntimeServeStaticModule = typeof import('next/dist/server/serve-static.js');
+type RuntimeCreateAtomicTimerGroup = (
+  delayMs?: number
+) => (callback: () => void) => ReturnType<typeof setTimeout>;
+
+let runtimeImageOptimizerModule: RuntimeImageOptimizerModule | null = null;
+let runtimeServeStaticModule: RuntimeServeStaticModule | null = null;
+
+function patchNextAtomicTimerGroupForBun(): void {
+  if (process.env.ADAPTER_BUN_DISABLE_ATOMIC_TIMER_PATCH === '1') {
+    if (ENABLE_DEBUG_TIMERS) {
+      console.log('[adapter-bun][timers] skip createAtomicTimerGroup patch: disabled');
+    }
+    return;
+  }
+  if (typeof process.versions?.bun !== 'string') {
+    if (ENABLE_DEBUG_TIMERS) {
+      console.log('[adapter-bun][timers] skip createAtomicTimerGroup patch: not bun');
+    }
+    return;
+  }
+
+  try {
+    const schedulingModule = require(
+      'next/dist/server/app-render/app-render-scheduling.js'
+    ) as {
+      createAtomicTimerGroup?: RuntimeCreateAtomicTimerGroup & {
+        __adapterBunPatched?: boolean;
+      };
+    };
+    const currentFactory = schedulingModule.createAtomicTimerGroup;
+    if (typeof currentFactory !== 'function' || currentFactory.__adapterBunPatched) {
+      if (ENABLE_DEBUG_TIMERS) {
+        console.log(
+          '[adapter-bun][timers] skip createAtomicTimerGroup patch: missing or already patched'
+        );
+      }
+      return;
+    }
+
+    const patchedFactory = ((delayMs = 0) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const queue: Array<() => void> = [];
+
+      return (callback: () => void) => {
+        queue.push(callback);
+        if (!timer) {
+          timer = setTimeout(() => {
+            const callbacks = queue.splice(0, queue.length);
+            timer = null;
+            for (const run of callbacks) {
+              run();
+            }
+          }, delayMs);
+        }
+        return timer;
+      };
+    }) as RuntimeCreateAtomicTimerGroup & { __adapterBunPatched?: boolean };
+
+    patchedFactory.__adapterBunPatched = true;
+    schedulingModule.createAtomicTimerGroup = patchedFactory;
+    if (ENABLE_DEBUG_TIMERS) {
+      console.log('[adapter-bun][timers] patched createAtomicTimerGroup export');
+    }
+  } catch (error) {
+    if (ENABLE_DEBUG_TIMERS) {
+      console.log(
+        '[adapter-bun][timers] failed createAtomicTimerGroup patch',
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+    // Ignore and continue with Next's default scheduling behavior.
+  }
+}
+
+patchNextAtomicTimerGroupForBun();
+
+function patchSetTimeoutForBunAtomicGroups(): void {
+  if (process.env.ADAPTER_BUN_DISABLE_ATOMIC_TIMER_PATCH === '1') {
+    if (ENABLE_DEBUG_TIMERS) {
+      console.log('[adapter-bun][timers] skip setTimeout atomic patch: disabled');
+    }
+    return;
+  }
+  if (typeof process.versions?.bun !== 'string') {
+    if (ENABLE_DEBUG_TIMERS) {
+      console.log('[adapter-bun][timers] skip setTimeout atomic patch: not bun');
+    }
+    return;
+  }
+
+  const currentSetTimeout = globalThis.setTimeout as typeof setTimeout & {
+    __adapterBunPatched?: boolean;
+  };
+  if (currentSetTimeout.__adapterBunPatched) {
+    if (ENABLE_DEBUG_TIMERS) {
+      console.log('[adapter-bun][timers] skip setTimeout atomic patch: already patched');
+    }
+    return;
+  }
+
+  const originalSetTimeout = currentSetTimeout.bind(globalThis);
+  const isAtomicTimerGroupHandler = (
+    handler: ((...cbArgs: unknown[]) => void) | string,
+    stack: string
+  ): boolean => {
+    if (typeof handler !== 'function') {
+      return false;
+    }
+
+    const handlerName = handler.name || '';
+    if (
+      handlerName.includes('runFirstCallback') ||
+      handlerName.includes('runSubsequentCallback')
+    ) {
+      return true;
+    }
+
+    if (stack.includes('app-render-scheduling')) {
+      return true;
+    }
+
+    try {
+      const source = Function.prototype.toString.call(handler);
+      return source.includes('didFirstTimerRun') || source.includes('didImmediateRun');
+    } catch {
+      return false;
+    }
+  };
+
+  const ensureIdleStart = (timer: ReturnType<typeof setTimeout>) => {
+    if (timer && typeof timer === 'object') {
+      const existingIdleStart = (timer as { _idleStart?: unknown })._idleStart;
+      if (typeof existingIdleStart !== 'number') {
+        try {
+          Object.defineProperty(timer, '_idleStart', {
+            configurable: true,
+            enumerable: false,
+            writable: true,
+            value: Date.now(),
+          });
+        } catch {
+          // Ignore environments where timer handles are non-extensible.
+        }
+      }
+    }
+    return timer;
+  };
+  let pendingAtomicBatch:
+    | {
+        timer: ReturnType<typeof setTimeout>;
+        callbacks: Array<() => void>;
+      }
+    | null = null;
+  let debugLoggedAtomicIntercept = false;
+  let debugLoggedShortTimeouts = 0;
+  const batchAllShortTimeouts = process.env.ADAPTER_BUN_BATCH_ALL_SHORT_TIMEOUTS === '1';
+
+  const wrappedSetTimeout = ((
+    handler: ((...cbArgs: unknown[]) => void) | string,
+    timeout?: number,
+    ...args: unknown[]
+  ) => {
+    const delayMs = typeof timeout === 'number' ? timeout : Number(timeout ?? 0);
+    if (typeof handler === 'function' && Number.isFinite(delayMs) && delayMs <= 1) {
+      const stack = new Error().stack ?? '';
+      if (ENABLE_DEBUG_TIMERS && debugLoggedShortTimeouts < 8) {
+        debugLoggedShortTimeouts += 1;
+        const firstStackLine = stack.split('\n')[1]?.trim() ?? '';
+        console.log(
+          '[adapter-bun][timers] short setTimeout',
+          'handler=',
+          handler.name || '<anonymous>',
+          'stack=',
+          firstStackLine
+        );
+      }
+      if (batchAllShortTimeouts || isAtomicTimerGroupHandler(handler, stack)) {
+        if (ENABLE_DEBUG_TIMERS && !debugLoggedAtomicIntercept) {
+          debugLoggedAtomicIntercept = true;
+          console.log(
+            '[adapter-bun][timers] intercepted atomic setTimeout',
+            'handler=',
+            handler.name || '<anonymous>'
+          );
+        }
+        if (!pendingAtomicBatch) {
+          const callbacks: Array<() => void> = [() => handler(...args)];
+          const timer = originalSetTimeout(() => {
+            const activeBatch = pendingAtomicBatch;
+            pendingAtomicBatch = null;
+            const queue = activeBatch ? activeBatch.callbacks : callbacks;
+            for (const run of queue) {
+              run();
+            }
+          }, delayMs);
+          const normalizedTimer = ensureIdleStart(timer);
+          pendingAtomicBatch = { timer: normalizedTimer, callbacks };
+          return normalizedTimer;
+        }
+
+        pendingAtomicBatch.callbacks.push(() => handler(...args));
+        return pendingAtomicBatch.timer;
+      }
+    }
+
+    const timer = (originalSetTimeout as unknown as (
+      ...timeoutArgs: unknown[]
+    ) => ReturnType<typeof setTimeout>)(
+      handler as unknown,
+      timeout as unknown,
+      ...args
+    );
+    return ensureIdleStart(timer);
+  }) as typeof setTimeout & { __adapterBunPatched?: boolean };
+
+  wrappedSetTimeout.__adapterBunPatched = true;
+  globalThis.setTimeout = wrappedSetTimeout;
+  try {
+    const timers = require('node:timers') as {
+      setTimeout?: typeof setTimeout;
+    };
+    if (timers && typeof timers.setTimeout === 'function') {
+      timers.setTimeout = wrappedSetTimeout as typeof setTimeout;
+    }
+  } catch {
+    // Best effort.
+  }
+  if (ENABLE_DEBUG_TIMERS) {
+    console.log('[adapter-bun][timers] patched global setTimeout for atomic groups');
+  }
+}
+
+patchSetTimeoutForBunAtomicGroups();
+
+function getImageOptimizerModule(): RuntimeImageOptimizerModule {
+  if (runtimeImageOptimizerModule) {
+    return runtimeImageOptimizerModule;
+  }
+  runtimeImageOptimizerModule = require(
+    'next/dist/server/image-optimizer.js'
+  ) as RuntimeImageOptimizerModule;
+  return runtimeImageOptimizerModule;
+}
+
+function getServeStaticModule(): RuntimeServeStaticModule {
+  if (runtimeServeStaticModule) {
+    return runtimeServeStaticModule;
+  }
+  runtimeServeStaticModule = require(
+    'next/dist/server/serve-static.js'
+  ) as RuntimeServeStaticModule;
+  return runtimeServeStaticModule;
+}
+
+function isNextImagePathname(pathname: string): boolean {
+  const imagePath = `${basePath || ''}/_next/image`;
+  return removePathnameTrailingSlash(pathname) === removePathnameTrailingSlash(imagePath);
+}
+
+function getRuntimeImageConfig(): RuntimeNextImageConfig | null {
+  return runtimeNextConfig.images && isRecord(runtimeNextConfig.images)
+    ? (runtimeNextConfig.images as RuntimeNextImageConfig)
+    : null;
+}
+
+function getNextImageMaximumResponseBody(imagesConfig: RuntimeNextImageConfig): number {
+  return typeof imagesConfig.maximumResponseBody === 'number' &&
+    Number.isFinite(imagesConfig.maximumResponseBody) &&
+    imagesConfig.maximumResponseBody > 0
+    ? imagesConfig.maximumResponseBody
+    : 50_000_000;
+}
+
+async function fetchInternalImageForOptimizer({
+  href,
+  req,
+  maximumResponseBody,
+}: {
+  href: string;
+  req: IncomingMessage;
+  maximumResponseBody: number;
+}): Promise<{
+  buffer: Buffer;
+  contentType: string | null;
+  cacheControl: string | null;
+  etag: string;
+}> {
+  const imageOptimizer = getImageOptimizerModule();
+  const targetUrl = new URL(href, process.env.__NEXT_PRIVATE_ORIGIN);
+  const requestHeaders = new Headers();
+  const acceptHeader = getSingleHeaderValue(req.headers.accept);
+  if (typeof acceptHeader === 'string' && acceptHeader.length > 0) {
+    requestHeaders.set('accept', acceptHeader);
+  }
+
+  const response = await fetch(targetUrl, {
+    method: 'GET',
+    headers: requestHeaders,
+    redirect: 'manual',
+  });
+
+  if (!response.ok || !response.body) {
+    throw new imageOptimizer.ImageError(
+      response.status || 500,
+      '"url" parameter is valid but upstream response is invalid'
+    );
+  }
+
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  const reader = response.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (!value || value.byteLength === 0) {
+      continue;
+    }
+    totalBytes += value.byteLength;
+    if (totalBytes > maximumResponseBody) {
+      throw new imageOptimizer.ImageError(
+        413,
+        '"url" parameter is valid but upstream response is invalid'
+      );
+    }
+    chunks.push(Buffer.from(value));
+  }
+
+  const buffer = Buffer.concat(chunks);
+  const contentType = response.headers.get('content-type');
+  const cacheControl = response.headers.get('cache-control');
+  const etag = imageOptimizer.extractEtag(response.headers.get('etag'), buffer);
+  return {
+    buffer,
+    contentType,
+    cacheControl,
+    etag,
+  };
+}
+
+async function handleNextImageRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  requestUrl: URL
+): Promise<boolean> {
+  if (!isNextImagePathname(requestUrl.pathname)) {
+    return false;
+  }
+
+  const imagesConfig = getRuntimeImageConfig();
+  if (!imagesConfig) {
+    return false;
+  }
+
+  const nextConfigForImages =
+    runtimeNextConfig as unknown as Parameters<
+      RuntimeImageOptimizerModule['ImageOptimizerCache']['validateParams']
+    >[2];
+  const imageOptimizer = getImageOptimizerModule();
+
+  if (runtimeNextConfig.output === 'export' || process.env.NEXT_MINIMAL) {
+    res.statusCode = 400;
+    if (!res.hasHeader('content-type')) {
+      res.setHeader('content-type', 'text/plain; charset=utf-8');
+    }
+    res.end('Bad Request');
+    return true;
+  }
+
+  if (imagesConfig.loader !== 'default' || imagesConfig.unoptimized) {
+    res.statusCode = 404;
+    if (!res.hasHeader('content-type')) {
+      res.setHeader('content-type', 'text/plain; charset=utf-8');
+    }
+    res.end('Not Found');
+    return true;
+  }
+
+  const parsedQuery = searchParamsToMatcherQuery(requestUrl.searchParams);
+  const paramsResult = imageOptimizer.ImageOptimizerCache.validateParams(
+    req,
+    parsedQuery,
+    nextConfigForImages,
+    false
+  );
+
+  if ('errorMessage' in paramsResult) {
+    res.statusCode = 400;
+    if (!res.hasHeader('content-type')) {
+      res.setHeader('content-type', 'text/plain; charset=utf-8');
+    }
+    res.end(paramsResult.errorMessage);
+    return true;
+  }
+
+  try {
+    const maximumResponseBody = getNextImageMaximumResponseBody(imagesConfig);
+    const imageUpstream = paramsResult.isAbsolute
+      ? await imageOptimizer.fetchExternalImage(
+          paramsResult.href,
+          Boolean(imagesConfig.dangerouslyAllowLocalIP),
+          maximumResponseBody
+        )
+      : await fetchInternalImageForOptimizer({
+          href: paramsResult.href,
+          req,
+          maximumResponseBody,
+        });
+
+    const hrefPathname = new URL(paramsResult.href, process.env.__NEXT_PRIVATE_ORIGIN).pathname;
+    if (isNextImagePathname(hrefPathname)) {
+      throw new Error('Invariant attempted to optimize _next/image itself');
+    }
+
+    const optimizedResult = await imageOptimizer.imageOptimizer(
+      imageUpstream,
+      paramsResult,
+      nextConfigForImages,
+      {
+        isDev: false,
+      }
+    );
+    const serveStatic = getServeStaticModule();
+    const extension =
+      serveStatic.getExtension(optimizedResult.contentType) ?? 'bin';
+    imageOptimizer.sendResponse(
+      req,
+      res,
+      paramsResult.href,
+      extension,
+      optimizedResult.buffer,
+      optimizedResult.etag,
+      paramsResult.isStatic,
+      'MISS',
+      nextConfigForImages.images,
+      optimizedResult.maxAge,
+      false
+    );
+    return true;
+  } catch (error) {
+    if (error instanceof imageOptimizer.ImageError) {
+      res.statusCode = error.statusCode;
+      if (!res.hasHeader('content-type')) {
+        res.setHeader('content-type', 'text/plain; charset=utf-8');
+      }
+      res.end(error.message);
+      return true;
+    }
+    throw error;
+  }
+}
 
 async function loadNodeHandler(output: RuntimeFunctionOutput): Promise<NodeRouteHandler> {
   const normalizedPath = path.resolve(output.filePath);
@@ -2916,6 +4388,48 @@ function createCloneableBody(bytes: Uint8Array): {
   };
 }
 
+async function readReadableStreamBody(
+  body: ReadableStream<Uint8Array> | null | undefined
+): Promise<Uint8Array> {
+  if (!body) {
+    return new Uint8Array(0);
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalLength = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value || value.byteLength === 0) {
+        continue;
+      }
+      chunks.push(value);
+      totalLength += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (chunks.length === 0) {
+    return new Uint8Array(0);
+  }
+  if (chunks.length === 1) {
+    return chunks[0] ?? new Uint8Array(0);
+  }
+
+  const merged = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
+}
+
 async function runEdgeFunctionOutput(
   output: RuntimeFunctionOutput,
   method: string | undefined,
@@ -2935,6 +4449,25 @@ async function runEdgeFunctionOutput(
   const edgeRequestUrl = new URL(requestUrl);
   mergeRequestMetaValuesIntoSearchParams(edgeRequestUrl.searchParams, requestMeta?.query);
   mergeRequestMetaValuesIntoSearchParams(edgeRequestUrl.searchParams, requestMeta?.params);
+  if (ENABLE_DEBUG_ROUTING && requestUrl.pathname.includes('/_next/data/')) {
+    debugRoutingLog(
+      'edge-next-data-invoke',
+      'output=',
+      output.pathname,
+      'requestUrl=',
+      requestUrl.toString(),
+      'edgeRequestUrl=',
+      edgeRequestUrl.toString(),
+      'x-nextjs-data=',
+      String(getSingleHeaderValue(headers['x-nextjs-data']) ?? ''),
+      'isNextDataReq=',
+      String(Boolean(requestMeta?.isNextDataReq)),
+      'invokePath=',
+      String(requestMeta?.invokePath ?? ''),
+      'invokeOutput=',
+      String(requestMeta?.invokeOutput ?? '')
+    );
+  }
 
   const abortController = new AbortController();
   const runPromise = run({
@@ -2954,7 +4487,9 @@ async function runEdgeFunctionOutput(
       nextConfig: edgeRequestNextConfig,
       url: edgeRequestUrl.toString(),
       page: {
-        name: output.pathname,
+        name: output.pathname.includes('/_next/data/')
+          ? output.sourcePage
+          : output.pathname,
         ...(requestMeta?.params ? { params: requestMeta.params } : {}),
       },
       ...(hasBody ? { body: createCloneableBody(requestBody) } : {}),
@@ -3065,19 +4600,6 @@ async function invokeFunctionOutput(
     }
   }
 
-  if (
-    (output.runtime === 'nodejs' || output.runtime === 'edge') &&
-    requestMeta?.isRSCRequest
-  ) {
-    // Flight responses can terminate their socket immediately after streaming.
-    // Explicitly disable keep-alive so pooled clients won't attempt reuse on
-    // the next request.
-    res.shouldKeepAlive = false;
-    if (!res.headersSent) {
-      res.setHeader('connection', 'close');
-    }
-  }
-
   if (output.runtime === 'edge') {
     const configuredTimeout = Number.parseInt(
       process.env.ADAPTER_BUN_EDGE_FUNCTION_TIMEOUT_MS || '',
@@ -3173,14 +4695,85 @@ async function invokeFunctionOutput(
 
   const nodeHandler = await loadNodeHandler(output);
   const waitUntil = createWaitUntilCollector();
+  const isAppOutput = isAppFunctionOutput(output);
+  const isAppRouteHandlerOutput = output.sourcePage.endsWith('/route');
+  const isNextDataRequest =
+    getSingleHeaderValue(req.headers['x-nextjs-data']) === '1' ||
+    requestUrl.pathname.includes('/_next/data/');
   const shouldFallbackToErrorPage =
     isReadMethod(req.method) &&
     !isApiRoutePathname(output.pathname) &&
-    output.pathname !== '/_error';
+    output.pathname !== '/_error' &&
+    !isAppOutput &&
+    !isAppRouteHandlerOutput &&
+    !isNextDataRequest;
   let suppressedNotFoundResponse = false;
   let restoreNotFoundFallbackPatch: (() => void) | null = null;
   const isActionRequest = isPossibleServerActionRequest(req);
-  let restoreActionBufferPatch: (() => void) | null = null;
+  const shouldDebugRscStream =
+    process.env.ADAPTER_BUN_DEBUG_RSC_STREAM === '1' &&
+    ENABLE_DEBUG_ROUTING &&
+    shouldDebugRequest(req.url) &&
+    getSingleHeaderValue(req.headers[RSC_HEADER]) === '1';
+  const shouldRewriteFallbackPlaceholders =
+    process.env.ADAPTER_BUN_REWRITE_FALLBACK_PLACEHOLDERS === '1' &&
+    requestMeta?.renderFallbackShell === true &&
+    Boolean(requestMeta.fallbackParams) &&
+    Boolean(requestMeta.params) &&
+    getSingleHeaderValue(req.headers[RSC_HEADER]) === '1' &&
+    req.method !== 'HEAD';
+  let restoreDebugRscStreamPatch: (() => void) | null = null;
+  let restoreFallbackPlaceholderPatch: (() => void) | null = null;
+  if (shouldDebugRscStream) {
+    const mutableRes = res as any;
+    const originalWrite = res.write.bind(res) as (...args: unknown[]) => boolean;
+    const originalEnd = res.end.bind(res) as (...args: unknown[]) => ServerResponse;
+    const payloadChunks: Buffer[] = [];
+    const pushChunk = (chunk: unknown, encoding: unknown): void => {
+      if (chunk === undefined || chunk === null) {
+        return;
+      }
+      if (Buffer.isBuffer(chunk)) {
+        payloadChunks.push(chunk);
+        return;
+      }
+      if (chunk instanceof Uint8Array) {
+        payloadChunks.push(Buffer.from(chunk));
+        return;
+      }
+      if (typeof chunk === 'string') {
+        payloadChunks.push(Buffer.from(chunk, encoding as BufferEncoding | undefined));
+      }
+    };
+
+    mutableRes.write = (...args: unknown[]) => {
+      const [chunk, encoding] = args;
+      pushChunk(chunk, encoding);
+      return originalWrite(...args);
+    };
+    mutableRes.end = (...args: unknown[]) => {
+      const [chunk, encoding] = args;
+      pushChunk(chunk, encoding);
+      const result = originalEnd(...args);
+      const payload = Buffer.concat(payloadChunks).toString('utf8');
+      debugRoutingLog(
+        'rsc-payload',
+        req.method,
+        req.url,
+        'len=',
+        String(payload.length),
+        'head=',
+        payload.slice(0, 2_000),
+        'tail=',
+        payload.slice(-2_000)
+      );
+      return result;
+    };
+    restoreDebugRscStreamPatch = () => {
+      mutableRes.write = originalWrite;
+      mutableRes.end = originalEnd;
+    };
+  }
 
   if (shouldFallbackToErrorPage) {
     const mutableRes = res as any;
@@ -3224,58 +4817,84 @@ async function invokeFunctionOutput(
     };
   }
 
-  if (isActionRequest) {
+  if (shouldRewriteFallbackPlaceholders) {
     const mutableRes = res as any;
     const originalWrite = res.write.bind(res) as (...args: unknown[]) => boolean;
     const originalEnd = res.end.bind(res) as (...args: unknown[]) => ServerResponse;
-    const bufferedChunks: Buffer[] = [];
+    const payloadChunks: Buffer[] = [];
     const pushChunk = (chunk: unknown, encoding: unknown): void => {
       if (chunk === undefined || chunk === null) {
         return;
       }
       if (Buffer.isBuffer(chunk)) {
-        bufferedChunks.push(chunk);
+        payloadChunks.push(chunk);
         return;
       }
       if (chunk instanceof Uint8Array) {
-        bufferedChunks.push(Buffer.from(chunk));
+        payloadChunks.push(Buffer.from(chunk));
         return;
       }
       if (typeof chunk === 'string') {
-        bufferedChunks.push(Buffer.from(chunk, encoding as BufferEncoding | undefined));
+        payloadChunks.push(Buffer.from(chunk, encoding as BufferEncoding | undefined));
       }
     };
 
-    mutableRes.write = (...args: unknown[]) => {
-      const [chunk, encoding] = args;
-      pushChunk(chunk, encoding);
-      return true;
-    };
-    mutableRes.end = (...args: unknown[]) => {
-      const [chunk, encoding, callback] = args;
-      pushChunk(chunk, encoding);
-      const body = Buffer.concat(bufferedChunks);
-      if (!res.headersSent && !res.hasHeader('content-length')) {
-        res.setHeader('content-length', String(body.byteLength));
+    const replacementPairs: Array<[string, string]> = [];
+    for (const [paramKey, fallbackParamValue] of requestMeta.fallbackParams!.entries()) {
+      const placeholderValue = fallbackParamValue[0];
+      if (typeof placeholderValue !== 'string' || placeholderValue.length === 0) {
+        continue;
       }
-      if (typeof callback === 'function') {
-        return originalEnd(body, callback);
+      const concreteParamValue = toSingleParamValue(requestMeta.params?.[paramKey]);
+      if (typeof concreteParamValue === 'string' && concreteParamValue.length > 0) {
+        replacementPairs.push([placeholderValue, concreteParamValue]);
       }
-      return originalEnd(body);
-    };
-    restoreActionBufferPatch = () => {
-      mutableRes.write = originalWrite;
-      mutableRes.end = originalEnd;
-    };
+    }
+
+    if (replacementPairs.length > 0) {
+      mutableRes.write = (...args: unknown[]) => {
+        const [chunk, encoding] = args;
+        pushChunk(chunk, encoding);
+        return true;
+      };
+      mutableRes.end = (...args: unknown[]) => {
+        const [chunk, encoding] = args;
+        pushChunk(chunk, encoding);
+
+        const payload = Buffer.concat(payloadChunks).toString('utf8');
+        let rewrittenPayload = payload;
+        for (const [placeholder, concreteValue] of replacementPairs) {
+          rewrittenPayload = rewrittenPayload.split(placeholder).join(concreteValue);
+        }
+
+        if (rewrittenPayload !== payload && res.hasHeader('content-length')) {
+          res.removeHeader('content-length');
+        }
+        if (rewrittenPayload.length > 0) {
+          originalWrite(rewrittenPayload, 'utf8');
+        }
+        return originalEnd();
+      };
+      restoreFallbackPlaceholderPatch = () => {
+        mutableRes.write = originalWrite;
+        mutableRes.end = originalEnd;
+      };
+    }
   }
+
+  // Keep action responses streaming-capable. Buffering res.write() breaks
+  // streamed server action payloads (for example ReadableStream responses).
 
   const shouldWaitForFinish = isActionRequest;
   await nodeHandler(req, res, {
     waitUntil: waitUntil.waitUntil,
     ...(requestMeta ? { requestMeta } : {}),
   });
-  if (restoreActionBufferPatch) {
-    restoreActionBufferPatch();
+  if (restoreDebugRscStreamPatch) {
+    restoreDebugRscStreamPatch();
+  }
+  if (restoreFallbackPlaceholderPatch) {
+    restoreFallbackPlaceholderPatch();
   }
   if (restoreNotFoundFallbackPatch) {
     restoreNotFoundFallbackPatch();
@@ -3315,25 +4934,37 @@ async function invokeMiddleware(
   middlewareResult: ReturnType<typeof responseToMiddlewareResult>;
   response: Response;
 }> {
-  const handler =
-    middleware.runtime === 'edge'
-      ? await loadEdgeHandler(middleware)
-      : await loadNodeMiddlewareHandler(middleware);
   const waitUntil = createWaitUntilCollector();
-  const requestInit: RequestInit & { duplex?: 'half' } = {
-    method: method || 'GET',
-    headers,
-  };
+  let response: Response;
+  if (middleware.runtime === 'edge') {
+    const requestBodyBytes = canRequestHaveBody(method)
+      ? await readReadableStreamBody(requestBody)
+      : new Uint8Array(0);
+    response = await runEdgeFunctionOutput(
+      middleware,
+      method,
+      headersToIncomingHttpHeaders(headers),
+      requestUrl,
+      requestBodyBytes,
+      waitUntil.waitUntil
+    );
+  } else {
+    const handler = await loadNodeMiddlewareHandler(middleware);
+    const requestInit: RequestInit & { duplex?: 'half' } = {
+      method: method || 'GET',
+      headers,
+    };
 
-  if (canRequestHaveBody(method)) {
-    requestInit.body = requestBody;
-    requestInit.duplex = 'half';
+    if (canRequestHaveBody(method)) {
+      requestInit.body = requestBody;
+      requestInit.duplex = 'half';
+    }
+
+    const middlewareRequest = new Request(requestUrl.toString(), requestInit);
+    response = await handler(middlewareRequest, {
+      waitUntil: waitUntil.waitUntil,
+    });
   }
-
-  const middlewareRequest = new Request(requestUrl.toString(), requestInit);
-  const response = await handler(middlewareRequest, {
-    waitUntil: waitUntil.waitUntil,
-  });
   void waitUntil.drain();
 
   return {
@@ -3435,6 +5066,10 @@ const server = http.createServer(async (req, res) => {
         String(res.getHeader('x-nextjs-matched-path') ?? ''),
         'action-revalidated=',
         String(res.getHeader('x-action-revalidated') ?? ''),
+        'stale-time=',
+        String(res.getHeader('x-nextjs-stale-time') ?? ''),
+        'postponed=',
+        String(res.getHeader('x-nextjs-postponed') ?? ''),
         'cache-control=',
         String(res.getHeader('cache-control') ?? ''),
         'connection=',
@@ -3449,6 +5084,9 @@ const server = http.createServer(async (req, res) => {
     ...req.headers,
   };
   stripInternalRequestHeaders(req.headers);
+  // Bun can close sockets eagerly in several response paths; advertise
+  // non-keepalive consistently so pooled clients won't reuse stale sockets.
+  markConnectionClose(res);
 
   if (cacheRuntime.handlerMode === 'http') {
     const requestUrl = new URL(req.url || '/', process.env.__NEXT_PRIVATE_ORIGIN);
@@ -3460,6 +5098,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  patchResponseAppendHeader(res);
   patchCacheControlHeader(req, res);
 
   const purposeHeader = getSingleHeaderValue(req.headers.purpose);
@@ -3513,8 +5152,9 @@ const server = http.createServer(async (req, res) => {
       String(getSingleHeaderValue(req.headers['next-url']) ?? '')
     );
   }
+  let allowRscContentTypeRewrite = false;
   if (isRscRequest) {
-    patchRscContentTypeHeader(res);
+    patchRscContentTypeHeader(res, () => allowRscContentTypeRewrite);
     if (rscHeaderValue !== '1') {
       req.headers.rsc = '1';
     }
@@ -3530,6 +5170,8 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const requestUrl = new URL(req.url || '/', process.env.__NEXT_PRIVATE_ORIGIN);
+    ensureForwardedRequestHeaders(req, requestUrl);
+    const routingBaseUrl = applyHostHeaderToUrl(requestUrl, req.headers.host);
     if (hasInvalidPathnameEncoding(requestUrl.pathname)) {
       res.statusCode = 400;
       res.shouldKeepAlive = false;
@@ -3547,16 +5189,28 @@ const server = http.createServer(async (req, res) => {
       buildId,
       basePath
     );
+    const nextDataRoutingPathname =
+      getNextDataNormalizedPathname(
+        requestUrl.pathname,
+        buildId,
+        basePath,
+        false
+      ) ?? nextDataNormalizedPathname;
+    const nextDataRoutePathname = nextDataRoutingPathname
+      ? applyConfiguredTrailingSlash(nextDataRoutingPathname)
+      : null;
     if (
-      nextDataNormalizedPathname &&
+      nextDataRoutePathname &&
       getSingleHeaderValue(req.headers['x-nextjs-data']) !== '1'
     ) {
       req.headers['x-nextjs-data'] = '1';
     }
 
-    const routingUrl = new URL(requestUrl);
-    if (nextDataNormalizedPathname) {
-      routingUrl.pathname = nextDataNormalizedPathname;
+    const routingUrl = new URL(routingBaseUrl);
+    const resolveRoutesUrl = new URL(routingBaseUrl);
+    if (nextDataRoutePathname) {
+      routingUrl.pathname = nextDataRoutePathname;
+      resolveRoutesUrl.pathname = nextDataRoutePathname;
     }
     const requestHasLocalePrefix = hasLocalePrefixInPathname(
       requestUrl.pathname,
@@ -3579,6 +5233,7 @@ const server = http.createServer(async (req, res) => {
         res.statusCode = 307;
         res.setHeader('location', `${canonicalRscUrl.pathname}${canonicalRscUrl.search}`);
         res.setHeader('content-length', '0');
+        markConnectionClose(res);
         res.end();
         return;
       }
@@ -3592,23 +5247,40 @@ const server = http.createServer(async (req, res) => {
     };
     const routingHeaders = toRequestHeaders(req.headers);
     let resolvedRequestHeaders = new Headers(routingHeaders);
-    if (nextDataNormalizedPathname && !routingHeaders.has('x-nextjs-data')) {
+    if (nextDataRoutePathname && !routingHeaders.has('x-nextjs-data')) {
       routingHeaders.set('x-nextjs-data', '1');
       resolvedRequestHeaders.set('x-nextjs-data', '1');
     }
     let middlewareBodyResponse: Response | null = null;
     let middlewareMatchedRequest = false;
+    let middlewareIssuedRedirect = false;
 
     if (runtimeRouting) {
-      const requestRoutingI18n = getRoutingI18nForRequest(
+      let requestRoutingI18n = getRoutingI18nForRequest(
         runtimeI18n,
         routingUrl.pathname,
         basePath,
         req.headers,
         routingUrl.hostname
       );
+      if (
+        !requestRoutingI18n &&
+        runtimeI18n &&
+        isRootPathnameForLocaleDetection(routingUrl.pathname, basePath)
+      ) {
+        const unprefixedRootPathname = basePath || '/';
+        const defaultLocaleRootPathname = `${basePath}${basePath ? '/' : '/'}${runtimeI18n.defaultLocale}`;
+        if (
+          !routingPathnameSet.has(unprefixedRootPathname) &&
+          routingPathnameSet.has(defaultLocaleRootPathname)
+        ) {
+          // Some i18n builds only emit locale-prefixed root routes. Keep i18n
+          // resolution enabled so "/" maps to the default-locale page.
+          requestRoutingI18n = runtimeI18n;
+        }
+      }
       resolvedRoutingResult = await resolveRoutes({
-        url: routingUrl,
+        url: resolveRoutesUrl,
         buildId,
         basePath,
         requestBody: createBodyStream(requestBody),
@@ -3620,10 +5292,31 @@ const server = http.createServer(async (req, res) => {
           if (!runtimeMiddleware) {
             return {};
           }
+          const middlewareUrl = new URL(url.toString());
+          const middlewareNextDataPathname = getNextDataNormalizedPathname(
+            middlewareUrl.pathname,
+            buildId,
+            basePath
+          );
+          if (middlewareNextDataPathname) {
+            middlewareUrl.pathname = applyConfiguredTrailingSlash(
+              middlewareNextDataPathname
+            );
+          }
           if (runtimeMiddlewareMatcher) {
             const matcherHeaders = headersToIncomingHttpHeaders(headers);
-            const matcherQuery = searchParamsToMatcherQuery(url.searchParams);
-            const normalizedPathname = removePathnameTrailingSlash(url.pathname);
+            for (const [rawKey, rawValue] of Object.entries(req.headers)) {
+              const normalizedKey = rawKey.toLowerCase();
+              if (matcherHeaders[normalizedKey] === undefined) {
+                matcherHeaders[normalizedKey] = rawValue;
+              }
+            }
+            const matcherQuery = searchParamsToMatcherQuery(
+              middlewareUrl.searchParams
+            );
+            const normalizedPathname = removePathnameTrailingSlash(
+              middlewareUrl.pathname
+            );
             let decodedPathname = normalizedPathname;
             try {
               decodedPathname = decodeURIComponent(normalizedPathname);
@@ -3644,11 +5337,15 @@ const server = http.createServer(async (req, res) => {
           middlewareMatchedRequest = true;
           const { middlewareResult, response } = await invokeMiddleware(
             runtimeMiddleware,
-            url,
+            middlewareUrl,
             req.method,
             headers,
             middlewareRequestBody
           );
+          middlewareIssuedRedirect =
+            middlewareIssuedRedirect ||
+            (isRedirectStatusCode(response.status) &&
+              typeof response.headers.get('location') === 'string');
           if (middlewareResult.requestHeaders) {
             resolvedRequestHeaders = new Headers(middlewareResult.requestHeaders);
           }
@@ -3658,6 +5355,106 @@ const server = http.createServer(async (req, res) => {
           return middlewareResult;
         },
       });
+
+      if (
+        runtimeI18n &&
+        !requestHasLocalePrefix &&
+        isRootPathnameForLocaleDetection(routingUrl.pathname, basePath)
+      ) {
+        const unprefixedRootPathname = basePath || '/';
+        const defaultLocaleRootPathname = `${basePath}${basePath ? '/' : '/'}${runtimeI18n.defaultLocale}`;
+        const resolvedRouteHeaders = resolvedRoutingResult.resolvedHeaders ?? new Headers();
+        const locationHeader = resolvedRouteHeaders.get('location');
+        let isDefaultLocaleRedirect = false;
+        if (
+          isRedirectStatusCode(resolvedRoutingResult.status) &&
+          typeof locationHeader === 'string' &&
+          locationHeader.length > 0
+        ) {
+          try {
+            isDefaultLocaleRedirect =
+              removePathnameTrailingSlash(
+                new URL(locationHeader, process.env.__NEXT_PRIVATE_ORIGIN).pathname
+              ) === removePathnameTrailingSlash(defaultLocaleRootPathname);
+          } catch {
+            isDefaultLocaleRedirect = false;
+          }
+        }
+        if (
+          isDefaultLocaleRedirect &&
+          !routingPathnameSet.has(unprefixedRootPathname) &&
+          routingPathnameSet.has(defaultLocaleRootPathname)
+        ) {
+          // Avoid redirect loops when the build only emits locale-prefixed
+          // root routes (for example "/en") but requests arrive on "/".
+          const adjustedHeaders = new Headers(resolvedRouteHeaders);
+          adjustedHeaders.delete('location');
+          resolvedRoutingResult = {
+            ...resolvedRoutingResult,
+            matchedPathname: defaultLocaleRootPathname,
+            status: undefined,
+            resolvedHeaders: adjustedHeaders,
+          };
+        }
+      }
+
+      if (
+        /[A-Z]/.test(routingUrl.pathname) &&
+        !resolvedRoutingResult.matchedPathname &&
+        !resolvedRoutingResult.redirect &&
+        !resolvedRoutingResult.externalRewrite &&
+        !resolvedRoutingResult.middlewareResponded
+      ) {
+        const caseInsensitiveFallback = resolveCaseInsensitiveRoutingFallback(
+          routingUrl,
+          req.headers,
+          runtimeRoutingConfig!
+        );
+        if (caseInsensitiveFallback) {
+          resolvedRoutingResult = caseInsensitiveFallback;
+        }
+      }
+
+      if (
+        trailingSlash &&
+        !resolvedRoutingResult.redirect &&
+        !resolvedRoutingResult.externalRewrite &&
+        !resolvedRoutingResult.middlewareResponded
+      ) {
+        const trailingSlashFallbackPathname = resolveTrailingSlashPathnameFallback(
+          routingUrl.pathname,
+          routingPathnameSet
+        );
+        if (
+          trailingSlashFallbackPathname &&
+          (
+            !resolvedRoutingResult.matchedPathname ||
+            isDynamicRoute(
+              normalizePathnameForRouteMatching(resolvedRoutingResult.matchedPathname)
+            )
+          )
+        ) {
+          resolvedRoutingResult = {
+            ...resolvedRoutingResult,
+            matchedPathname: trailingSlashFallbackPathname,
+            routeMatches: undefined,
+          };
+        }
+      }
+    }
+
+    if (resolvedRoutingResult.matchedPathname) {
+      const normalizedMatchedNextDataPathname = getNextDataNormalizedPathname(
+        resolvedRoutingResult.matchedPathname,
+        buildId,
+        basePath
+      );
+      if (normalizedMatchedNextDataPathname) {
+        resolvedRoutingResult = {
+          ...resolvedRoutingResult,
+          matchedPathname: normalizedMatchedNextDataPathname,
+        };
+      }
     }
 
     if (debugRequest) {
@@ -3694,7 +5491,31 @@ const server = http.createServer(async (req, res) => {
     }
 
     const routeHeaders = resolvedRoutingResult.resolvedHeaders;
-    const routeStatus = resolvedRoutingResult.status;
+    let routeStatus = resolvedRoutingResult.status;
+    if (
+      nextDataRoutePathname &&
+      routeHeaders &&
+      isRedirectStatusCode(routeStatus)
+    ) {
+      const routeLocationHeader = routeHeaders.get('location');
+      if (routeLocationHeader) {
+        try {
+          const locationUrl = new URL(
+            routeLocationHeader,
+            process.env.__NEXT_PRIVATE_ORIGIN
+          );
+          if (
+            removePathnameTrailingSlash(locationUrl.pathname) ===
+            removePathnameTrailingSlash(nextDataRoutePathname)
+          ) {
+            routeHeaders.delete('location');
+            routeStatus = undefined;
+          }
+        } catch {
+          // Keep the original redirect when location is not a valid URL.
+        }
+      }
+    }
 
     if (middlewareMatchedRequest) {
       // Middleware responses commonly terminate sockets after write without an
@@ -3727,6 +5548,7 @@ const server = http.createServer(async (req, res) => {
       }
       res.statusCode = resolvedRoutingResult.redirect.status;
       res.setHeader('location', redirectLocation);
+      markConnectionClose(res);
       res.end();
       return;
     }
@@ -3779,7 +5601,13 @@ const server = http.createServer(async (req, res) => {
             routeLocationHeader,
             process.env.__NEXT_PRIVATE_ORIGIN
           );
-          redirectUrl.search = requestUrl.search;
+          const requestPathname = removePathnameTrailingSlash(requestUrl.pathname);
+          const redirectPathname = removePathnameTrailingSlash(redirectUrl.pathname);
+          const shouldPropagateSearch =
+            !middlewareIssuedRedirect || requestPathname === redirectPathname;
+          if (shouldPropagateSearch) {
+            redirectUrl.search = requestUrl.search;
+          }
           const currentOrigin = process.env.__NEXT_PRIVATE_ORIGIN ?? '';
           const shouldPreserveOrigin = redirectUrl.origin !== currentOrigin;
           redirectLocation = shouldPreserveOrigin
@@ -3806,34 +5634,15 @@ const server = http.createServer(async (req, res) => {
       if (redirectStatus === 308) {
         res.setHeader('refresh', `0;url=${redirectLocation}`);
       }
+      markConnectionClose(res);
       res.end(redirectLocation);
       return;
     }
 
     let matchedPathname = resolvedRoutingResult.matchedPathname;
-    let resolvedFunctionOutputFromFallback: ResolvedFunctionOutput | null = null;
-    if (!matchedPathname && isApiRoutePathname(routingUrl.pathname)) {
-      resolvedFunctionOutputFromFallback = resolveFunctionOutput(
-        routingUrl.pathname,
-        routingUrl.pathname
-      );
-      if (resolvedFunctionOutputFromFallback) {
-        matchedPathname = resolvedFunctionOutputFromFallback.output.pathname;
-        if (debugRequest) {
-          debugRoutingLog(
-            'fallback-output-match',
-            req.method,
-            req.url,
-            'output=',
-            resolvedFunctionOutputFromFallback.output.pathname
-          );
-        }
-      }
-    }
-
     if (!matchedPathname) {
-      if (routeHeaders) {
-        applyResponseHeaders(res, routeHeaders);
+      if (await handleNextImageRequest(req, res, requestUrl)) {
+        return;
       }
 
       const requestStaticAsset = resolveStaticAssetFromCandidates([
@@ -3841,6 +5650,9 @@ const server = http.createServer(async (req, res) => {
         routingUrl.pathname,
       ]);
       if (requestStaticAsset) {
+        if (routeHeaders) {
+          applyResponseHeaders(res, routeHeaders);
+        }
         if (!isReadMethod(req.method)) {
           writeMethodNotAllowedResponse(res);
           return;
@@ -3848,6 +5660,13 @@ const server = http.createServer(async (req, res) => {
       }
       if (requestStaticAsset && (await serveStaticAsset(req, res, adapterDir, requestStaticAsset))) {
         return;
+      }
+
+    }
+
+    if (!matchedPathname) {
+      if (routeHeaders) {
+        applyResponseHeaders(res, routeHeaders);
       }
 
       res.statusCode = 404;
@@ -3871,6 +5690,8 @@ const server = http.createServer(async (req, res) => {
       }
 
       const errorOutput = resolveErrorOutputFromCandidates([
+        '/_not-found',
+        basePath ? `${basePath}/_not-found` : null,
         '/_error',
         basePath ? `${basePath}/_error` : null,
       ]);
@@ -3894,9 +5715,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     const resolvedUrl = new URL(routingUrl);
+    const sourcePathname = nextDataRoutePathname ?? routingUrl.pathname;
 
     const middlewareRewriteHeader = routeHeaders?.get('x-middleware-rewrite');
     let middlewareRewriteUrl: URL | null = null;
+    let routeMatches = resolvedRoutingResult.routeMatches;
+    if (process.env.ADAPTER_BUN_CLEAR_ROUTE_MATCHES === '1') {
+      routeMatches = undefined;
+    }
     if (middlewareRewriteHeader) {
       middlewareRewriteUrl = new URL(
         middlewareRewriteHeader,
@@ -3904,35 +5730,147 @@ const server = http.createServer(async (req, res) => {
       );
       resolvedUrl.pathname = middlewareRewriteUrl.pathname;
       resolvedUrl.search = middlewareRewriteUrl.search;
+
+      const middlewareRewriteMatchPathname =
+        resolveTrailingSlashPathnameFallback(
+          middlewareRewriteUrl.pathname,
+          routingPathnameSet
+        ) ?? middlewareRewriteUrl.pathname;
+      const sourceMatchesResolvedPathname =
+        removePathnameTrailingSlash(sourcePathname) ===
+          removePathnameTrailingSlash(matchedPathname) ||
+        pathnameMatchesRoutePathname(sourcePathname, matchedPathname);
+      if (
+        matchedPathname &&
+        sourceMatchesResolvedPathname &&
+        !pathnameMatchesRoutePathname(
+          middlewareRewriteMatchPathname,
+          matchedPathname
+        )
+      ) {
+        matchedPathname = middlewareRewriteMatchPathname;
+        routeMatches = undefined;
+      }
     }
 
-    const routeMatches = resolvedRoutingResult.routeMatches;
-    const rewrittenQuery = applyDestinationQueryFromRoutingRules(
-      routingUrl.pathname,
-      matchedPathname,
-      resolvedUrl.searchParams,
-      runtimeRoutingConfig,
-      routeMatches
+    routeMatches = resolveRouteMatchPlaceholders(
+      routeMatches,
+      getRouteCapturesForPathname(sourcePathname, matchedPathname)
     );
+
+    const shouldSkipDestinationRules =
+      process.env.ADAPTER_BUN_SKIP_DESTINATION_RULES === '1';
+    const destinationMatch = shouldSkipDestinationRules
+      ? null
+      : resolveDestinationPathnameFromRoutingRules(
+          routingUrl,
+          matchedPathname,
+          runtimeRoutingConfig,
+          req.headers,
+          routeMatches
+        );
+    if (destinationMatch) {
+      routeMatches = resolveRouteMatchPlaceholders(
+        routeMatches,
+        destinationMatch.captures
+      );
+    }
+
+    const rewrittenQuery = shouldSkipDestinationRules
+      ? new URLSearchParams(resolvedUrl.searchParams)
+      : applyDestinationQueryFromRoutingRules(
+          routingUrl,
+          matchedPathname,
+          resolvedUrl.searchParams,
+          runtimeRoutingConfig,
+          req.headers,
+          routeMatches
+        );
     resolvedUrl.search = rewrittenQuery.size > 0 ? `?${rewrittenQuery.toString()}` : '';
 
     const rscSuffix = routeMatches?.rscSuffix;
-    const sourcePathname = nextDataNormalizedPathname ?? routingUrl.pathname;
-    const invocationPathname = middlewareRewriteUrl?.pathname ?? sourcePathname;
+    const destinationPathname = destinationMatch?.pathname;
+    const invocationDestinationPathname =
+      destinationPathname && !isDynamicRoute(destinationPathname)
+        ? destinationPathname
+        : null;
+    const invocationPathname =
+      middlewareRewriteUrl?.pathname ??
+      invocationDestinationPathname ??
+      sourcePathname;
     const explicitRscPath =
       isRscRequest ||
       invocationPathname.endsWith('.rsc') ||
       matchedPathname.endsWith('.rsc') ||
       (typeof rscSuffix === 'string' && rscSuffix.length > 0);
-    const resolvedFunctionOutput =
-      resolvedFunctionOutputFromFallback ??
-      resolveFunctionOutput(
+    const preferRscOutput =
+      process.env.ADAPTER_BUN_DISABLE_PREFER_RSC_OUTPUT === '1'
+        ? false
+        : explicitRscPath;
+    let resolvedFunctionOutput: ResolvedFunctionOutput | null = null;
+    if (nextDataNormalizedPathname) {
+      const nextDataCandidatePathnames = new Set<string>();
+      if (middlewareRewriteUrl) {
+        const rewrittenNextDataPathname = toNextDataPathname(
+          middlewareRewriteUrl.pathname,
+          buildId,
+          basePath
+        );
+        if (rewrittenNextDataPathname) {
+          nextDataCandidatePathnames.add(rewrittenNextDataPathname);
+        }
+      }
+      nextDataCandidatePathnames.add(requestUrl.pathname);
+
+      for (const nextDataCandidatePathname of nextDataCandidatePathnames) {
+        const nextDataOutput = resolveFunctionOutput(
+          nextDataCandidatePathname,
+          nextDataCandidatePathname,
+          undefined,
+          false,
+          routeMatches
+        );
+        if (nextDataOutput?.output.pathname.includes('/_next/data/')) {
+          resolvedFunctionOutput = nextDataOutput;
+          break;
+        }
+      }
+    }
+    if (!resolvedFunctionOutput) {
+      resolvedFunctionOutput = resolveFunctionOutput(
         matchedPathname,
         invocationPathname,
         typeof rscSuffix === 'string' ? rscSuffix : undefined,
-        explicitRscPath,
+        preferRscOutput,
         routeMatches
       );
+    }
+    if (runtimeI18n && !requestHasLocalePrefix) {
+      const matchedHasLocalePrefix = hasLocalePrefixInPathname(
+        matchedPathname,
+        basePath,
+        runtimeI18n
+      );
+      if (matchedHasLocalePrefix) {
+        const invocationResolvedFunctionOutput = resolveFunctionOutput(
+          invocationPathname,
+          invocationPathname,
+          typeof rscSuffix === 'string' ? rscSuffix : undefined,
+          explicitRscPath
+        );
+        const shouldPreferInvocationResolvedOutput =
+          Boolean(invocationResolvedFunctionOutput) &&
+          (!resolvedFunctionOutput ||
+            (isAppFunctionOutput(invocationResolvedFunctionOutput?.output) &&
+              !isAppFunctionOutput(resolvedFunctionOutput.output)));
+        if (shouldPreferInvocationResolvedOutput) {
+          resolvedFunctionOutput = invocationResolvedFunctionOutput;
+          if (resolvedFunctionOutput) {
+            matchedPathname = resolvedFunctionOutput.output.pathname;
+          }
+        }
+      }
+    }
     if (debugRequest) {
       debugRoutingLog(
         'resolved-output',
@@ -3952,16 +5890,46 @@ const server = http.createServer(async (req, res) => {
         resolvedFunctionOutput?.output.runtime ?? ''
       );
     }
-    const rewriteSourceParams = extractRewriteSourceParamsFromRoutingRules(
-      routingUrl.pathname,
-      matchedPathname,
-      runtimeRoutingConfig,
-      routeMatches
+
+    if (process.env.ADAPTER_BUN_DISABLE_ROUTE_MATCHES_HEADER !== '1') {
+      const routeMatchesHeaderValue = toRouteMatchesHeaderValue(routeMatches);
+      const normalizedMatchedPathnameForRouteMatches =
+        normalizePathnameForRouteMatching(matchedPathname);
+      const shouldForceEmptyRouteMatchesHeader =
+        process.env.ADAPTER_BUN_EMPTY_ROUTE_MATCHES_ON_FALLBACK === '1' &&
+        Boolean(getFallbackParamsForOutput(resolvedFunctionOutput?.output));
+      if (routeMatchesHeaderValue !== undefined) {
+        req.headers['x-now-route-matches'] = shouldForceEmptyRouteMatchesHeader
+          ? ''
+          : routeMatchesHeaderValue;
+      } else if (isDynamicRoute(normalizedMatchedPathnameForRouteMatches)) {
+        // Keep parity with Next's fallback shell pathway for dynamic matches
+        // that intentionally omit route-match values.
+        req.headers['x-now-route-matches'] = '';
+      } else {
+        delete req.headers['x-now-route-matches'];
+      }
+    }
+
+    const rewriteSourceParams =
+      process.env.ADAPTER_BUN_DISABLE_REWRITE_SOURCE_PARAMS === '1'
+        ? {}
+        : extractRewriteSourceParamsFromRoutingRules(
+            routingUrl,
+            matchedPathname,
+            runtimeRoutingConfig,
+            req.headers,
+            routeMatches
+          );
+    const requestQueryBase = removeSyntheticRoutePlaceholderQueryValues(
+      mergeDecodedParamsIntoQuery(
+        toRequestQuery(resolvedUrl.searchParams),
+        rewriteSourceParams
+      )
     );
-    const requestQueryBase = mergeDecodedParamsIntoQuery(
-      toRequestQuery(resolvedUrl.searchParams),
-      rewriteSourceParams
-    );
+    if (isAppFunctionOutput(resolvedFunctionOutput?.output)) {
+      removeInternalRouteParamQueryValues(requestQueryBase);
+    }
     const requestQuery = shouldMergeRouteMatchesIntoRequestQuery(
       resolvedFunctionOutput?.output
     )
@@ -3971,15 +5939,53 @@ const server = http.createServer(async (req, res) => {
           resolvedFunctionOutput?.output.pathname ?? matchedPathname
         )
       : requestQueryBase;
+    const fallbackParams = getFallbackParamsForOutput(resolvedFunctionOutput?.output);
+    let requestMetaParams =
+      process.env.ADAPTER_BUN_DISABLE_REQUEST_META_PARAMS === '1'
+        ? undefined
+        : resolvedFunctionOutput?.params;
+    if (
+      process.env.ADAPTER_BUN_FORCE_PLACEHOLDER_PARAMS_ON_FALLBACK === '1' &&
+      fallbackParams &&
+      requestMetaParams
+    ) {
+      const fallbackParamNames = Object.keys(fallbackParams);
+      if (fallbackParamNames.length > 0) {
+        requestMetaParams = { ...requestMetaParams };
+        for (const key of fallbackParamNames) {
+          if (key in requestMetaParams) {
+            requestMetaParams[key] = `[${key}]`;
+          }
+        }
+      }
+    }
+    const requestMetaQuery =
+      process.env.ADAPTER_BUN_CLEAR_QUERY_ON_FALLBACK === '1' && fallbackParams
+        ? {}
+        : requestQuery;
+    const routerStateTreeHeader = getSingleHeaderValue(
+      req.headers[NEXT_ROUTER_STATE_TREE_HEADER]
+    );
+    const shouldForceRenderFallbackShell =
+      (process.env.ADAPTER_BUN_FORCE_RENDER_FALLBACK_SHELL === '1' ||
+        (process.env.ADAPTER_BUN_FORCE_RENDER_FALLBACK_SHELL_ON_REFETCH === '1' &&
+          typeof routerStateTreeHeader === 'string' &&
+          routerStateTreeHeader.includes('refetch'))) &&
+      Boolean(fallbackParams) &&
+      isAppFunctionOutput(resolvedFunctionOutput?.output);
     const requestMeta = applyRscRequestMeta(
       toRequestMeta({
+        requestUrl,
         matchedPathname,
         requestPathname: sourcePathname,
-        invokeOutput: resolvedFunctionOutput?.output.pathname ?? matchedPathname,
+        invokeOutput:
+          toInvokeOutputPathname(resolvedFunctionOutput?.output) || matchedPathname,
         routeStatus,
-        query: requestQuery,
-        params: resolvedFunctionOutput?.params,
+        query: requestMetaQuery,
+        params: requestMetaParams,
         revalidate: internalRevalidate,
+        fallbackParams,
+        renderFallbackShell: shouldForceRenderFallbackShell,
       }),
       req.headers,
       resolvedUrl
@@ -4002,19 +6008,28 @@ const server = http.createServer(async (req, res) => {
         'query=',
         JSON.stringify(requestMeta.query ?? {}),
         'params=',
-        JSON.stringify(requestMeta.params ?? {})
+        JSON.stringify(requestMeta.params ?? {}),
+        'renderFallbackShell=',
+        String(Boolean(requestMeta.renderFallbackShell)),
+        'fallbackParams=',
+        String(requestMeta.fallbackParams?.size ?? 0)
       );
     }
     if (nextDataNormalizedPathname) {
       requestMeta.isNextDataReq = true;
       req.url = `${requestUrl.pathname}${requestUrl.search}`;
     } else if (middlewareRewriteUrl) {
+      req.url = `${requestUrl.pathname}${resolvedUrl.search}`;
+    } else if (process.env.ADAPTER_BUN_USE_ORIGINAL_REQ_URL === '1') {
       req.url = `${requestUrl.pathname}${requestUrl.search}`;
     } else {
       req.url = `${resolvedUrl.pathname}${resolvedUrl.search}`;
     }
 
     if (resolvedFunctionOutput) {
+      if (isRscRequest) {
+        allowRscContentTypeRewrite = true;
+      }
       const isMiddlewarePrefetchDataRequest =
         getSingleHeaderValue(req.headers['x-middleware-prefetch']) === '1' &&
         (Boolean(nextDataNormalizedPathname) ||
@@ -4023,7 +6038,7 @@ const server = http.createServer(async (req, res) => {
         resolvedFunctionOutput.output.pathname
       );
       const hasPrerenderCacheForResolvedOutput = hasPrerenderCacheEntryForPathnames([
-        nextDataNormalizedPathname ?? invocationPathname,
+        nextDataRoutePathname ?? invocationPathname,
         resolvedUrl.pathname,
         matchedPathname,
         resolvedFunctionOutput.output.pathname,
@@ -4061,7 +6076,7 @@ const server = http.createServer(async (req, res) => {
         req,
         res,
         resolvedFunctionOutput.output,
-        resolvedUrl,
+        nextDataNormalizedPathname ? requestUrl : resolvedUrl,
         requestBody,
         requestMeta
       );
