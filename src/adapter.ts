@@ -33,6 +33,7 @@ const RUNTIME_NEXT_CONFIG_FILE = 'runtime-next-config.json';
 const RSC_SUFFIX = '.rsc';
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
 const CACHE_RUNTIME_MODULES = [
+  'early-timers.js',
   'cache-handler.js',
   'cache-handler-http.js',
   'cache-handler-registration.js',
@@ -206,6 +207,7 @@ async function writeServerEntry(outDir: string): Promise<void> {
   const sourcePath = path.join(import.meta.dirname, 'runtime', 'server.js');
   const sourceCode = await Bun.file(sourcePath).text();
   const runtimeServerCode = sourceCode
+    .replace("import './early-timers.js';", "import './runtime/early-timers.js';")
     .replace("from './cache-store.js';", "from './runtime/cache-store.js';")
     .replace(
       "from './cache-http-server.js';",
@@ -345,6 +347,32 @@ function hasSeededSegmentEntries(
   return false;
 }
 
+function getSeededCacheKeyCandidates(cacheKey: string): string[] {
+  const candidates = new Set<string>([cacheKey]);
+
+  if (cacheKey === '/') {
+    candidates.add('/index');
+  } else if (cacheKey.endsWith('/index')) {
+    const withoutIndex = cacheKey.slice(0, -'/index'.length);
+    candidates.add(withoutIndex.length > 0 ? withoutIndex : '/');
+  }
+
+  return [...candidates];
+}
+
+function findExistingSeededPath(
+  sourcePathByPathname: Map<string, string>,
+  pathnameCandidates: readonly string[]
+): string | undefined {
+  for (const pathname of pathnameCandidates) {
+    const sourcePath = sourcePathByPathname.get(pathname);
+    if (sourcePath && existsSync(sourcePath)) {
+      return sourcePath;
+    }
+  }
+  return undefined;
+}
+
 async function buildSeededAppPageCacheValue({
   cacheKey,
   sourcePath,
@@ -366,9 +394,14 @@ async function buildSeededAppPageCacheValue({
   }
 
   const meta = await readAppPageRouteMeta(sourcePath);
+  const cacheKeyCandidates = getSeededCacheKeyCandidates(cacheKey);
   const hasAppCompanion =
-    sourcePathByPathname.has(`${cacheKey}${RSC_SUFFIX}`) ||
-    hasSeededSegmentEntries(cacheKey, sourcePathByPathname.keys()) ||
+    cacheKeyCandidates.some((candidate) =>
+      sourcePathByPathname.has(`${candidate}${RSC_SUFFIX}`)
+    ) ||
+    cacheKeyCandidates.some((candidate) =>
+      hasSeededSegmentEntries(candidate, sourcePathByPathname.keys())
+    ) ||
     Boolean(meta?.postponed);
   if (!hasAppCompanion) {
     return null;
@@ -377,8 +410,11 @@ async function buildSeededAppPageCacheValue({
   let rscData: Buffer | undefined;
   const shouldLoadRscData = !(meta && typeof meta.postponed === 'string');
   if (shouldLoadRscData) {
-    const rscPath = sourcePathByPathname.get(`${cacheKey}${RSC_SUFFIX}`);
-    if (rscPath && existsSync(rscPath)) {
+    const rscPath = findExistingSeededPath(
+      sourcePathByPathname,
+      cacheKeyCandidates.map((candidate) => `${candidate}${RSC_SUFFIX}`)
+    );
+    if (rscPath) {
       rscData = Buffer.from(await Bun.file(rscPath).bytes());
     }
   }
@@ -388,9 +424,13 @@ async function buildSeededAppPageCacheValue({
     const segmentPath = segmentPathRaw.startsWith('/')
       ? segmentPathRaw
       : `/${segmentPathRaw}`;
-    const segmentCacheKey = `${cacheKey}.segments${segmentPath}${SEGMENT_RSC_SUFFIX}`;
-    const segmentSourcePath = sourcePathByPathname.get(segmentCacheKey);
-    if (!segmentSourcePath || !existsSync(segmentSourcePath)) {
+    const segmentSourcePath = findExistingSeededPath(
+      sourcePathByPathname,
+      cacheKeyCandidates.map(
+        (candidate) => `${candidate}.segments${segmentPath}${SEGMENT_RSC_SUFFIX}`
+      )
+    );
+    if (!segmentSourcePath) {
       continue;
     }
     segmentData.set(
@@ -567,6 +607,155 @@ function collectRuntimeFunctionOutputs(
   );
 }
 
+function isStaticMetadataRoutePathname(pathname: string): boolean {
+  return (
+    pathname.endsWith('/robots.txt') ||
+    pathname.endsWith('/sitemap.xml') ||
+    pathname.endsWith('/favicon.ico') ||
+    pathname.endsWith('/manifest.webmanifest')
+  );
+}
+
+function isPrerenderedMetadataRoutePathname({
+  pathname,
+  prerenderRoutes,
+  prerenderDynamicRoutes,
+  locales,
+}: {
+  pathname: string;
+  prerenderRoutes: Set<string>;
+  prerenderDynamicRoutes: Set<string>;
+  locales: readonly string[] | undefined;
+}): boolean {
+  if (prerenderRoutes.has(pathname) || prerenderDynamicRoutes.has(pathname)) {
+    return true;
+  }
+  if (!locales || locales.length === 0) {
+    return false;
+  }
+
+  for (const locale of locales) {
+    const localePathname = path.posix.join('/', locale, pathname.slice(1));
+    if (
+      prerenderRoutes.has(localePathname) ||
+      prerenderDynamicRoutes.has(localePathname)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function collectMissingDynamicMetadataFunctionOutputs({
+  ctx,
+  existingFunctionOutputs,
+}: {
+  ctx: BuildCompleteContext;
+  existingFunctionOutputs: readonly BunRuntimeFunctionOutput[];
+}): Promise<BunRuntimeFunctionOutput[]> {
+  const absoluteDistDir = path.isAbsolute(ctx.distDir)
+    ? ctx.distDir
+    : path.join(ctx.projectDir, ctx.distDir);
+  const appPathsManifestPath = path.join(
+    absoluteDistDir,
+    'server',
+    'app-paths-manifest.json'
+  );
+  if (!existsSync(appPathsManifestPath)) {
+    return [];
+  }
+
+  let appPathsManifest: Record<string, string>;
+  try {
+    appPathsManifest = (await Bun.file(appPathsManifestPath).json()) as Record<
+      string,
+      string
+    >;
+  } catch {
+    return [];
+  }
+
+  const prerenderManifestPath = path.join(absoluteDistDir, 'prerender-manifest.json');
+  let prerenderManifest:
+    | {
+        routes?: Record<string, unknown>;
+        dynamicRoutes?: Record<string, unknown>;
+      }
+    | null = null;
+  try {
+    prerenderManifest = (await Bun.file(prerenderManifestPath).json()) as {
+      routes?: Record<string, unknown>;
+      dynamicRoutes?: Record<string, unknown>;
+    };
+  } catch {
+    prerenderManifest = null;
+  }
+
+  const prerenderRoutes = new Set(Object.keys(prerenderManifest?.routes ?? {}));
+  const prerenderDynamicRoutes = new Set(
+    Object.keys(prerenderManifest?.dynamicRoutes ?? {})
+  );
+  const existingPathnames = new Set(
+    existingFunctionOutputs.map((output) => output.pathname)
+  );
+
+  const missingOutputs: BunRuntimeFunctionOutput[] = [];
+  const maybePushOutput = (output: BunRuntimeFunctionOutput): void => {
+    if (existingPathnames.has(output.pathname)) {
+      return;
+    }
+    existingPathnames.add(output.pathname);
+    missingOutputs.push(output);
+  };
+
+  for (const [sourcePage, relativeModulePath] of Object.entries(appPathsManifest)) {
+    if (!sourcePage.endsWith('/route')) {
+      continue;
+    }
+
+    const pathname = sourcePage.slice(0, -'/route'.length) || '/';
+    if (!isStaticMetadataRoutePathname(pathname)) {
+      continue;
+    }
+
+    if (
+      isPrerenderedMetadataRoutePathname({
+        pathname,
+        prerenderRoutes,
+        prerenderDynamicRoutes,
+        locales: ctx.config.i18n?.locales,
+      })
+    ) {
+      continue;
+    }
+
+    const filePath = path.isAbsolute(relativeModulePath)
+      ? relativeModulePath
+      : path.join(absoluteDistDir, 'server', relativeModulePath);
+    if (!existsSync(filePath)) {
+      continue;
+    }
+
+    maybePushOutput({
+      id: pathname,
+      pathname,
+      sourcePage,
+      runtime: 'nodejs',
+      filePath,
+    });
+    maybePushOutput({
+      id: `${pathname}${RSC_SUFFIX}`,
+      pathname: `${pathname}${RSC_SUFFIX}`,
+      sourcePage,
+      runtime: 'nodejs',
+      filePath,
+    });
+  }
+
+  return missingOutputs;
+}
+
 function resolveSourcePath(repoRoot: string, filePath: string): string {
   return path.isAbsolute(filePath) ? filePath : path.resolve(repoRoot, filePath);
 }
@@ -582,6 +771,7 @@ async function seedPrerenderCache({
 }): Promise<void> {
   const seedable = prerenders.filter((p) => p.fallback?.filePath);
   if (seedable.length === 0) return;
+  const explicitCacheKeys = new Set(seedable.map((entry) => entry.pathname));
 
   const sourcePathByPathname = new Map<string, string>();
   for (const prerender of seedable) {
@@ -642,6 +832,10 @@ async function seedPrerenderCache({
       }
 
       const status = fallback.initialStatus ?? 200;
+      const contentTypeHeader = getHeaderValueIgnoreCase(headers, 'content-type');
+      const isHtmlEntry =
+        typeof contentTypeHeader === 'string' &&
+        contentTypeHeader.toLowerCase().startsWith('text/html');
 
       let storedBody = body;
       const seededAppPageValue = await buildSeededAppPageCacheValue({
@@ -666,9 +860,7 @@ async function seedPrerenderCache({
         expiresAt = createdAt + fallback.initialExpiration * 1000;
       }
 
-      entries.push({
-        cacheKey,
-        pathname: prerender.pathname,
+      const entryBase = {
         groupId: prerender.groupId,
         status,
         headers: JSON.stringify(headers),
@@ -676,7 +868,27 @@ async function seedPrerenderCache({
         tags,
         revalidateAt,
         expiresAt,
+      };
+
+      entries.push({
+        ...entryBase,
+        cacheKey,
+        pathname: cacheKey,
       });
+
+      if (isHtmlEntry) {
+        for (const aliasCacheKey of getSeededCacheKeyCandidates(cacheKey)) {
+          if (aliasCacheKey === cacheKey || explicitCacheKeys.has(aliasCacheKey)) {
+            continue;
+          }
+
+          entries.push({
+            ...entryBase,
+            cacheKey: aliasCacheKey,
+            pathname: aliasCacheKey,
+          });
+        }
+      }
     }
 
     db.transaction(() => {
@@ -735,7 +947,18 @@ async function onBuildComplete(
   const previewProps = await readPreviewProps(ctx);
   const cacheRuntime = createRuntimeCacheConfig(options);
   const runtimeRouting = toRuntimeRoutingConfig(ctx);
-  const runtimeFunctionOutputs = collectRuntimeFunctionOutputs(ctx.outputs);
+  let runtimeFunctionOutputs = collectRuntimeFunctionOutputs(ctx.outputs);
+  const missingDynamicMetadataOutputs =
+    await collectMissingDynamicMetadataFunctionOutputs({
+      ctx,
+      existingFunctionOutputs: runtimeFunctionOutputs,
+    });
+  if (missingDynamicMetadataOutputs.length > 0) {
+    runtimeFunctionOutputs = [
+      ...runtimeFunctionOutputs,
+      ...missingDynamicMetadataOutputs,
+    ];
+  }
   const runtimeMiddleware = ctx.outputs.middleware
     ? toRuntimeFunctionOutput({
         output: ctx.outputs.middleware,

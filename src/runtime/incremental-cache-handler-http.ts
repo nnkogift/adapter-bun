@@ -24,9 +24,16 @@ import type {
   SetIncrementalResponseCacheContext,
 } from 'next/dist/server/response-cache';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import { getRouteMatcher } from 'next/dist/shared/lib/router/utils/route-matcher.js';
+import { getNamedRouteRegex } from 'next/dist/shared/lib/router/utils/route-regex.js';
 
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
+const NEXT_CACHE_ROUTE_TAG_PREFIX = '_N_T_';
 const store = createFetchPrerenderCacheStore();
+const dynamicTemplateMatcherCache = new Map<
+  string,
+  (pathname: string) => Record<string, string | string[]> | false
+>();
 const ENABLE_DEBUG_INCREMENTAL_CACHE =
   process.env.NEXT_PRIVATE_DEBUG_CACHE === '1' ||
   process.env.ADAPTER_BUN_DEBUG_CACHE === '1';
@@ -132,6 +139,56 @@ function collectTags(
   return [...tags];
 }
 
+function toAppPagePathnameAliasCandidate(tag: string): string | null {
+  if (!tag.startsWith(NEXT_CACHE_ROUTE_TAG_PREFIX)) {
+    return null;
+  }
+
+  const pathname = tag.slice(NEXT_CACHE_ROUTE_TAG_PREFIX.length);
+  if (!pathname.startsWith('/')) {
+    return null;
+  }
+  if (pathname.includes('[') || pathname.includes(']')) {
+    return null;
+  }
+  if (pathname === '/layout' || pathname.endsWith('/layout')) {
+    return null;
+  }
+  if (pathname.endsWith('/page')) {
+    return null;
+  }
+
+  return pathname === '/index' ? '/' : pathname;
+}
+
+function getAppPagePathnameAliasFromTags(cacheKey: string, tags: string[]): string | null {
+  if (cacheKey.startsWith('/')) {
+    return null;
+  }
+
+  const candidates = new Set<string>();
+  for (const tag of tags) {
+    const candidate = toAppPagePathnameAliasCandidate(tag);
+    if (candidate && candidate !== cacheKey) {
+      candidates.add(candidate);
+    }
+  }
+
+  if (candidates.size === 0) {
+    return null;
+  }
+
+  const sorted = [...candidates].sort((left, right) => {
+    const depthDiff = right.split('/').length - left.split('/').length;
+    if (depthDiff !== 0) {
+      return depthDiff;
+    }
+    return right.length - left.length;
+  });
+
+  return sorted[0] ?? null;
+}
+
 function readStoredHeaderTags(headers: Record<string, string>): string[] {
   const raw = headers['x-next-cache-tags'];
   if (typeof raw !== 'string' || raw.length === 0) return [];
@@ -146,6 +203,144 @@ function toAbsoluteTimestamp(seconds: number | null, now: number): number | null
     return null;
   }
   return now + seconds * 1000;
+}
+
+function isDynamicTemplatePathname(pathname: string): boolean {
+  return pathname.includes('[') && pathname.includes(']');
+}
+
+function isDynamicTemplateCandidateCacheKey(cacheKey: string): boolean {
+  return (
+    cacheKey.startsWith('/') &&
+    !cacheKey.startsWith('/_next/') &&
+    !cacheKey.endsWith('.rsc') &&
+    !cacheKey.includes('.segments') &&
+    !cacheKey.endsWith('.meta')
+  );
+}
+
+function toDynamicTemplateSearchPrefixes(cacheKey: string): string[] {
+  const segments = cacheKey.split('/').filter(Boolean);
+  if (segments.length === 0) {
+    return ['/'];
+  }
+
+  const prefixes: string[] = [];
+  for (let index = segments.length - 1; index >= 1; index -= 1) {
+    prefixes.push(`/${segments.slice(0, index).join('/')}/`);
+  }
+  prefixes.push('/');
+  return prefixes;
+}
+
+function getDynamicTemplateMatcher(
+  pathname: string
+): ((candidatePathname: string) => Record<string, string | string[]> | false) | null {
+  const existing = dynamicTemplateMatcherCache.get(pathname);
+  if (existing) {
+    return existing;
+  }
+
+  try {
+    const matcher = getRouteMatcher(
+      getNamedRouteRegex(pathname, {
+        includeSuffix: true,
+        prefixRouteKeys: false,
+      })
+    ) as (candidatePathname: string) => Record<string, string | string[]> | false;
+    dynamicTemplateMatcherCache.set(pathname, matcher);
+    return matcher;
+  } catch {
+    return null;
+  }
+}
+
+function pickDynamicTemplateAliasCacheKey(
+  cacheKey: string,
+  entries: Array<{ cacheKey: string }>
+): string | null {
+  const matches: string[] = [];
+
+  for (const entry of entries) {
+    const candidateCacheKey = entry.cacheKey;
+    if (
+      !isDynamicTemplateCandidateCacheKey(candidateCacheKey) ||
+      !isDynamicTemplatePathname(candidateCacheKey)
+    ) {
+      continue;
+    }
+
+    const matcher = getDynamicTemplateMatcher(candidateCacheKey);
+    if (!matcher || !matcher(cacheKey)) {
+      continue;
+    }
+
+    matches.push(candidateCacheKey);
+  }
+
+  if (matches.length === 0) {
+    return null;
+  }
+
+  matches.sort((left, right) => {
+    const depthDiff = right.split('/').length - left.split('/').length;
+    if (depthDiff !== 0) {
+      return depthDiff;
+    }
+    return right.length - left.length;
+  });
+
+  return matches[0] ?? null;
+}
+
+async function findDynamicTemplateAliasEntry(cacheKey: string): Promise<{
+  cacheKey: string;
+  row: {
+    cacheKey: string;
+    pathname: string;
+    groupId: number;
+    status: number;
+    headers: Record<string, string>;
+    body: Uint8Array | string;
+    bodyEncoding: 'binary' | 'base64';
+    createdAt: number;
+    revalidateAt: number | null;
+    expiresAt: number | null;
+    cacheQuery?: Record<string, string[]>;
+    cacheHeaders?: Record<string, string>;
+  };
+} | null> {
+  for (const prefix of toDynamicTemplateSearchPrefixes(cacheKey)) {
+    const prefixedEntries = (await store.findByPrefix?.(prefix)) ?? [];
+    if (prefixedEntries.length === 0) {
+      continue;
+    }
+
+    const aliasCacheKey = pickDynamicTemplateAliasCacheKey(cacheKey, prefixedEntries);
+    if (!aliasCacheKey) {
+      continue;
+    }
+
+    const prefixedEntry = prefixedEntries.find(
+      (entry) => entry.cacheKey === aliasCacheKey
+    );
+    if (prefixedEntry) {
+      return {
+        cacheKey: aliasCacheKey,
+        row: prefixedEntry,
+      };
+    }
+
+    const directRow = await store.get(aliasCacheKey);
+    if (directRow) {
+      return {
+        cacheKey: aliasCacheKey,
+        row: directRow,
+      };
+    }
+  }
+
+  return null;
 }
 
 function resolveRevalidateSeconds(
@@ -324,7 +519,21 @@ export default class FetchIncrementalCacheHandler
     cacheKey: string,
     ctx: GetIncrementalFetchCacheContext | GetIncrementalResponseCacheContext
   ): Promise<CacheHandlerValue | null> {
-    const row = await store.get(cacheKey);
+    let row = await store.get(cacheKey);
+    let resolvedCacheKey = cacheKey;
+    if (!row && ctx.kind === 'APP_PAGE' && !isDynamicTemplatePathname(cacheKey)) {
+      const aliasEntry = await findDynamicTemplateAliasEntry(cacheKey);
+      if (aliasEntry) {
+        row = aliasEntry.row;
+        resolvedCacheKey = aliasEntry.cacheKey;
+        debugIncrementalCacheLog(
+          'get dynamic alias',
+          cacheKey,
+          '=>',
+          resolvedCacheKey
+        );
+      }
+    }
     if (!row) {
       debugIncrementalCacheLog('get miss', cacheKey, 'kind=', ctx.kind);
       return null;
@@ -401,7 +610,7 @@ export default class FetchIncrementalCacheHandler
     } catch {}
 
     if (!decoded) {
-      const seeded = await decodeSeededPrerenderValue(cacheKey, row, ctx);
+      const seeded = await decodeSeededPrerenderValue(resolvedCacheKey, row, ctx);
       if (!seeded) {
         debugIncrementalCacheLog('get miss decode/seed', cacheKey, 'kind=', ctx.kind);
         return null;
@@ -481,18 +690,20 @@ export default class FetchIncrementalCacheHandler
         ? ctx.cacheControl.expire
         : null;
 
-    await store.set(cacheKey, {
+    const entry = {
       cacheKey,
       pathname: cacheKey,
       groupId: 0,
       status: 200,
       headers,
       body: new TextEncoder().encode(encodeCacheValue(data)),
-      bodyEncoding: 'binary',
+      bodyEncoding: 'binary' as const,
       createdAt: now,
       revalidateAt: toAbsoluteTimestamp(revalidateSeconds, now),
       expiresAt: toAbsoluteTimestamp(expireSeconds, now),
-    });
+    };
+
+    await store.set(cacheKey, entry);
     debugIncrementalCacheLog(
       'set',
       cacheKey,
@@ -504,6 +715,24 @@ export default class FetchIncrementalCacheHandler
       tags.join(',')
     );
     if ((data as { kind?: unknown }).kind === 'APP_PAGE') {
+      const aliasPathname = getAppPagePathnameAliasFromTags(cacheKey, tags);
+      if (aliasPathname) {
+        const existingAlias = await store.get(aliasPathname);
+        if (!existingAlias) {
+          await store.set(aliasPathname, {
+            ...entry,
+            cacheKey: aliasPathname,
+            pathname: aliasPathname,
+          });
+          debugIncrementalCacheLog(
+            'set app-page alias',
+            cacheKey,
+            '=>',
+            aliasPathname
+          );
+        }
+      }
+
       const postponed = (data as { postponed?: unknown }).postponed;
       debugIncrementalCacheLog(
         'set app-page postponed',

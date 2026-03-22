@@ -10,6 +10,14 @@ const CACHE_TAGS_HEADER = 'x-next-cache-tags';
 const CACHE_STALE_HEADER = 'x-next-cache-stale';
 const store = createFetchPrerenderCacheStore();
 const pendingSets = new Map<string, Promise<void>>();
+const inMemoryBodyChunks = new Map<
+  string,
+  {
+    createdAt: number;
+    chunks: Uint8Array[];
+  }
+>();
+const MAX_IN_MEMORY_CHUNK_ENTRIES = 512;
 const ENABLE_DEBUG_CACHE =
   process.env.NEXT_PRIVATE_DEBUG_CACHE === '1' ||
   process.env.ADAPTER_BUN_DEBUG_CACHE === '1';
@@ -52,6 +60,17 @@ function decodeStoredBodyBytes(row: {
 
   const encodedBody = typeof row.body === 'string' ? row.body : utf8FromBytes(row.body);
   return decodeBase64ToBytes(encodedBody);
+}
+
+function toReadableStreamFromChunks(chunks: readonly Uint8Array[]): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(chunk);
+      }
+      controller.close();
+    },
+  });
 }
 
 class FetchCacheHandler implements NextUseCacheHandler {
@@ -141,13 +160,11 @@ class FetchCacheHandler implements NextUseCacheHandler {
     }
 
     const staleSec = readStoredStale(row.headers, revalidateSec);
-    const bodyBytes = decodeStoredBodyBytes(row);
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(bodyBytes);
-        controller.close();
-      },
-    });
+    const cachedBody = inMemoryBodyChunks.get(cacheKey);
+    const stream =
+      cachedBody && cachedBody.createdAt === row.createdAt && cachedBody.chunks.length > 0
+        ? toReadableStreamFromChunks(cachedBody.chunks)
+        : toReadableStreamFromChunks([decodeStoredBodyBytes(row)]);
     debugCacheLog(
       'get return',
       cacheKey,
@@ -200,6 +217,21 @@ class FetchCacheHandler implements NextUseCacheHandler {
         offset += chunk.byteLength;
       }
       const createdAt = entry.timestamp ?? Date.now();
+
+      const chunksForMemory =
+        chunks.length > 0
+          ? chunks.map((chunk) => chunk.slice())
+          : [combined.slice()];
+      inMemoryBodyChunks.set(cacheKey, {
+        createdAt,
+        chunks: chunksForMemory,
+      });
+      if (inMemoryBodyChunks.size > MAX_IN_MEMORY_CHUNK_ENTRIES) {
+        const oldestKey = inMemoryBodyChunks.keys().next().value;
+        if (typeof oldestKey === 'string') {
+          inMemoryBodyChunks.delete(oldestKey);
+        }
+      }
 
       await store.set(cacheKey, {
         cacheKey,
