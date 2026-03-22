@@ -14,6 +14,7 @@ import type {
   SetIncrementalFetchCacheContext,
   SetIncrementalResponseCacheContext,
 } from 'next/dist/server/response-cache';
+import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 const MAP_MARKER = '__adapter_bun_type';
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
@@ -28,6 +29,28 @@ const KNOWN_CACHE_KINDS = new Set([
 ]);
 
 registerGlobalCacheHandlers(cacheHandler);
+
+function updateInMemoryTagsManifest(
+  tags: string[],
+  update: PrerenderTagManifestUpdate & { now: number }
+): void {
+  for (const tag of tags) {
+    const current = tagsManifest.get(tag) ?? {};
+    if (update.mode === 'stale') {
+      current.stale = update.now;
+      if (
+        typeof update.expireSeconds === 'number' &&
+        Number.isFinite(update.expireSeconds) &&
+        update.expireSeconds > 0
+      ) {
+        current.expired = update.now + update.expireSeconds * 1000;
+      }
+    } else {
+      current.expired = update.now;
+    }
+    tagsManifest.set(tag, current);
+  }
+}
 
 function normalizeTags(tags: string[]): string[] {
   const unique = new Set<string>();
@@ -341,6 +364,7 @@ async function updateTagManifests(
   update: PrerenderTagManifestUpdate & { now: number }
 ): Promise<void> {
   if (tags.length === 0) return;
+  updateInMemoryTagsManifest(tags, update);
   const store = getSharedPrerenderCacheStore();
   store.updateTagManifest?.(tags, update);
 }
@@ -394,14 +418,19 @@ export default class BunSqliteIncrementalCacheHandler
     if (tagsToCheck.length > 0) {
       const tagEntries = store.getTagManifestEntries?.(tagsToCheck);
       if (tagEntries) {
+        const now = Date.now();
         for (const tag of tagsToCheck) {
           const tagEntry = tagEntries[tag];
           if (!tagEntry) continue;
-          if (tagEntry.expiredAt !== undefined && tagEntry.expiredAt > row.createdAt) {
+          if (
+            tagEntry.expiredAt !== undefined &&
+            tagEntry.expiredAt <= now &&
+            tagEntry.expiredAt > row.createdAt
+          ) {
             return null;
           }
           if (tagEntry.staleAt !== undefined && tagEntry.staleAt > row.createdAt) {
-            return null;
+            continue;
           }
         }
       }

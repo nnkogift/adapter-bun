@@ -95,6 +95,11 @@ export interface BunRuntimeRouting {
   shouldNormalizeNextData: boolean;
 }
 
+export interface BunRuntimeAssetBinding {
+  name: string;
+  filePath: string;
+}
+
 export interface BunRuntimeFunctionOutput {
   id: string;
   pathname: string;
@@ -107,6 +112,8 @@ export interface BunRuntimeFunctionOutput {
     handlerExport: string;
   };
   assets?: string[];
+  assetBindings?: BunRuntimeAssetBinding[];
+  wasmBindings?: BunRuntimeAssetBinding[];
   env?: Record<string, string>;
 }
 

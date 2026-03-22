@@ -4,10 +4,12 @@ import path from 'node:path';
 import { Database } from 'bun:sqlite';
 import type { NextAdapter } from 'next';
 import type { AdapterOutput } from 'next';
+import type { IncrementalCacheValue } from 'next/dist/server/response-cache';
 import {
   buildDeploymentManifest,
   collectOutputPathnames,
 } from './manifest.ts';
+import { encodeCacheValue } from './runtime/incremental-cache-codec.ts';
 import { SCHEMA_SQL } from './runtime/sqlite-cache.ts';
 import {
   stageStaticAssets,
@@ -15,6 +17,7 @@ import {
 } from './staging.ts';
 import type {
   BunAdapterOptions,
+  BunRuntimeAssetBinding,
   BunDeploymentManifest,
   BunRuntimeFunctionOutput,
   BuildCompleteContext,
@@ -27,6 +30,8 @@ const DEFAULT_HOSTNAME = '0.0.0.0';
 const DEFAULT_CACHE_HANDLER_MODE = 'http';
 const DEFAULT_CACHE_ENDPOINT_PATH = '/_adapter/cache';
 const RUNTIME_NEXT_CONFIG_FILE = 'runtime-next-config.json';
+const RSC_SUFFIX = '.rsc';
+const SEGMENT_RSC_SUFFIX = '.segment.rsc';
 const CACHE_RUNTIME_MODULES = [
   'cache-handler.js',
   'cache-handler-http.js',
@@ -284,6 +289,129 @@ function collectTags(
   return [...tags].sort();
 }
 
+function getHeaderValueIgnoreCase(
+  headers: Record<string, string>,
+  key: string
+): string | undefined {
+  const keyLower = key.toLowerCase();
+  for (const [headerKey, value] of Object.entries(headers)) {
+    if (headerKey.toLowerCase() === keyLower) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+interface AppPageRouteMeta {
+  postponed?: string;
+  segmentPaths?: string[];
+}
+
+async function readAppPageRouteMeta(htmlPath: string): Promise<AppPageRouteMeta | null> {
+  if (!htmlPath.endsWith('.html')) {
+    return null;
+  }
+
+  const metaPath = htmlPath.slice(0, -'.html'.length) + '.meta';
+  if (!existsSync(metaPath)) {
+    return null;
+  }
+
+  try {
+    const parsed = (await Bun.file(metaPath).json()) as Record<string, unknown>;
+    const postponed = typeof parsed.postponed === 'string' ? parsed.postponed : undefined;
+    const segmentPaths = Array.isArray(parsed.segmentPaths)
+      ? parsed.segmentPaths.filter((item): item is string => typeof item === 'string')
+      : undefined;
+    return { postponed, segmentPaths };
+  } catch {
+    return null;
+  }
+}
+
+function hasSeededSegmentEntries(
+  cacheKey: string,
+  pathnames: Iterable<string>
+): boolean {
+  const segmentPrefix = `${cacheKey}.segments/`;
+  for (const pathname of pathnames) {
+    if (
+      pathname.startsWith(segmentPrefix) &&
+      pathname.endsWith(SEGMENT_RSC_SUFFIX)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function buildSeededAppPageCacheValue({
+  cacheKey,
+  sourcePath,
+  htmlBody,
+  headers,
+  status,
+  sourcePathByPathname,
+}: {
+  cacheKey: string;
+  sourcePath: string;
+  htmlBody: Uint8Array;
+  headers: Record<string, string>;
+  status: number;
+  sourcePathByPathname: Map<string, string>;
+}): Promise<IncrementalCacheValue | null> {
+  const contentType = getHeaderValueIgnoreCase(headers, 'content-type');
+  if (!contentType || !contentType.toLowerCase().startsWith('text/html')) {
+    return null;
+  }
+
+  const meta = await readAppPageRouteMeta(sourcePath);
+  const hasAppCompanion =
+    sourcePathByPathname.has(`${cacheKey}${RSC_SUFFIX}`) ||
+    hasSeededSegmentEntries(cacheKey, sourcePathByPathname.keys()) ||
+    Boolean(meta?.postponed);
+  if (!hasAppCompanion) {
+    return null;
+  }
+
+  let rscData: Buffer | undefined;
+  const shouldLoadRscData = !(meta && typeof meta.postponed === 'string');
+  if (shouldLoadRscData) {
+    const rscPath = sourcePathByPathname.get(`${cacheKey}${RSC_SUFFIX}`);
+    if (rscPath && existsSync(rscPath)) {
+      rscData = Buffer.from(await Bun.file(rscPath).bytes());
+    }
+  }
+
+  const segmentData = new Map<string, Buffer>();
+  for (const segmentPathRaw of meta?.segmentPaths ?? []) {
+    const segmentPath = segmentPathRaw.startsWith('/')
+      ? segmentPathRaw
+      : `/${segmentPathRaw}`;
+    const segmentCacheKey = `${cacheKey}.segments${segmentPath}${SEGMENT_RSC_SUFFIX}`;
+    const segmentSourcePath = sourcePathByPathname.get(segmentCacheKey);
+    if (!segmentSourcePath || !existsSync(segmentSourcePath)) {
+      continue;
+    }
+    segmentData.set(
+      segmentPath,
+      Buffer.from(await Bun.file(segmentSourcePath).bytes())
+    );
+  }
+
+  const appPageValue: IncrementalCacheValue = {
+    kind: 'APP_PAGE',
+    html: Buffer.from(htmlBody).toString('utf8'),
+    headers,
+    status,
+    ...(rscData ? { rscData } : {}),
+    ...(meta?.postponed ? { postponed: meta.postponed } : {}),
+    ...(segmentData.size > 0 ? { segmentData } : {}),
+  } as IncrementalCacheValue;
+
+  return appPageValue;
+}
+
 function cloneRouteHas(
   value: BuildRouteHas
 ): NonNullable<RuntimeRoutingConfig['beforeFiles'][number]['has']>[number] {
@@ -351,6 +479,24 @@ function toRuntimeRoutingConfig(ctx: BuildCompleteContext): RuntimeRoutingConfig
   };
 }
 
+function toRuntimeAssetBindings(
+  value: Record<string, string> | undefined
+): BunRuntimeAssetBinding[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const bindings: BunRuntimeAssetBinding[] = [];
+  for (const [name, filePath] of Object.entries(value)) {
+    if (!name || !filePath) {
+      continue;
+    }
+    bindings.push({ name, filePath });
+  }
+
+  return bindings.length > 0 ? bindings : undefined;
+}
+
 function toRuntimeFunctionOutput({
   output,
   includeAssets,
@@ -363,9 +509,17 @@ function toRuntimeFunctionOutput({
     | AdapterOutput['MIDDLEWARE'];
   includeAssets: boolean;
 }): BunRuntimeFunctionOutput {
+  const assetBindings = includeAssets ? toRuntimeAssetBindings(output.assets) : undefined;
+  const wasmBindings = includeAssets ? toRuntimeAssetBindings(output.wasmAssets) : undefined;
   const serializedAssets =
-    includeAssets && output.assets
-      ? [...new Set([output.filePath, ...Object.values(output.assets)])]
+    includeAssets
+      ? [
+          ...new Set([
+            output.filePath,
+            ...(assetBindings?.map((binding) => binding.filePath) ?? []),
+            ...(wasmBindings?.map((binding) => binding.filePath) ?? []),
+          ]),
+        ]
       : undefined;
   const env = output.config.env;
 
@@ -386,6 +540,12 @@ function toRuntimeFunctionOutput({
       : {}),
     ...(serializedAssets && serializedAssets.length > 0
       ? { assets: serializedAssets }
+      : {}),
+    ...(assetBindings && assetBindings.length > 0
+      ? { assetBindings }
+      : {}),
+    ...(wasmBindings && wasmBindings.length > 0
+      ? { wasmBindings }
       : {}),
     ...(env && Object.keys(env).length > 0 ? { env: { ...env } } : {}),
   };
@@ -422,6 +582,15 @@ async function seedPrerenderCache({
 }): Promise<void> {
   const seedable = prerenders.filter((p) => p.fallback?.filePath);
   if (seedable.length === 0) return;
+
+  const sourcePathByPathname = new Map<string, string>();
+  for (const prerender of seedable) {
+    const fallback = prerender.fallback!;
+    sourcePathByPathname.set(
+      prerender.pathname,
+      resolveSourcePath(repoRoot, fallback.filePath!)
+    );
+  }
 
   const dbPath = path.join(outDir, 'cache.db');
   const db = new Database(dbPath);
@@ -474,6 +643,19 @@ async function seedPrerenderCache({
 
       const status = fallback.initialStatus ?? 200;
 
+      let storedBody = body;
+      const seededAppPageValue = await buildSeededAppPageCacheValue({
+        cacheKey,
+        sourcePath,
+        htmlBody: body,
+        headers,
+        status,
+        sourcePathByPathname,
+      });
+      if (seededAppPageValue) {
+        storedBody = Buffer.from(encodeCacheValue(seededAppPageValue), 'utf8');
+      }
+
       let revalidateAt: number | null = null;
       if (typeof fallback.initialRevalidate === 'number' && fallback.initialRevalidate > 0) {
         revalidateAt = createdAt + fallback.initialRevalidate * 1000;
@@ -490,7 +672,7 @@ async function seedPrerenderCache({
         groupId: prerender.groupId,
         status,
         headers: JSON.stringify(headers),
-        body,
+        body: storedBody,
         tags,
         revalidateAt,
         expiresAt,

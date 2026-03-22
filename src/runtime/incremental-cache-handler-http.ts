@@ -23,11 +23,43 @@ import type {
   SetIncrementalFetchCacheContext,
   SetIncrementalResponseCacheContext,
 } from 'next/dist/server/response-cache';
+import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
 const store = createFetchPrerenderCacheStore();
+const ENABLE_DEBUG_INCREMENTAL_CACHE =
+  process.env.NEXT_PRIVATE_DEBUG_CACHE === '1' ||
+  process.env.ADAPTER_BUN_DEBUG_CACHE === '1';
 
 registerGlobalCacheHandlers(cacheHandler);
+
+function debugIncrementalCacheLog(...args: unknown[]): void {
+  if (ENABLE_DEBUG_INCREMENTAL_CACHE) {
+    console.log('[adapter-bun][incremental-cache-http]', ...args);
+  }
+}
+
+function updateInMemoryTagsManifest(
+  tags: string[],
+  update: PrerenderTagManifestUpdate & { now: number }
+): void {
+  for (const tag of tags) {
+    const current = tagsManifest.get(tag) ?? {};
+    if (update.mode === 'stale') {
+      current.stale = update.now;
+      if (
+        typeof update.expireSeconds === 'number' &&
+        Number.isFinite(update.expireSeconds) &&
+        update.expireSeconds > 0
+      ) {
+        current.expired = update.now + update.expireSeconds * 1000;
+      }
+    } else {
+      current.expired = update.now;
+    }
+    tagsManifest.set(tag, current);
+  }
+}
 
 function normalizeTags(tags: string[]): string[] {
   const unique = new Set<string>();
@@ -254,6 +286,7 @@ async function updateTagManifests(
   update: PrerenderTagManifestUpdate & { now: number }
 ): Promise<void> {
   if (tags.length === 0) return;
+  updateInMemoryTagsManifest(tags, update);
   await store.updateTagManifest?.(tags, update);
 }
 
@@ -293,24 +326,61 @@ export default class FetchIncrementalCacheHandler
   ): Promise<CacheHandlerValue | null> {
     const row = await store.get(cacheKey);
     if (!row) {
+      debugIncrementalCacheLog('get miss', cacheKey, 'kind=', ctx.kind);
       return null;
     }
 
     const queryTags = getFetchContextTags(ctx);
     const storedTags = readStoredHeaderTags(row.headers);
     const tagsToCheck = normalizeTags([...queryTags, ...storedTags]);
+    debugIncrementalCacheLog(
+      'get hit',
+      cacheKey,
+      'kind=',
+      ctx.kind,
+      'createdAt=',
+      row.createdAt,
+      'tags=',
+      tagsToCheck.join(',')
+    );
 
     if (tagsToCheck.length > 0) {
       const tagEntries = await store.getTagManifestEntries?.(tagsToCheck);
       if (tagEntries) {
+        const now = Date.now();
         for (const tag of tagsToCheck) {
           const tagEntry = tagEntries[tag];
           if (!tagEntry) continue;
-          if (tagEntry.expiredAt !== undefined && tagEntry.expiredAt > row.createdAt) {
+          if (
+            tagEntry.expiredAt !== undefined &&
+            tagEntry.expiredAt <= now &&
+            tagEntry.expiredAt > row.createdAt
+          ) {
+            debugIncrementalCacheLog(
+              'get miss expired tag',
+              cacheKey,
+              'tag=',
+              tag,
+              'expiredAt=',
+              tagEntry.expiredAt,
+              'now=',
+              now,
+              'createdAt=',
+              row.createdAt
+            );
             return null;
           }
           if (tagEntry.staleAt !== undefined && tagEntry.staleAt > row.createdAt) {
-            return null;
+            debugIncrementalCacheLog(
+              'get stale tag',
+              cacheKey,
+              'tag=',
+              tag,
+              'staleAt=',
+              tagEntry.staleAt,
+              'createdAt=',
+              row.createdAt
+            );
           }
         }
       }
@@ -333,10 +403,36 @@ export default class FetchIncrementalCacheHandler
     if (!decoded) {
       const seeded = await decodeSeededPrerenderValue(cacheKey, row, ctx);
       if (!seeded) {
+        debugIncrementalCacheLog('get miss decode/seed', cacheKey, 'kind=', ctx.kind);
         return null;
       }
       value = seeded;
     }
+
+    if (
+      value &&
+      typeof value === 'object' &&
+      (value as { kind?: unknown }).kind === 'APP_PAGE'
+    ) {
+      const postponed = (value as { postponed?: unknown }).postponed;
+      const headers = (value as { headers?: unknown }).headers;
+      const cacheTagsHeader =
+        headers &&
+        typeof headers === 'object' &&
+        'x-next-cache-tags' in (headers as Record<string, unknown>) &&
+        typeof (headers as Record<string, unknown>)['x-next-cache-tags'] === 'string'
+          ? ((headers as Record<string, unknown>)['x-next-cache-tags'] as string)
+          : '';
+      debugIncrementalCacheLog(
+        'get app-page postponed',
+        cacheKey,
+        typeof postponed === 'string' ? postponed.length : 0,
+        'cache-tags=',
+        cacheTagsHeader
+      );
+    }
+
+    debugIncrementalCacheLog('get return', cacheKey, 'kind=', ctx.kind);
 
     return {
       lastModified: row.createdAt,
@@ -366,6 +462,7 @@ export default class FetchIncrementalCacheHandler
         revalidateAt: null,
         expiresAt: null,
       });
+      debugIncrementalCacheLog('set null marker', cacheKey);
       return;
     }
 
@@ -396,5 +493,23 @@ export default class FetchIncrementalCacheHandler
       revalidateAt: toAbsoluteTimestamp(revalidateSeconds, now),
       expiresAt: toAbsoluteTimestamp(expireSeconds, now),
     });
+    debugIncrementalCacheLog(
+      'set',
+      cacheKey,
+      'kind=',
+      (data as { kind?: unknown }).kind,
+      'createdAt=',
+      now,
+      'tags=',
+      tags.join(',')
+    );
+    if ((data as { kind?: unknown }).kind === 'APP_PAGE') {
+      const postponed = (data as { postponed?: unknown }).postponed;
+      debugIncrementalCacheLog(
+        'set app-page postponed',
+        cacheKey,
+        typeof postponed === 'string' ? postponed.length : 0
+      );
+    }
   }
 }
