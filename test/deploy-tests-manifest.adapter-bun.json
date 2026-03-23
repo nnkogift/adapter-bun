@@ -1,12 +1,5 @@
 {
   "version": 2,
-  "suites": {
-    "test/e2e/app-dir/segment-cache/memory-pressure/segment-cache-memory-pressure.test.ts": {
-      "failed": [
-        "segment cache memory pressure does not leak memory when repeatedly triggering prefetches"
-      ]
-    }
-  },
   "rules": {
     "include": [],
     "exclude": [
@@ -14,7 +7,8 @@
       "test/e2e/middleware-fetches-with-any-http-method/index.test.ts",
       "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts",
       "test/e2e/edge-async-local-storage/index.test.ts",
-      "test/e2e/app-dir/app-prefetch/prefetching.test.ts"
+      "test/e2e/app-dir/app-prefetch/prefetching.test.ts",
+      "test/e2e/app-dir/segment-cache/memory-pressure/segment-cache-memory-pressure.test.ts"
     ]
   }
 }
