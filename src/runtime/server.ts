@@ -1123,6 +1123,15 @@ function toNextDataPathname(
   return `${basePath}/_next/data/${buildId}${dataRoutePathname}.json`;
 }
 
+function normalizeRepeatedSlashes(url: string): string {
+  const urlParts = url.split('?');
+  const urlNoQuery = urlParts[0] ?? '';
+  return (
+    urlNoQuery.replace(/\\/g, '/').replace(/\/\/+/g, '/') +
+    (urlParts[1] ? `?${urlParts.slice(1).join('?')}` : '')
+  );
+}
+
 const ENABLE_DEBUG_ROUTING = process.env.ADAPTER_BUN_DEBUG_ROUTING === '1';
 const ENABLE_DEBUG_CONNECTIONS = process.env.ADAPTER_BUN_DEBUG_CONNECTIONS === '1';
 const ENABLE_DEBUG_TIMERS = process.env.ADAPTER_BUN_DEBUG_TIMERS === '1';
@@ -1953,6 +1962,22 @@ function hasLocalePrefixInPathname(
     }
   }
   return false;
+}
+
+function getLocaleFromPathname(
+  pathname: string,
+  basePath: string,
+  i18n: ReturnType<typeof toRoutingI18n>
+): string | undefined {
+  if (!i18n) {
+    return undefined;
+  }
+  const withoutBasePath = getPathnameWithoutBasePath(pathname, basePath);
+  const firstSegment = withoutBasePath.split('/').filter(Boolean)[0];
+  if (firstSegment && i18n.locales.includes(firstSegment)) {
+    return firstSegment;
+  }
+  return undefined;
 }
 
 function isApiPathname(
@@ -5146,6 +5171,16 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  const requestUrlNoQuery = (req.url || '').split('?', 1)[0] ?? '';
+  if (requestUrlNoQuery.match(/(\\|\/\/)/)) {
+    const normalizedUrl = normalizeRepeatedSlashes(req.url || '/');
+    res.statusCode = 308;
+    res.setHeader('location', normalizedUrl);
+    markConnectionClose(res);
+    res.end(normalizedUrl);
+    return;
+  }
+
   const debugRequest = shouldDebugRequest(req.url);
   if (debugRequest) {
     res.once('finish', () => {
@@ -5802,7 +5837,15 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      const notFoundLocale =
+        getLocaleFromPathname(requestUrl.pathname, basePath, runtimeI18n) ??
+        getLocaleFromPathname(routingUrl.pathname, basePath, runtimeI18n) ??
+        runtimeI18n?.defaultLocale;
+      const localizedNotFoundPathname = notFoundLocale
+        ? `${basePath}${basePath ? '/' : '/'}${notFoundLocale}/404`
+        : null;
       const notFoundAsset = resolveStaticAssetFromCandidates([
+        localizedNotFoundPathname,
         '/404',
         basePath ? `${basePath}/404` : null,
       ]);
@@ -6140,7 +6183,26 @@ const server = http.createServer(async (req, res) => {
       requestMeta.isNextDataReq = true;
       req.url = `${requestUrl.pathname}${requestUrl.search}`;
     } else if (middlewareRewriteUrl) {
-      req.url = `${requestUrl.pathname}${resolvedUrl.search}`;
+      const matchedLocale = getLocaleFromPathname(
+        matchedPathname,
+        basePath,
+        runtimeI18n
+      );
+      const requestLocale =
+        getLocaleFromPathname(sourcePathname, basePath, runtimeI18n) ??
+        runtimeI18n?.defaultLocale;
+      // Preserve original request URLs for middleware rewrites by default, but
+      // when middleware rewrites into a different non-default locale we need to
+      // invoke with the rewritten pathname so Next can resolve locale context.
+      const shouldUseRewrittenMiddlewareUrl =
+        Boolean(runtimeI18n) &&
+        typeof matchedLocale === 'string' &&
+        typeof requestLocale === 'string' &&
+        matchedLocale !== requestLocale &&
+        matchedLocale !== runtimeI18n?.defaultLocale;
+      req.url = shouldUseRewrittenMiddlewareUrl
+        ? `${resolvedUrl.pathname}${resolvedUrl.search}`
+        : `${requestUrl.pathname}${resolvedUrl.search}`;
     } else if (process.env.ADAPTER_BUN_USE_ORIGINAL_REQ_URL === '1') {
       req.url = `${requestUrl.pathname}${requestUrl.search}`;
     } else {
