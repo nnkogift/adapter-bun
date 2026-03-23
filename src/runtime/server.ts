@@ -14,6 +14,7 @@ import {
   responseToMiddlewareResult,
   type Route,
   type RouteHas,
+  type ResolveRoutesQuery,
   type ResolveRoutesResult,
 } from '@next/routing';
 import {
@@ -797,285 +798,6 @@ function getRouteCapturesForPathname(
   }
 
   return captures;
-}
-
-function applyDestinationQueryFromRoutingRules(
-  requestUrl: URL,
-  matchedPathname: string,
-  query: URLSearchParams,
-  routingConfig: RuntimeRoutingConfig | null,
-  requestHeaders: IncomingHttpHeaders,
-  routeMatches?: Record<string, string>
-): URLSearchParams {
-  const nextQuery = new URLSearchParams(query);
-  if (!routingConfig) {
-    return nextQuery;
-  }
-
-  const routeGroups: RuntimeRoute[][] = [
-    routingConfig.beforeMiddleware,
-    routingConfig.beforeFiles,
-    routingConfig.afterFiles,
-    routingConfig.fallback,
-  ];
-  const routingHeaders = toRequestHeaders(requestHeaders);
-  let currentUrl = new URL(requestUrl.toString());
-
-  for (const routes of routeGroups) {
-    for (const route of routes) {
-      if (!route.destination) {
-        continue;
-      }
-      if (isRedirectStatusCode(route.status)) {
-        continue;
-      }
-
-      const routeMatch = matchRoutingRule(route, currentUrl, routingHeaders);
-      if (!routeMatch.matched) {
-        continue;
-      }
-
-      const destination = replaceRouteDestinationCaptures(
-        route.destination,
-        routeMatch.regexMatch,
-        routeMatches,
-        routeMatch.conditionCaptures
-      );
-      if (isExternalDestinationUrl(destination)) {
-        continue;
-      }
-
-      const destinationUrl = new URL(destination, 'http://n');
-      currentUrl = applyInternalRouteDestination(currentUrl, destination);
-      if (
-        !destination.includes('?') ||
-        !pathnameMatchesRoutePathname(destinationUrl.pathname, matchedPathname) ||
-        destinationUrl.searchParams.size === 0
-      ) {
-        continue;
-      }
-
-      const destinationQueryKeys = new Set(destinationUrl.searchParams.keys());
-      for (const destinationQueryKey of destinationQueryKeys) {
-        nextQuery.delete(destinationQueryKey);
-      }
-      for (const [destinationQueryKey, destinationQueryValue] of destinationUrl.searchParams.entries()) {
-        nextQuery.append(destinationQueryKey, destinationQueryValue);
-      }
-      return nextQuery;
-    }
-  }
-
-  return nextQuery;
-}
-
-function resolveDestinationPathnameFromRoutingRules(
-  requestUrl: URL,
-  matchedPathname: string,
-  routingConfig: RuntimeRoutingConfig | null,
-  requestHeaders: IncomingHttpHeaders,
-  routeMatches?: Record<string, string>
-):
-  | {
-      pathname: string;
-      captures: Record<string, string>;
-    }
-  | null {
-  if (!routingConfig) {
-    return null;
-  }
-
-  const routeGroups: RuntimeRoute[][] = [
-    routingConfig.beforeMiddleware,
-    routingConfig.beforeFiles,
-    routingConfig.afterFiles,
-    routingConfig.dynamicRoutes,
-    routingConfig.fallback,
-  ];
-  const routingHeaders = toRequestHeaders(requestHeaders);
-  let currentUrl = new URL(requestUrl.toString());
-
-  for (const routes of routeGroups) {
-    for (const route of routes) {
-      if (!route.destination) {
-        continue;
-      }
-      if (isRedirectStatusCode(route.status)) {
-        continue;
-      }
-
-      const routeMatch = matchRoutingRule(route, currentUrl, routingHeaders);
-      if (!routeMatch.matched) {
-        continue;
-      }
-
-      const destination = replaceRouteDestinationCaptures(
-        route.destination,
-        routeMatch.regexMatch,
-        routeMatches,
-        routeMatch.conditionCaptures
-      );
-      if (isExternalDestinationUrl(destination)) {
-        continue;
-      }
-
-      const destinationUrl = new URL(destination, 'http://n');
-      currentUrl = applyInternalRouteDestination(currentUrl, destination);
-      if (!pathnameMatchesRoutePathname(destinationUrl.pathname, matchedPathname)) {
-        continue;
-      }
-
-      const captures: Record<string, string> = {
-        ...routeMatch.conditionCaptures,
-      };
-      const groups = (
-        routeMatch.regexMatch as RegExpMatchArray & { groups?: Record<string, string | undefined> }
-      ).groups;
-      if (groups) {
-        for (const [key, value] of Object.entries(groups)) {
-          if (typeof value === 'string' && value.length > 0) {
-            captures[key] = value;
-          }
-        }
-      }
-
-      return {
-        pathname: destinationUrl.pathname,
-        captures,
-      };
-    }
-  }
-
-  return null;
-}
-
-function extractRewriteSourceParamsFromRoutingRules(
-  requestUrl: URL,
-  matchedPathname: string,
-  routingConfig: RuntimeRoutingConfig | null,
-  requestHeaders: IncomingHttpHeaders,
-  routeMatches?: Record<string, string>
-): Record<string, string> {
-  if (!routingConfig) {
-    return {};
-  }
-
-  const routeGroups: RuntimeRoute[][] = [
-    routingConfig.beforeMiddleware,
-    routingConfig.beforeFiles,
-    routingConfig.afterFiles,
-    routingConfig.fallback,
-  ];
-  const matchedRouteParams =
-    toRequestMetaParamsFromRouteMatches(routeMatches, matchedPathname) ?? {};
-  const matchedRouteMatcher = isDynamicRoute(matchedPathname)
-    ? getRouteMatcher(
-        getNamedRouteRegex(normalizePathnameForRouteMatching(matchedPathname), {
-          prefixRouteKeys: false,
-          includeSuffix: true,
-        })
-      )
-    : null;
-  const routingHeaders = toRequestHeaders(requestHeaders);
-
-  const areParamsCompatible = (
-    destinationParams: RuntimeRequestMetaParams | undefined
-  ): boolean => {
-    if (!destinationParams) {
-      return true;
-    }
-
-    for (const [key, value] of Object.entries(destinationParams)) {
-      const matchedValue = matchedRouteParams[key];
-      if (matchedValue === undefined) {
-        continue;
-      }
-      if (Array.isArray(value) && Array.isArray(matchedValue)) {
-        if (value.length !== matchedValue.length) {
-          return false;
-        }
-        for (let index = 0; index < value.length; index += 1) {
-          if (value[index] !== matchedValue[index]) {
-            return false;
-          }
-        }
-        continue;
-      }
-      if (value !== matchedValue) {
-        return false;
-      }
-    }
-
-    return true;
-  };
-
-  let firstDynamicParams: Record<string, string> | null = null;
-  let currentUrl = new URL(requestUrl.toString());
-
-  for (const routes of routeGroups) {
-    for (const route of routes) {
-      if (!route.destination) {
-        continue;
-      }
-      if (isRedirectStatusCode(route.status)) {
-        continue;
-      }
-
-      const routeMatch = matchRoutingRule(route, currentUrl, routingHeaders);
-      if (!routeMatch.matched) {
-        continue;
-      }
-
-      const destination = replaceRouteDestinationCaptures(
-        route.destination,
-        routeMatch.regexMatch,
-        routeMatches,
-        routeMatch.conditionCaptures
-      );
-      if (isExternalDestinationUrl(destination)) {
-        continue;
-      }
-
-      const destinationUrl = new URL(destination, 'http://n');
-      currentUrl = applyInternalRouteDestination(currentUrl, destination);
-      if (!pathnameMatchesRoutePathname(destinationUrl.pathname, matchedPathname)) {
-        continue;
-      }
-      if (matchedRouteMatcher) {
-        const destinationParams = toRequestMetaParamsFromMatcher(
-          matchedRouteMatcher(destinationUrl.pathname) as RuntimeDynamicRouteMatcherResult | false
-        );
-        if (!areParamsCompatible(destinationParams)) {
-          continue;
-        }
-      }
-
-      const sourceParams: Record<string, string> = {};
-      const groups = (
-        routeMatch.regexMatch as RegExpMatchArray & { groups?: Record<string, string | undefined> }
-      ).groups;
-      if (groups) {
-        for (const [key, value] of Object.entries(groups)) {
-          if (typeof value !== 'string' || value.length === 0) {
-            continue;
-          }
-          sourceParams[key] = value;
-        }
-      }
-
-      if (Object.keys(sourceParams).length === 0) {
-        // If any matching rewrite has no source captures, treat it as an
-        // exact/static match and ignore capture params from broader patterns.
-        return {};
-      }
-
-      if (!firstDynamicParams) {
-        firstDynamicParams = sourceParams;
-      }
-    }
-  }
-
-  return firstDynamicParams ?? {};
 }
 
 function getNextDataNormalizedPathname(
@@ -2539,6 +2261,43 @@ function toRequestQuery(
   return query;
 }
 
+function toRequestQueryFromResolveRoutesQuery(
+  query: ResolveRoutesQuery | undefined
+): RuntimeRequestMetaQuery {
+  if (!query) {
+    return {};
+  }
+
+  const requestQuery: RuntimeRequestMetaQuery = {};
+  for (const [key, value] of Object.entries(query)) {
+    requestQuery[key] = Array.isArray(value) ? [...value] : value;
+  }
+
+  return requestQuery;
+}
+
+function toSearchStringFromResolveRoutesQuery(
+  query: ResolveRoutesQuery | undefined
+): string {
+  if (!query) {
+    return '';
+  }
+
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        searchParams.append(key, entry);
+      }
+      continue;
+    }
+    searchParams.append(key, value);
+  }
+
+  const search = searchParams.toString();
+  return search.length > 0 ? `?${search}` : '';
+}
+
 function mergeRequestMetaValuesIntoSearchParams(
   searchParams: URLSearchParams,
   values: RuntimeRequestMetaQuery | RuntimeRequestMetaParams | undefined
@@ -2560,39 +2319,6 @@ function mergeRequestMetaValuesIntoSearchParams(
     }
     searchParams.append(key, value);
   }
-}
-
-function mergeDecodedParamsIntoQuery(
-  query: RuntimeRequestMetaQuery,
-  params: Record<string, string> | undefined
-): RuntimeRequestMetaQuery {
-  if (!params) {
-    return query;
-  }
-
-  for (const [key, value] of Object.entries(params)) {
-    if (typeof value !== 'string') {
-      continue;
-    }
-    const decodedValue = decodeRouteMatchValue(value);
-
-    const existing = query[key];
-    if (existing === undefined) {
-      query[key] = decodedValue;
-      continue;
-    }
-    if (Array.isArray(existing)) {
-      if (!existing.includes(decodedValue)) {
-        existing.push(decodedValue);
-      }
-      continue;
-    }
-    if (existing !== decodedValue) {
-      query[key] = [existing, decodedValue];
-    }
-  }
-
-  return query;
 }
 
 function removeSyntheticRoutePlaceholderQueryValues(
@@ -5378,7 +5104,7 @@ const server = http.createServer(async (req, res) => {
     const requestBody = await getBufferedRequestBody(req);
 
     let resolvedRoutingResult: ResolveRoutesResult = {
-      matchedPathname: routingUrl.pathname,
+      resolvedPathname: routingUrl.pathname,
       resolvedHeaders: new Headers(),
     };
     const routingHeaders = toRequestHeaders(req.headers);
@@ -5525,9 +5251,17 @@ const server = http.createServer(async (req, res) => {
           // root routes (for example "/en") but requests arrive on "/".
           const adjustedHeaders = new Headers(resolvedRouteHeaders);
           adjustedHeaders.delete('location');
+          const fallbackInvocationQuery =
+            resolvedRoutingResult.invocationTarget?.query ??
+            resolvedRoutingResult.resolvedQuery ??
+            {};
           resolvedRoutingResult = {
             ...resolvedRoutingResult,
-            matchedPathname: defaultLocaleRootPathname,
+            resolvedPathname: defaultLocaleRootPathname,
+            invocationTarget: {
+              pathname: defaultLocaleRootPathname,
+              query: fallbackInvocationQuery,
+            },
             status: undefined,
             resolvedHeaders: adjustedHeaders,
           };
@@ -5536,7 +5270,7 @@ const server = http.createServer(async (req, res) => {
 
       if (
         /[A-Z]/.test(routingUrl.pathname) &&
-        !resolvedRoutingResult.matchedPathname &&
+        !resolvedRoutingResult.resolvedPathname &&
         !resolvedRoutingResult.redirect &&
         !resolvedRoutingResult.externalRewrite &&
         !resolvedRoutingResult.middlewareResponded
@@ -5564,31 +5298,39 @@ const server = http.createServer(async (req, res) => {
         if (
           trailingSlashFallbackPathname &&
           (
-            !resolvedRoutingResult.matchedPathname ||
+            !resolvedRoutingResult.resolvedPathname ||
             isDynamicRoute(
-              normalizePathnameForRouteMatching(resolvedRoutingResult.matchedPathname)
+              normalizePathnameForRouteMatching(resolvedRoutingResult.resolvedPathname)
             )
           )
         ) {
+          const fallbackInvocationQuery =
+            resolvedRoutingResult.invocationTarget?.query ??
+            resolvedRoutingResult.resolvedQuery ??
+            {};
           resolvedRoutingResult = {
             ...resolvedRoutingResult,
-            matchedPathname: trailingSlashFallbackPathname,
+            resolvedPathname: trailingSlashFallbackPathname,
+            invocationTarget: {
+              pathname: trailingSlashFallbackPathname,
+              query: fallbackInvocationQuery,
+            },
             routeMatches: undefined,
           };
         }
       }
     }
 
-    if (resolvedRoutingResult.matchedPathname) {
+    if (resolvedRoutingResult.resolvedPathname) {
       const normalizedMatchedNextDataPathname = getNextDataNormalizedPathname(
-        resolvedRoutingResult.matchedPathname,
+        resolvedRoutingResult.resolvedPathname,
         buildId,
         basePath
       );
       if (normalizedMatchedNextDataPathname) {
         resolvedRoutingResult = {
           ...resolvedRoutingResult,
-          matchedPathname: normalizedMatchedNextDataPathname,
+          resolvedPathname: normalizedMatchedNextDataPathname,
         };
       }
     }
@@ -5599,7 +5341,7 @@ const server = http.createServer(async (req, res) => {
         req.method,
         req.url,
         'matched=',
-        resolvedRoutingResult.matchedPathname ?? '',
+        resolvedRoutingResult.resolvedPathname ?? '',
         'status=',
         typeof resolvedRoutingResult.status === 'number'
           ? String(resolvedRoutingResult.status)
@@ -5775,7 +5517,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    let matchedPathname = resolvedRoutingResult.matchedPathname;
+    let matchedPathname = resolvedRoutingResult.resolvedPathname;
     let routingFallbackFunctionOutput: ResolvedFunctionOutput | null = null;
     if (!matchedPathname) {
       if (await handleNextImageRequest(req, res, requestUrl)) {
@@ -5880,6 +5622,12 @@ const server = http.createServer(async (req, res) => {
 
     const resolvedUrl = new URL(routingUrl);
     const sourcePathname = nextDataRoutePathname ?? routingUrl.pathname;
+    const resolvedRoutingQuery =
+      resolvedRoutingResult.invocationTarget?.query ??
+      resolvedRoutingResult.resolvedQuery;
+    if (resolvedRoutingQuery) {
+      resolvedUrl.search = toSearchStringFromResolveRoutesQuery(resolvedRoutingQuery);
+    }
 
     const middlewareRewriteHeader = routeHeaders?.get('x-middleware-rewrite');
     let middlewareRewriteUrl: URL | null = null;
@@ -5893,74 +5641,22 @@ const server = http.createServer(async (req, res) => {
         process.env.__NEXT_PRIVATE_ORIGIN
       );
       resolvedUrl.pathname = middlewareRewriteUrl.pathname;
-      resolvedUrl.search = middlewareRewriteUrl.search;
-
-      const middlewareRewriteMatchPathname =
-        resolveTrailingSlashPathnameFallback(
-          middlewareRewriteUrl.pathname,
-          routingPathnameSet
-        ) ?? middlewareRewriteUrl.pathname;
-      const sourceMatchesResolvedPathname =
-        removePathnameTrailingSlash(sourcePathname) ===
-          removePathnameTrailingSlash(matchedPathname) ||
-        pathnameMatchesRoutePathname(sourcePathname, matchedPathname);
-      if (
-        matchedPathname &&
-        sourceMatchesResolvedPathname &&
-        !pathnameMatchesRoutePathname(
-          middlewareRewriteMatchPathname,
-          matchedPathname
-        )
-      ) {
-        matchedPathname = middlewareRewriteMatchPathname;
-        routeMatches = undefined;
+      if (!resolvedRoutingQuery) {
+        resolvedUrl.search = middlewareRewriteUrl.search;
       }
     }
 
+    const routeCapturePathname =
+      resolvedRoutingResult.invocationTarget?.pathname ?? sourcePathname;
     routeMatches = resolveRouteMatchPlaceholders(
       routeMatches,
-      getRouteCapturesForPathname(sourcePathname, matchedPathname)
+      getRouteCapturesForPathname(routeCapturePathname, matchedPathname)
     );
 
-    const shouldSkipDestinationRules =
-      process.env.ADAPTER_BUN_SKIP_DESTINATION_RULES === '1';
-    const destinationMatch = shouldSkipDestinationRules
-      ? null
-      : resolveDestinationPathnameFromRoutingRules(
-          routingUrl,
-          matchedPathname,
-          runtimeRoutingConfig,
-          req.headers,
-          routeMatches
-        );
-    if (destinationMatch) {
-      routeMatches = resolveRouteMatchPlaceholders(
-        routeMatches,
-        destinationMatch.captures
-      );
-    }
-
-    const rewrittenQuery = shouldSkipDestinationRules
-      ? new URLSearchParams(resolvedUrl.searchParams)
-      : applyDestinationQueryFromRoutingRules(
-          routingUrl,
-          matchedPathname,
-          resolvedUrl.searchParams,
-          runtimeRoutingConfig,
-          req.headers,
-          routeMatches
-        );
-    resolvedUrl.search = rewrittenQuery.size > 0 ? `?${rewrittenQuery.toString()}` : '';
-
     const rscSuffix = routeMatches?.rscSuffix;
-    const destinationPathname = destinationMatch?.pathname;
-    const invocationDestinationPathname =
-      destinationPathname && !isDynamicRoute(destinationPathname)
-        ? destinationPathname
-        : null;
     const invocationPathname =
+      resolvedRoutingResult.invocationTarget?.pathname ??
       middlewareRewriteUrl?.pathname ??
-      invocationDestinationPathname ??
       sourcePathname;
     const explicitRscPath =
       isRscRequest ||
@@ -5974,15 +5670,13 @@ const server = http.createServer(async (req, res) => {
     let resolvedFunctionOutput: ResolvedFunctionOutput | null = routingFallbackFunctionOutput;
     if (nextDataNormalizedPathname) {
       const nextDataCandidatePathnames = new Set<string>();
-      if (middlewareRewriteUrl) {
-        const rewrittenNextDataPathname = toNextDataPathname(
-          middlewareRewriteUrl.pathname,
-          buildId,
-          basePath
-        );
-        if (rewrittenNextDataPathname) {
-          nextDataCandidatePathnames.add(rewrittenNextDataPathname);
-        }
+      const invocationNextDataPathname = toNextDataPathname(
+        invocationPathname,
+        buildId,
+        basePath
+      );
+      if (invocationNextDataPathname) {
+        nextDataCandidatePathnames.add(invocationNextDataPathname);
       }
       nextDataCandidatePathnames.add(requestUrl.pathname);
 
@@ -6075,21 +5769,13 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    const rewriteSourceParams =
-      process.env.ADAPTER_BUN_DISABLE_REWRITE_SOURCE_PARAMS === '1'
-        ? {}
-        : extractRewriteSourceParamsFromRoutingRules(
-            routingUrl,
-            matchedPathname,
-            runtimeRoutingConfig,
-            req.headers,
-            routeMatches
-          );
+    const requestMetaSourceQuery =
+      resolvedRoutingResult.invocationTarget?.query ??
+      resolvedRoutingResult.resolvedQuery;
     const requestQueryBase = removeSyntheticRoutePlaceholderQueryValues(
-      mergeDecodedParamsIntoQuery(
-        toRequestQuery(resolvedUrl.searchParams),
-        rewriteSourceParams
-      )
+      requestMetaSourceQuery
+        ? toRequestQueryFromResolveRoutesQuery(requestMetaSourceQuery)
+        : toRequestQuery(resolvedUrl.searchParams)
     );
     if (isAppFunctionOutput(resolvedFunctionOutput?.output)) {
       removeInternalRouteParamQueryValues(requestQueryBase);
