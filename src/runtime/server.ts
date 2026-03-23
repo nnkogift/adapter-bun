@@ -1764,6 +1764,53 @@ function removePathnameTrailingSlash(pathname: string): string {
   return pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
 }
 
+function isDynamicRouteSegment(segment: string): boolean {
+  return segment.startsWith('[') && segment.endsWith(']');
+}
+
+function hasSufficientStaticPathOverlap(
+  matchedPathname: string,
+  candidatePathname: string,
+  i18n: ReturnType<typeof toRoutingI18n>
+): boolean {
+  const matchedSegments = removePathnameTrailingSlash(matchedPathname)
+    .split('/')
+    .filter(Boolean);
+  const candidateSegments = removePathnameTrailingSlash(candidatePathname)
+    .split('/')
+    .filter(Boolean);
+  const limit = Math.min(matchedSegments.length, candidateSegments.length);
+  let matchedStaticNonLocaleCount = 0;
+  let sharedStaticCount = 0;
+
+  for (let index = 0; index < limit; index += 1) {
+    const matchedSegment = matchedSegments[index]!;
+    const candidateSegment = candidateSegments[index]!;
+    const matchedDynamic = isDynamicRouteSegment(matchedSegment);
+    const candidateDynamic = isDynamicRouteSegment(candidateSegment);
+
+    if (!matchedDynamic) {
+      const isLocaleSegment = Boolean(i18n && index === 0 && i18n.locales.includes(matchedSegment));
+      if (!isLocaleSegment) {
+        matchedStaticNonLocaleCount += 1;
+      }
+    }
+
+    if (!matchedDynamic && !candidateDynamic) {
+      if (matchedSegment !== candidateSegment) {
+        return false;
+      }
+      sharedStaticCount += 1;
+    }
+  }
+
+  if (matchedStaticNonLocaleCount === 0) {
+    return true;
+  }
+
+  return sharedStaticCount > 0;
+}
+
 function shouldPreservePathnameWithoutTrailingSlash(pathname: string): boolean {
   const lastSegment = pathname.split('/').pop() ?? '';
   return lastSegment.includes('.');
@@ -1905,6 +1952,31 @@ function hasLocalePrefixInPathname(
       return true;
     }
   }
+  return false;
+}
+
+function isApiPathname(
+  pathname: string,
+  basePath: string,
+  i18n: ReturnType<typeof toRoutingI18n>
+): boolean {
+  const withoutBasePath = getPathnameWithoutBasePath(pathname, basePath);
+  if (withoutBasePath === '/api' || withoutBasePath.startsWith('/api/')) {
+    return true;
+  }
+  if (!i18n) {
+    return false;
+  }
+
+  for (const locale of i18n.locales) {
+    if (
+      withoutBasePath === `/${locale}/api` ||
+      withoutBasePath.startsWith(`/${locale}/api/`)
+    ) {
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -3478,6 +3550,17 @@ function resolveFunctionOutput(
   addManifestPathnameCandidates(candidatePathnames, requestPathname);
 
   for (const candidatePathname of candidatePathnames) {
+    const candidateContainsLiteralBrackets =
+      candidatePathname.includes('[') ||
+      candidatePathname.includes(']') ||
+      /%5B|%5D/i.test(candidatePathname);
+    // When the incoming request is concrete (no literal brackets), avoid
+    // matching dynamic function templates against template candidates like
+    // "/foo/[id]". That can incorrectly select a handler and mask 404s.
+    if (!requestContainsLiteralBrackets && candidateContainsLiteralBrackets) {
+      continue;
+    }
+
     for (const dynamicPathname of dynamicFunctionOutputPathnames) {
       if (restrictDynamicFallbackToMatchedPath) {
         const dynamicCandidatePathname = toMatcherPathname(dynamicPathname);
@@ -3485,6 +3568,15 @@ function resolveFunctionOutput(
           pathnameMatchesRoutePathname(matchedPathname, dynamicCandidatePathname) ||
           pathnameMatchesRoutePathname(dynamicCandidatePathname, matchedPathname);
         if (!compatibleWithMatchedPath) {
+          continue;
+        }
+        if (
+          !hasSufficientStaticPathOverlap(
+            matchedPathname,
+            dynamicCandidatePathname,
+            runtimeI18n
+          )
+        ) {
           continue;
         }
       }
@@ -5672,18 +5764,23 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const shouldPreferRscFallbackOutput =
-        isRscRequest ||
-        routingUrl.pathname.endsWith('.rsc') ||
-        requestUrl.pathname.endsWith('.rsc');
-      routingFallbackFunctionOutput = resolveFunctionOutput(
-        routingUrl.pathname,
-        routingUrl.pathname,
-        undefined,
-        shouldPreferRscFallbackOutput
-      );
-      if (routingFallbackFunctionOutput) {
-        matchedPathname = routingFallbackFunctionOutput.output.pathname;
+      // Unmatched API routes can legitimately bypass @next/routing route matches
+      // in deploy mode. Restrict function-output fallback to API-like paths so
+      // regular page routes still 404 when no route was matched.
+      if (isApiPathname(routingUrl.pathname, basePath, runtimeI18n)) {
+        const shouldPreferRscFallbackOutput =
+          isRscRequest ||
+          routingUrl.pathname.endsWith('.rsc') ||
+          requestUrl.pathname.endsWith('.rsc');
+        routingFallbackFunctionOutput = resolveFunctionOutput(
+          routingUrl.pathname,
+          routingUrl.pathname,
+          undefined,
+          shouldPreferRscFallbackOutput
+        );
+        if (routingFallbackFunctionOutput) {
+          matchedPathname = routingFallbackFunctionOutput.output.pathname;
+        }
       }
 
     }
