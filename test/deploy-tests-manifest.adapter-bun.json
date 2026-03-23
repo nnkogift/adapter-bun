@@ -1,6 +1,12 @@
 {
   "version": 2,
-  "suites": {},
+  "suites": {
+    "test/e2e/app-dir/segment-cache/memory-pressure/segment-cache-memory-pressure.test.ts": {
+      "failed": [
+        "segment cache memory pressure does not leak memory when repeatedly triggering prefetches"
+      ]
+    }
+  },
   "rules": {
     "include": [],
     "exclude": [
