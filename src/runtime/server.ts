@@ -747,13 +747,17 @@ function pathnameEqualsWithRootAlias(leftPathname: string, rightPathname: string
   );
 }
 
+function hasInterceptionMarkerPrefix(segment: string): boolean {
+  return (
+    segment.startsWith('(.)') ||
+    segment.startsWith('(..)') ||
+    segment.startsWith('(...)')
+  );
+}
+
 function stripInterceptionMarkerPrefix(segment: string): string {
   let normalizedSegment = segment;
-  while (
-    normalizedSegment.startsWith('(.)') ||
-    normalizedSegment.startsWith('(..)') ||
-    normalizedSegment.startsWith('(...)')
-  ) {
+  while (hasInterceptionMarkerPrefix(normalizedSegment)) {
     if (normalizedSegment.startsWith('(.)')) {
       normalizedSegment = normalizedSegment.slice('(.)'.length);
       continue;
@@ -768,6 +772,10 @@ function stripInterceptionMarkerPrefix(segment: string): string {
     }
   }
   return normalizedSegment;
+}
+
+function hasInterceptionMarkerInPathname(pathname: string): boolean {
+  return pathname.split('/').some((segment) => hasInterceptionMarkerPrefix(segment));
 }
 
 function normalizePathnameForRouteMatching(pathname: string): string {
@@ -6078,12 +6086,13 @@ const server = http.createServer(async (req, res) => {
       );
     }
     if (middlewareRewriteUrl && !nextDataNormalizedPathname) {
+      const resolvedOutputPathname = toInvokeOutputPathname(
+        resolvedFunctionOutput?.output
+      );
       const shouldTryRewrittenOutput =
         !resolvedFunctionOutput ||
-        (pathnameEqualsWithRootAlias(
-          toInvokeOutputPathname(resolvedFunctionOutput.output),
-          matchedPathname
-        ) &&
+        (isDynamicRoute(matchedPathname) &&
+          pathnameEqualsWithRootAlias(resolvedOutputPathname, matchedPathname) &&
           !pathnameEqualsWithRootAlias(middlewareRewriteUrl.pathname, matchedPathname));
       if (shouldTryRewrittenOutput) {
         const rewrittenMiddlewarePathname = removePathnameTrailingSlash(
@@ -6097,7 +6106,14 @@ const server = http.createServer(async (req, res) => {
           routeMatches
         );
         if (rewrittenOutput) {
-          resolvedFunctionOutput = rewrittenOutput;
+          const matchedHasInterception = hasInterceptionMarkerInPathname(matchedPathname);
+          const rewrittenOutputPathname = toInvokeOutputPathname(rewrittenOutput.output);
+          const rewrittenHasInterception = hasInterceptionMarkerInPathname(
+            rewrittenOutputPathname
+          );
+          if (matchedHasInterception === rewrittenHasInterception) {
+            resolvedFunctionOutput = rewrittenOutput;
+          }
         }
       }
     }
