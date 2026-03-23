@@ -3373,6 +3373,11 @@ function resolveFunctionOutput(
   routeMatches?: Record<string, string>
 ): ResolvedFunctionOutput | null {
   const preferredMatchedPathname = withOptionalSuffix(matchedPathname, rscSuffix);
+  const requestContainsLiteralBrackets =
+    requestPathname.includes('[') ||
+    requestPathname.includes(']') ||
+    /%5B|%5D/i.test(requestPathname);
+  let restrictDynamicFallbackToMatchedPath = false;
   const matchedPathParams = toRequestMetaParamsFromRouteMatches(
     routeMatches,
     matchedPathname
@@ -3443,20 +3448,14 @@ function resolveFunctionOutput(
         }
       }
     }
-    const requestContainsLiteralBrackets =
-      requestPathname.includes('[') ||
-      requestPathname.includes(']') ||
-      /%5B|%5D/i.test(requestPathname);
-    if (requestContainsLiteralBrackets) {
-      // Requests like "/dynamic/[first]" can be routed to a concrete
-      // prerender pathname with no direct function output. Fall through so the
-      // dynamic matcher set can resolve the canonical handler (e.g. [slug]).
-    } else {
-      // When routing already selected a dynamic pathname but there is no
-      // corresponding runtime function output, treat it as non-function (for
-      // example pages-router dynamic routes served from static assets) instead
-      // of falling through to unrelated dynamic handlers.
-      return null;
+    // Requests like "/dynamic/[first]" can be routed to a concrete prerender
+    // pathname with no direct function output. Fall through so the dynamic
+    // matcher set can resolve the canonical handler (e.g. [slug]).
+    // For non-bracket requests that already matched a dynamic pathname, still
+    // attempt dynamic fallback resolution but only against compatible dynamic
+    // function templates to avoid unrelated handler selection.
+    if (!requestContainsLiteralBrackets) {
+      restrictDynamicFallbackToMatchedPath = true;
     }
   }
 
@@ -3480,6 +3479,16 @@ function resolveFunctionOutput(
 
   for (const candidatePathname of candidatePathnames) {
     for (const dynamicPathname of dynamicFunctionOutputPathnames) {
+      if (restrictDynamicFallbackToMatchedPath) {
+        const dynamicCandidatePathname = toMatcherPathname(dynamicPathname);
+        const compatibleWithMatchedPath =
+          pathnameMatchesRoutePathname(matchedPathname, dynamicCandidatePathname) ||
+          pathnameMatchesRoutePathname(dynamicCandidatePathname, matchedPathname);
+        if (!compatibleWithMatchedPath) {
+          continue;
+        }
+      }
+
       const matcher = dynamicFunctionMatchers.get(dynamicPathname);
       if (!matcher) {
         continue;
@@ -5640,6 +5649,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     let matchedPathname = resolvedRoutingResult.matchedPathname;
+    let routingFallbackFunctionOutput: ResolvedFunctionOutput | null = null;
     if (!matchedPathname) {
       if (await handleNextImageRequest(req, res, requestUrl)) {
         return;
@@ -5660,6 +5670,20 @@ const server = http.createServer(async (req, res) => {
       }
       if (requestStaticAsset && (await serveStaticAsset(req, res, adapterDir, requestStaticAsset))) {
         return;
+      }
+
+      const shouldPreferRscFallbackOutput =
+        isRscRequest ||
+        routingUrl.pathname.endsWith('.rsc') ||
+        requestUrl.pathname.endsWith('.rsc');
+      routingFallbackFunctionOutput = resolveFunctionOutput(
+        routingUrl.pathname,
+        routingUrl.pathname,
+        undefined,
+        shouldPreferRscFallbackOutput
+      );
+      if (routingFallbackFunctionOutput) {
+        matchedPathname = routingFallbackFunctionOutput.output.pathname;
       }
 
     }
@@ -5807,7 +5831,7 @@ const server = http.createServer(async (req, res) => {
       process.env.ADAPTER_BUN_DISABLE_PREFER_RSC_OUTPUT === '1'
         ? false
         : explicitRscPath;
-    let resolvedFunctionOutput: ResolvedFunctionOutput | null = null;
+    let resolvedFunctionOutput: ResolvedFunctionOutput | null = routingFallbackFunctionOutput;
     if (nextDataNormalizedPathname) {
       const nextDataCandidatePathnames = new Set<string>();
       if (middlewareRewriteUrl) {
