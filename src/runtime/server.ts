@@ -6091,8 +6091,7 @@ const server = http.createServer(async (req, res) => {
       );
       const shouldTryRewrittenOutput =
         !resolvedFunctionOutput ||
-        (isDynamicRoute(matchedPathname) &&
-          pathnameEqualsWithRootAlias(resolvedOutputPathname, matchedPathname) &&
+        (pathnameEqualsWithRootAlias(resolvedOutputPathname, matchedPathname) &&
           !pathnameEqualsWithRootAlias(middlewareRewriteUrl.pathname, matchedPathname));
       if (shouldTryRewrittenOutput) {
         const rewrittenMiddlewarePathname = removePathnameTrailingSlash(
@@ -6111,7 +6110,14 @@ const server = http.createServer(async (req, res) => {
           const rewrittenHasInterception = hasInterceptionMarkerInPathname(
             rewrittenOutputPathname
           );
-          if (matchedHasInterception === rewrittenHasInterception) {
+          const shouldAvoidDynamicFallbackOverride =
+            Boolean(resolvedFunctionOutput) &&
+            !isDynamicRoute(resolvedOutputPathname) &&
+            isDynamicRoute(rewrittenOutputPathname);
+          if (
+            !shouldAvoidDynamicFallbackOverride &&
+            matchedHasInterception === rewrittenHasInterception
+          ) {
             resolvedFunctionOutput = rewrittenOutput;
           }
         }
