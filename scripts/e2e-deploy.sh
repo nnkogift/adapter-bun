@@ -122,6 +122,37 @@ if (changed) {
 }
 " >&2
 
+# Some fixtures leave TypeScript unpinned or use `latest`, which can float to
+# TS 6 and fail with default `moduleResolution=node10` templates. Lock deploy
+# fixtures to the same TS major used in CI for deterministic behavior.
+node -e "
+const fs = require('fs');
+const pkgPath = 'package.json';
+const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+
+const getCurrentTs = () =>
+  pkg.devDependencies?.typescript ??
+  pkg.dependencies?.typescript ??
+  pkg.optionalDependencies?.typescript;
+
+const isExplicitlySupported = (value) =>
+  typeof value === 'string' &&
+  (/^\\s*5(?:\\.|$)/.test(value) || /^\\s*[~^]?5(?:\\.|$)/.test(value));
+
+const currentTs = getCurrentTs();
+const shouldPinTs =
+  currentTs === undefined ||
+  (typeof currentTs === 'string' &&
+    (currentTs === 'latest' || /^\\s*[~^]?6(?:\\.|$)/.test(currentTs)));
+
+if (shouldPinTs && !isExplicitlySupported(currentTs)) {
+  pkg.devDependencies = pkg.devDependencies || {};
+  pkg.devDependencies.typescript = '5.9.3';
+  fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+  console.error('Pinned typescript to 5.9.3 for deploy test compatibility');
+}
+" >&2
+
 # 4. Install dependencies
 bun install --no-frozen-lockfile >&2
 

@@ -142,6 +142,14 @@ interface RuntimePrerenderManifestDynamicRoute {
 
 interface RuntimePrerenderManifest {
   dynamicRoutes?: Record<string, RuntimePrerenderManifestDynamicRoute>;
+  preview?: {
+    previewModeId?: string;
+    previewModeSigningKey?: string;
+    previewModeEncryptionKey?: string;
+  };
+  routes?: Record<string, unknown>;
+  notFoundRoutes?: string[];
+  version?: number;
 }
 
 interface RuntimeI18nConfig {
@@ -181,13 +189,27 @@ interface RuntimeNextExperimentalConfig {
   imgOptSkipMetadata?: boolean | null;
   imgOptTimeoutInSeconds?: number;
   isrFlushToDisk?: boolean;
+  fetchCacheKeyPrefix?: string;
+  allowedRevalidateHeaderKeys?: string[];
 }
 
 interface RuntimeNextConfig {
   output?: string;
   basePath?: string;
+  cacheHandler?: string;
+  cacheMaxMemorySize?: number;
   images?: RuntimeNextImageConfig;
   experimental?: RuntimeNextExperimentalConfig;
+}
+
+interface RuntimeRequiredServerFilesConfig {
+  cacheHandler?: string;
+  cacheMaxMemorySize?: number;
+  experimental?: RuntimeNextExperimentalConfig;
+}
+
+interface RuntimeRequiredServerFilesManifest {
+  config?: RuntimeRequiredServerFilesConfig;
 }
 
 interface RuntimeEdgeOutput {
@@ -329,6 +351,19 @@ function resolveCacheRuntimeConfig(manifest: DeploymentManifest): {
 
 function getSingleHeaderValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function toStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const entries: string[] = [];
+  for (const item of value) {
+    if (typeof item === 'string') {
+      entries.push(item);
+    }
+  }
+  return entries;
 }
 
 const INTERNAL_REQUEST_HEADERS = new Set([
@@ -1702,6 +1737,34 @@ function getLocaleFromPathname(
   return undefined;
 }
 
+function stripLocalePrefixFromPathname(
+  pathname: string,
+  basePath: string,
+  i18n: ReturnType<typeof toRoutingI18n>
+): string {
+  if (!i18n) {
+    return pathname;
+  }
+
+  const withoutBasePath = getPathnameWithoutBasePath(pathname, basePath);
+  for (const locale of i18n.locales) {
+    const localePrefix = `/${locale}`;
+    if (withoutBasePath === localePrefix) {
+      return basePath || '/';
+    }
+    if (withoutBasePath.startsWith(`${localePrefix}/`)) {
+      const withoutLocalePrefix = withoutBasePath.slice(localePrefix.length);
+      const normalizedWithoutLocalePrefix =
+        withoutLocalePrefix.length > 0 ? withoutLocalePrefix : '/';
+      return basePath
+        ? `${basePath}${normalizedWithoutLocalePrefix}`
+        : normalizedWithoutLocalePrefix;
+    }
+  }
+
+  return pathname;
+}
+
 function isApiPathname(
   pathname: string,
   basePath: string,
@@ -2133,6 +2196,13 @@ function isSyntheticRouteMatchPlaceholder(value: string): boolean {
   return decodeRouteMatchValue(value).startsWith('$nxtP');
 }
 
+function hasSyntheticRouteMatchPlaceholderInPathname(pathname: string): boolean {
+  if (pathname.includes('$nxtP')) {
+    return true;
+  }
+  return pathname.toLowerCase().includes('%24nxtp');
+}
+
 function resolveRouteMatchPlaceholderValue(
   value: string,
   captures: Record<string, string>
@@ -2285,6 +2355,25 @@ function toSearchStringFromResolveRoutesQuery(
 
   const searchParams = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        searchParams.append(key, entry);
+      }
+      continue;
+    }
+    searchParams.append(key, value);
+  }
+
+  const search = searchParams.toString();
+  return search.length > 0 ? `?${search}` : '';
+}
+
+function toSearchStringFromRequestMetaQuery(query: RuntimeRequestMetaQuery): string {
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined) {
+      continue;
+    }
     if (Array.isArray(value)) {
       for (const entry of value) {
         searchParams.append(key, entry);
@@ -2677,6 +2766,43 @@ async function loadPrerenderDynamicRoutes(
   return dynamicRoutes;
 }
 
+function createEmptyPrerenderManifest(): RuntimePrerenderManifest {
+  return {
+    version: 4,
+    routes: {},
+    dynamicRoutes: {},
+    notFoundRoutes: [],
+    preview: {
+      previewModeId: '',
+      previewModeSigningKey: '',
+      previewModeEncryptionKey: '',
+    },
+  };
+}
+
+async function loadPrerenderManifest(
+  distDir: string | undefined
+): Promise<RuntimePrerenderManifest> {
+  if (!distDir) {
+    return createEmptyPrerenderManifest();
+  }
+
+  const prerenderManifestPath = path.join(distDir, 'prerender-manifest.json');
+  const prerenderManifestFile = Bun.file(prerenderManifestPath);
+  if (!(await prerenderManifestFile.exists())) {
+    return createEmptyPrerenderManifest();
+  }
+
+  try {
+    const prerenderManifestValue = (await prerenderManifestFile.json()) as unknown;
+    if (isRecord(prerenderManifestValue)) {
+      return prerenderManifestValue as RuntimePrerenderManifest;
+    }
+  } catch {}
+
+  return createEmptyPrerenderManifest();
+}
+
 const adapterDir = import.meta.dirname;
 const manifestPath = path.join(adapterDir, 'deployment-manifest.json');
 const manifest = (await Bun.file(manifestPath).json()) as DeploymentManifest;
@@ -2695,6 +2821,25 @@ try {
 } catch {
   runtimeNextConfig = {};
 }
+const requiredServerFilesPath = manifestDistDir
+  ? path.join(manifestDistDir, 'required-server-files.json')
+  : null;
+let requiredServerFilesConfig: RuntimeRequiredServerFilesConfig = {};
+if (requiredServerFilesPath) {
+  try {
+    const requiredServerFilesValue = (await Bun.file(requiredServerFilesPath).json()) as unknown;
+    if (isRecord(requiredServerFilesValue)) {
+      const configValue = (requiredServerFilesValue as RuntimeRequiredServerFilesManifest)
+        .config;
+      if (isRecord(configValue)) {
+        requiredServerFilesConfig = configValue as RuntimeRequiredServerFilesConfig;
+      }
+    }
+  } catch {
+    requiredServerFilesConfig = {};
+  }
+}
+const prerenderManifest = await loadPrerenderManifest(manifestDistDir);
 
 // NEXT_ADAPTER_PATH is required at build-time to activate adapter hooks, but
 // keeping it at runtime changes Next.js request handling branches in ways that
@@ -3212,6 +3357,17 @@ function resolveFunctionOutput(
     getFunctionOutputByPathname(preferredMatchedPathname) ??
     getFunctionOutputByPathname(matchedPathname);
   if (exactOutput) {
+    if (!isAppFunctionOutput(exactOutput)) {
+      const appOutputForRequestPathname = resolveAppFunctionOutputForRequestPathname(
+        requestPathname,
+        rscSuffix,
+        preferRscOutput
+      );
+      if (appOutputForRequestPathname) {
+        return appOutputForRequestPathname;
+      }
+    }
+
     const exactOutputMatcherPathname = toMatcherPathname(exactOutput.pathname);
     const exactMatcher =
       dynamicFunctionMatchers.get(exactOutputMatcherPathname) ??
@@ -3366,6 +3522,70 @@ function resolveFunctionOutput(
         paramsFromMatcher,
         filteredRouteMatchedParams
       );
+      const resolvedOutput = preferRscFunctionOutput(output, preferRscOutput);
+      return params ? { output: resolvedOutput, params } : { output: resolvedOutput };
+    }
+  }
+
+  return null;
+}
+
+function resolveAppFunctionOutputForRequestPathname(
+  requestPathname: string,
+  rscSuffix?: string,
+  preferRscOutput: boolean = false
+): ResolvedFunctionOutput | null {
+  const candidatePathnames = new Set<string>();
+  addManifestPathnameCandidates(
+    candidatePathnames,
+    withOptionalSuffix(requestPathname, rscSuffix)
+  );
+  addManifestPathnameCandidates(candidatePathnames, requestPathname);
+  if (runtimeI18n) {
+    const withoutLocalePrefix = stripLocalePrefixFromPathname(
+      requestPathname,
+      basePath,
+      runtimeI18n
+    );
+    if (withoutLocalePrefix !== requestPathname) {
+      addManifestPathnameCandidates(
+        candidatePathnames,
+        withOptionalSuffix(withoutLocalePrefix, rscSuffix)
+      );
+      addManifestPathnameCandidates(candidatePathnames, withoutLocalePrefix);
+    }
+  }
+
+  for (const candidatePathname of candidatePathnames) {
+    const exactOutput = getFunctionOutputByPathname(candidatePathname);
+    if (exactOutput && isAppFunctionOutput(exactOutput)) {
+      return { output: preferRscFunctionOutput(exactOutput, preferRscOutput) };
+    }
+
+    for (const dynamicPathname of dynamicFunctionOutputPathnames) {
+      const output = functionOutputByPathname.get(dynamicPathname);
+      if (!output || !isAppFunctionOutput(output)) {
+        continue;
+      }
+
+      const matcher = dynamicFunctionMatchers.get(dynamicPathname);
+      if (!matcher) {
+        continue;
+      }
+
+      let matchedParams = matcher(candidatePathname);
+      if (!matchedParams) {
+        const normalizedCandidatePathname =
+          normalizePathnameForRouteMatching(candidatePathname);
+        if (normalizedCandidatePathname !== candidatePathname) {
+          matchedParams = matcher(normalizedCandidatePathname);
+        }
+      }
+      if (!matchedParams) {
+        continue;
+      }
+
+      const params = toRequestMetaParamsFromMatcher(matchedParams);
       const resolvedOutput = preferRscFunctionOutput(output, preferRscOutput);
       return params ? { output: resolvedOutput, params } : { output: resolvedOutput };
     }
@@ -4177,6 +4397,146 @@ const edgeClientAssetToken =
   process.env.NEXT_DEPLOYMENT_ID ||
   '';
 
+type RuntimeIncrementalCache = {
+  resetRequestCache?: () => void;
+};
+
+type RuntimeIncrementalCacheConstructor = new (options: {
+  dev: boolean;
+  minimalMode?: boolean;
+  flushToDisk?: boolean;
+  serverDistDir?: string;
+  requestHeaders: IncomingHttpHeaders;
+  maxMemoryCacheSize?: number;
+  getPrerenderManifest: () => RuntimePrerenderManifest;
+  fetchCacheKeyPrefix?: string;
+  CurCacheHandler?: new (...args: any[]) => unknown;
+  allowedRevalidateHeaderKeys?: string[];
+}) => RuntimeIncrementalCache;
+
+let incrementalCacheConstructor: RuntimeIncrementalCacheConstructor | null = null;
+let incrementalCacheHandlerConstructor:
+  | (new (...args: any[]) => unknown)
+  | null
+  | undefined = undefined;
+
+function getIncrementalCacheConstructor(): RuntimeIncrementalCacheConstructor {
+  if (incrementalCacheConstructor) {
+    return incrementalCacheConstructor;
+  }
+
+  const incrementalCacheModule = require('next/dist/server/lib/incremental-cache') as {
+    IncrementalCache?: unknown;
+  };
+  if (typeof incrementalCacheModule.IncrementalCache !== 'function') {
+    throw new Error('[adapter-bun] failed to load IncrementalCache constructor');
+  }
+
+  incrementalCacheConstructor =
+    incrementalCacheModule.IncrementalCache as RuntimeIncrementalCacheConstructor;
+  return incrementalCacheConstructor;
+}
+
+function resolveModuleClassExport(value: unknown): (new (...args: any[]) => unknown) | null {
+  if (typeof value === 'function') {
+    return value as new (...args: any[]) => unknown;
+  }
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const defaultExport = value.default;
+  if (typeof defaultExport === 'function') {
+    return defaultExport as new (...args: any[]) => unknown;
+  }
+  if (isRecord(defaultExport) && typeof defaultExport.default === 'function') {
+    return defaultExport.default as new (...args: any[]) => unknown;
+  }
+
+  return null;
+}
+
+function getIncrementalCacheHandlerConstructor():
+  | (new (...args: any[]) => unknown)
+  | undefined {
+  if (incrementalCacheHandlerConstructor !== undefined) {
+    return incrementalCacheHandlerConstructor ?? undefined;
+  }
+
+  incrementalCacheHandlerConstructor = null;
+  const cacheHandlerPath =
+    requiredServerFilesConfig.cacheHandler || runtimeNextConfig.cacheHandler;
+  if (typeof cacheHandlerPath !== 'string' || cacheHandlerPath.length === 0) {
+    return undefined;
+  }
+
+  const resolvedCacheHandlerPath = path.isAbsolute(cacheHandlerPath)
+    ? cacheHandlerPath
+    : path.resolve(manifestDistDir ?? edgeRuntimeDistDir, cacheHandlerPath);
+
+  try {
+    const loadedModule = require(resolvedCacheHandlerPath) as unknown;
+    const resolvedConstructor = resolveModuleClassExport(loadedModule);
+    if (resolvedConstructor) {
+      incrementalCacheHandlerConstructor = resolvedConstructor;
+    }
+  } catch (error) {
+    if (ENABLE_DEBUG_ROUTING) {
+      debugRoutingLog(
+        'incremental-cache-handler-load-failed',
+        resolvedCacheHandlerPath,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+
+  return incrementalCacheHandlerConstructor ?? undefined;
+}
+
+function createEdgeIncrementalCache(
+  requestHeaders: IncomingHttpHeaders
+): RuntimeIncrementalCache | undefined {
+  try {
+    const IncrementalCache = getIncrementalCacheConstructor();
+    const cacheHandlerConstructor = getIncrementalCacheHandlerConstructor();
+    const experimentalConfig = requiredServerFilesConfig.experimental ?? runtimeNextConfig.experimental;
+    const cacheMaxMemorySize =
+      typeof requiredServerFilesConfig.cacheMaxMemorySize === 'number'
+        ? requiredServerFilesConfig.cacheMaxMemorySize
+        : typeof runtimeNextConfig.cacheMaxMemorySize === 'number'
+          ? runtimeNextConfig.cacheMaxMemorySize
+          : undefined;
+    const allowedRevalidateHeaderKeys =
+      toStringArray(experimentalConfig?.allowedRevalidateHeaderKeys) ?? undefined;
+    const incrementalCache = new IncrementalCache({
+      dev: false,
+      minimalMode: true,
+      flushToDisk: experimentalConfig?.isrFlushToDisk,
+      serverDistDir: path.join(edgeRuntimeDistDir, 'server'),
+      requestHeaders,
+      maxMemoryCacheSize: cacheMaxMemorySize,
+      getPrerenderManifest: () => prerenderManifest,
+      fetchCacheKeyPrefix: experimentalConfig?.fetchCacheKeyPrefix,
+      CurCacheHandler: cacheHandlerConstructor,
+      allowedRevalidateHeaderKeys,
+    });
+    if (typeof incrementalCache.resetRequestCache === 'function') {
+      incrementalCache.resetRequestCache();
+    }
+    (globalThis as { __incrementalCache?: RuntimeIncrementalCache }).__incrementalCache =
+      incrementalCache;
+    return incrementalCache;
+  } catch (error) {
+    if (ENABLE_DEBUG_ROUTING) {
+      debugRoutingLog(
+        'incremental-cache-create-failed',
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+    return undefined;
+  }
+}
+
 let sandboxRun:
   | ((params: any) => Promise<{ response: Response; waitUntil: Promise<unknown> }>)
   | null = null;
@@ -4322,6 +4682,7 @@ async function runEdgeFunctionOutput(
   }
 
   const abortController = new AbortController();
+  const incrementalCache = createEdgeIncrementalCache(headers);
   const runPromise = run({
     distDir: edgeRuntimeDistDir,
     name,
@@ -4350,6 +4711,7 @@ async function runEdgeFunctionOutput(
       ...(requestMeta ? { requestMeta } : {}),
     },
     useCache: true,
+    ...(incrementalCache ? { incrementalCache } : {}),
     clientAssetToken: edgeClientAssetToken,
   });
 
@@ -5587,6 +5949,8 @@ const server = http.createServer(async (req, res) => {
         ? `${basePath}${basePath ? '/' : '/'}${notFoundLocale}/404`
         : null;
       const notFoundAsset = resolveStaticAssetFromCandidates([
+        '/_not-found',
+        basePath ? `${basePath}/_not-found` : null,
         localizedNotFoundPathname,
         '/404',
         basePath ? `${basePath}/404` : null,
@@ -5646,8 +6010,12 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    const invocationTargetPathname = resolvedRoutingResult.invocationTarget?.pathname;
     const routeCapturePathname =
-      resolvedRoutingResult.invocationTarget?.pathname ?? sourcePathname;
+      invocationTargetPathname &&
+      !hasSyntheticRouteMatchPlaceholderInPathname(invocationTargetPathname)
+        ? invocationTargetPathname
+        : sourcePathname;
     routeMatches = resolveRouteMatchPlaceholders(
       routeMatches,
       getRouteCapturesForPathname(routeCapturePathname, matchedPathname)
@@ -5655,8 +6023,8 @@ const server = http.createServer(async (req, res) => {
 
     const rscSuffix = routeMatches?.rscSuffix;
     const invocationPathname =
-      resolvedRoutingResult.invocationTarget?.pathname ??
       middlewareRewriteUrl?.pathname ??
+      resolvedRoutingResult.invocationTarget?.pathname ??
       sourcePathname;
     const explicitRscPath =
       isRscRequest ||
@@ -5670,6 +6038,12 @@ const server = http.createServer(async (req, res) => {
     let resolvedFunctionOutput: ResolvedFunctionOutput | null = routingFallbackFunctionOutput;
     if (nextDataNormalizedPathname) {
       const nextDataCandidatePathnames = new Set<string>();
+      const middlewareRewriteNextDataPathname =
+        middlewareRewriteUrl &&
+        toNextDataPathname(middlewareRewriteUrl.pathname, buildId, basePath);
+      if (middlewareRewriteNextDataPathname) {
+        nextDataCandidatePathnames.add(middlewareRewriteNextDataPathname);
+      }
       const invocationNextDataPathname = toNextDataPathname(
         invocationPathname,
         buildId,
@@ -5702,6 +6076,30 @@ const server = http.createServer(async (req, res) => {
         preferRscOutput,
         routeMatches
       );
+    }
+    if (middlewareRewriteUrl && !nextDataNormalizedPathname) {
+      const shouldTryRewrittenOutput =
+        !resolvedFunctionOutput ||
+        (pathnameEqualsWithRootAlias(
+          toInvokeOutputPathname(resolvedFunctionOutput.output),
+          matchedPathname
+        ) &&
+          !pathnameEqualsWithRootAlias(middlewareRewriteUrl.pathname, matchedPathname));
+      if (shouldTryRewrittenOutput) {
+        const rewrittenMiddlewarePathname = removePathnameTrailingSlash(
+          middlewareRewriteUrl.pathname
+        );
+        const rewrittenOutput = resolveFunctionOutput(
+          rewrittenMiddlewarePathname,
+          rewrittenMiddlewarePathname,
+          typeof rscSuffix === 'string' ? rscSuffix : undefined,
+          preferRscOutput,
+          routeMatches
+        );
+        if (rewrittenOutput) {
+          resolvedFunctionOutput = rewrittenOutput;
+        }
+      }
     }
     if (runtimeI18n && !requestHasLocalePrefix) {
       const matchedHasLocalePrefix = hasLocalePrefixInPathname(
@@ -5749,37 +6147,22 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
-    if (process.env.ADAPTER_BUN_DISABLE_ROUTE_MATCHES_HEADER !== '1') {
-      const routeMatchesHeaderValue = toRouteMatchesHeaderValue(routeMatches);
-      const normalizedMatchedPathnameForRouteMatches =
-        normalizePathnameForRouteMatching(matchedPathname);
-      const shouldForceEmptyRouteMatchesHeader =
-        process.env.ADAPTER_BUN_EMPTY_ROUTE_MATCHES_ON_FALLBACK === '1' &&
-        Boolean(getFallbackParamsForOutput(resolvedFunctionOutput?.output));
-      if (routeMatchesHeaderValue !== undefined) {
-        req.headers['x-now-route-matches'] = shouldForceEmptyRouteMatchesHeader
-          ? ''
-          : routeMatchesHeaderValue;
-      } else if (isDynamicRoute(normalizedMatchedPathnameForRouteMatches)) {
-        // Keep parity with Next's fallback shell pathway for dynamic matches
-        // that intentionally omit route-match values.
-        req.headers['x-now-route-matches'] = '';
-      } else {
-        delete req.headers['x-now-route-matches'];
-      }
-    }
+    // Do not forward Next internal matched-path headers to runtime handlers.
+    delete req.headers['x-now-route-matches'];
+    delete req.headers['x-matched-path'];
 
     const requestMetaSourceQuery =
       resolvedRoutingResult.invocationTarget?.query ??
       resolvedRoutingResult.resolvedQuery;
+    const hasRequestMetaSourceQuery =
+      Boolean(requestMetaSourceQuery) &&
+      Object.keys(requestMetaSourceQuery as Record<string, unknown>).length > 0;
     const requestQueryBase = removeSyntheticRoutePlaceholderQueryValues(
-      requestMetaSourceQuery
+      hasRequestMetaSourceQuery
         ? toRequestQueryFromResolveRoutesQuery(requestMetaSourceQuery)
-        : toRequestQuery(resolvedUrl.searchParams)
+        : toRequestQuery(requestUrl.searchParams)
     );
-    if (isAppFunctionOutput(resolvedFunctionOutput?.output)) {
-      removeInternalRouteParamQueryValues(requestQueryBase);
-    }
+    removeInternalRouteParamQueryValues(requestQueryBase);
     const requestQuery = shouldMergeRouteMatchesIntoRequestQuery(
       resolvedFunctionOutput?.output
     )
@@ -5813,6 +6196,7 @@ const server = http.createServer(async (req, res) => {
       process.env.ADAPTER_BUN_CLEAR_QUERY_ON_FALLBACK === '1' && fallbackParams
         ? {}
         : requestQuery;
+    resolvedUrl.search = toSearchStringFromRequestMetaQuery(requestQuery);
     const routerStateTreeHeader = getSingleHeaderValue(
       req.headers[NEXT_ROUTER_STATE_TREE_HEADER]
     );
@@ -5921,7 +6305,6 @@ const server = http.createServer(async (req, res) => {
         if (!res.hasHeader('content-type')) {
           res.setHeader('content-type', 'application/json; charset=utf-8');
         }
-        res.setHeader('x-matched-path', resolvedFunctionOutput.output.pathname);
         res.setHeader('x-middleware-skip', '1');
         res.setHeader(
           'cache-control',
