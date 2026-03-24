@@ -765,6 +765,55 @@ function resolveCaseInsensitiveRoutingFallback(
   return null;
 }
 
+function resolveRuntimeRewritePathname(
+  requestUrl: URL,
+  requestHeaders: IncomingHttpHeaders,
+  routingConfig: RuntimeRoutingConfig
+): string | undefined {
+  const routeGroups: RuntimeRoute[][] = [
+    routingConfig.beforeMiddleware,
+    routingConfig.beforeFiles,
+    routingConfig.afterFiles,
+    routingConfig.fallback,
+  ];
+  const routingHeaders = toRequestHeaders(requestHeaders);
+  const requestOrigin = requestUrl.origin;
+  let currentUrl = new URL(requestUrl.toString());
+  let didRewrite = false;
+
+  for (const routes of routeGroups) {
+    for (const route of routes) {
+      const routeMatch = matchRoutingRule(route, currentUrl, routingHeaders, false);
+      if (!routeMatch.matched || !route.destination) {
+        continue;
+      }
+
+      const destination = replaceRouteDestinationCaptures(
+        route.destination,
+        routeMatch.regexMatch,
+        undefined,
+        routeMatch.conditionCaptures
+      );
+
+      if (isRedirectStatusCode(route.status) || isExternalDestinationUrl(destination)) {
+        return didRewrite ? currentUrl.pathname : undefined;
+      }
+
+      const nextUrl = applyInternalRouteDestination(currentUrl, destination);
+      if (nextUrl.origin !== requestOrigin) {
+        return didRewrite ? currentUrl.pathname : undefined;
+      }
+
+      if (nextUrl.pathname !== currentUrl.pathname || nextUrl.search !== currentUrl.search) {
+        didRewrite = true;
+      }
+      currentUrl = nextUrl;
+    }
+  }
+
+  return didRewrite ? currentUrl.pathname : undefined;
+}
+
 function pathnameEqualsWithRootAlias(leftPathname: string, rightPathname: string): boolean {
   if (leftPathname === rightPathname) {
     return true;
@@ -2197,6 +2246,25 @@ function hasInternalRouteParamPlaceholderInParams(
           return true;
         }
       }
+    }
+  }
+
+  return false;
+}
+
+function hasUnresolvedRouteMatchPlaceholder(
+  routeMatches: Record<string, string> | undefined
+): boolean {
+  if (!routeMatches) {
+    return false;
+  }
+
+  for (const value of Object.values(routeMatches)) {
+    if (typeof value !== 'string' || value.length <= 1) {
+      continue;
+    }
+    if (value.startsWith('$')) {
+      return true;
     }
   }
 
@@ -6199,6 +6267,10 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    const runtimeRewritePathnameForParams =
+      runtimeRoutingConfig && hasUnresolvedRouteMatchPlaceholder(routeMatches)
+        ? resolveRuntimeRewritePathname(routingUrl, req.headers, runtimeRoutingConfig)
+        : undefined;
     const rscSuffix = routeMatches?.rscSuffix;
     const invocationPathname =
       resolvedRoutingResult.invocationTarget?.pathname ??
@@ -6206,6 +6278,8 @@ const server = http.createServer(async (req, res) => {
       sourcePathname;
     const paramsExtractionPathname = selectPathnameForParamExtraction([
       middlewareRewriteUrl?.pathname,
+      runtimeRewritePathnameForParams,
+      resolvedRoutingResult.invocationTarget?.pathname,
       sourcePathname,
       requestUrl.pathname,
       resolvedUrl.pathname,
@@ -6417,9 +6491,13 @@ const server = http.createServer(async (req, res) => {
     ) {
       const paramPathnameCandidates = [
         outputRequestPathname,
+        runtimeRewritePathnameForParams,
         invocationPathname,
       ];
       for (const paramPathname of paramPathnameCandidates) {
+        if (!paramPathname) {
+          continue;
+        }
         const candidateParams = getDynamicParamsForOutputRequestPathname(
           resolvedFunctionOutput.output,
           paramPathname,
@@ -6431,21 +6509,6 @@ const server = http.createServer(async (req, res) => {
         requestMetaParams = candidateParams;
         if (!hasInternalRouteParamPlaceholderInParams(candidateParams)) {
           break;
-        }
-      }
-    }
-    if (
-      process.env.ADAPTER_BUN_FORCE_PLACEHOLDER_PARAMS_ON_FALLBACK === '1' &&
-      fallbackParams &&
-      requestMetaParams
-    ) {
-      const fallbackParamNames = Object.keys(fallbackParams);
-      if (fallbackParamNames.length > 0) {
-        requestMetaParams = { ...requestMetaParams };
-        for (const key of fallbackParamNames) {
-          if (key in requestMetaParams) {
-            requestMetaParams[key] = `[${key}]`;
-          }
         }
       }
     }
