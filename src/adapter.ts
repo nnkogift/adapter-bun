@@ -34,6 +34,7 @@ const RSC_SUFFIX = '.rsc';
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
 const CACHE_RUNTIME_MODULES = [
   'early-timers.js',
+  'next-compat.js',
   'cache-handler.js',
   'cache-handler-http.js',
   'cache-handler-registration.js',
@@ -208,6 +209,7 @@ async function writeServerEntry(outDir: string): Promise<void> {
   const sourceCode = await Bun.file(sourcePath).text();
   const runtimeServerCode = sourceCode
     .replace("import './early-timers.js';", "import './runtime/early-timers.js';")
+    .replace("from './next-compat.js';", "from './runtime/next-compat.js';")
     .replace("from './cache-store.js';", "from './runtime/cache-store.js';")
     .replace(
       "from './cache-http-server.js';",
