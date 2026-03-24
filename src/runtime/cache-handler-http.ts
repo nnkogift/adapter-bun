@@ -89,6 +89,30 @@ class FetchCacheHandler implements NextUseCacheHandler {
       return undefined;
     }
 
+    const now = Date.now();
+    if (row.expiresAt !== null && row.expiresAt <= now) {
+      debugCacheLog(
+        'get miss expired',
+        cacheKey,
+        'expiresAt=',
+        row.expiresAt,
+        'now=',
+        now
+      );
+      return undefined;
+    }
+    if (row.revalidateAt !== null && row.revalidateAt <= now) {
+      debugCacheLog(
+        'get miss stale',
+        cacheKey,
+        'revalidateAt=',
+        row.revalidateAt,
+        'now=',
+        now
+      );
+      return undefined;
+    }
+
     let revalidateSec =
       row.revalidateAt !== null
         ? Math.max(0, Math.floor((row.revalidateAt - row.createdAt) / 1000))

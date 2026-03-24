@@ -84,6 +84,14 @@ class CacheHandler implements NextUseCacheHandler {
     const row = store.get(cacheKey);
     if (!row) return undefined;
 
+    const now = Date.now();
+    if (row.expiresAt !== null && row.expiresAt <= now) {
+      return undefined;
+    }
+    if (row.revalidateAt !== null && row.revalidateAt <= now) {
+      return undefined;
+    }
+
     // Compute durations from absolute timestamps
     let revalidateSec =
       row.revalidateAt !== null
@@ -98,7 +106,6 @@ class CacheHandler implements NextUseCacheHandler {
     if (tags.length > 0) {
       const tagEntries = store.getTagManifestEntries?.(tags);
       if (tagEntries) {
-        const now = Date.now();
         for (const tag of tags) {
           const tagEntry = tagEntries[tag];
           if (!tagEntry) continue;
