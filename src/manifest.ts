@@ -45,6 +45,7 @@ export function buildDeploymentManifest({
   routing,
   middlewareOutput,
   functionOutputs,
+  resolvedPathnameToSourcePage,
 }: {
   adapterName: string;
   adapterOutDir: string;
@@ -59,6 +60,9 @@ export function buildDeploymentManifest({
   routing?: NonNullable<BunDeploymentManifest['runtime']>['routing'];
   middlewareOutput?: NonNullable<BunDeploymentManifest['runtime']>['middleware'];
   functionOutputs?: NonNullable<BunDeploymentManifest['runtime']>['functions'];
+  resolvedPathnameToSourcePage?: NonNullable<
+    BunDeploymentManifest['runtime']
+  >['resolvedPathnameToSourcePage'];
 }): BunDeploymentManifest {
   return {
     schemaVersion: 1,
@@ -88,6 +92,7 @@ export function buildDeploymentManifest({
       routing: routing ?? null,
       middleware: middlewareOutput ?? null,
       functions: functionOutputs ?? [],
+      resolvedPathnameToSourcePage: resolvedPathnameToSourcePage ?? {},
     },
     staticAssets,
     summary: {

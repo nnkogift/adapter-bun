@@ -22,16 +22,12 @@ import {
   computeCacheBustingSearchParam,
   createOpaqueFallbackRouteParams,
   getMiddlewareRouteMatcher,
-  getNamedRouteRegex,
-  getRouteMatcher,
-  getSortedRoutes,
   isDynamicRoute,
   NEXT_RSC_UNION_QUERY,
   NEXT_ROUTER_PREFETCH_HEADER,
   NEXT_ROUTER_SEGMENT_PREFETCH_HEADER,
   NEXT_ROUTER_STATE_TREE_HEADER,
   NEXT_URL,
-  normalizeNextQueryParam,
   RSC_HEADER,
   setCacheBustingSearchParamWithHash,
 } from './next-compat.js';
@@ -65,10 +61,6 @@ type RuntimeInternalRevalidate = (config: {
   headers: RuntimeRevalidateHeaders;
   opts: { unstable_onlyGenerated?: boolean };
 }) => Promise<void>;
-type RuntimeDynamicRouteMatcherResult = Record<string, string | string[] | undefined>;
-type RuntimeDynamicRouteMatcher = (
-  pathname: string
-) => RuntimeDynamicRouteMatcherResult | false;
 
 interface RuntimeRequestMeta {
   initURL?: string;
@@ -278,6 +270,7 @@ interface RuntimeSection {
   routing?: RuntimeRoutingConfig | null;
   middleware?: RuntimeFunctionOutput | null;
   functions?: RuntimeFunctionOutput[];
+  resolvedPathnameToSourcePage?: Record<string, string>;
 }
 
 interface StaticAsset {
@@ -787,60 +780,6 @@ function normalizePathnameForRouteMatching(pathname: string): string {
     .split('/')
     .map((segment) => stripInterceptionMarkerPrefix(segment))
     .join('/');
-}
-
-function pathnameMatchesRoutePathname(
-  candidatePathname: string,
-  routePathname: string
-): boolean {
-  if (pathnameEqualsWithRootAlias(candidatePathname, routePathname)) {
-    return true;
-  }
-
-  if (!isDynamicRoute(routePathname)) {
-    return false;
-  }
-
-  const matcher = getRouteMatcher(
-    getNamedRouteRegex(normalizePathnameForRouteMatching(routePathname), {
-      prefixRouteKeys: false,
-      includeSuffix: true,
-    })
-  );
-  return Boolean(matcher(candidatePathname));
-}
-
-function getRouteCapturesForPathname(
-  candidatePathname: string,
-  routePathname: string
-): Record<string, string> {
-  if (!isDynamicRoute(routePathname)) {
-    return {};
-  }
-
-  const matcher = getRouteMatcher(
-    getNamedRouteRegex(normalizePathnameForRouteMatching(routePathname), {
-      prefixRouteKeys: false,
-      includeSuffix: true,
-    })
-  ) as RuntimeDynamicRouteMatcher;
-  const matched = matcher(candidatePathname);
-  if (!matched) {
-    return {};
-  }
-
-  const captures: Record<string, string> = {};
-  for (const [key, value] of Object.entries(matched)) {
-    if (typeof value === 'string' && value.length > 0) {
-      captures[key] = value;
-      continue;
-    }
-    if (Array.isArray(value) && value.length > 0) {
-      captures[key] = value.join('/');
-    }
-  }
-
-  return captures;
 }
 
 function getNextDataNormalizedPathname(
@@ -1538,53 +1477,6 @@ function removePathnameTrailingSlash(pathname: string): string {
   return pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
 }
 
-function isDynamicRouteSegment(segment: string): boolean {
-  return segment.startsWith('[') && segment.endsWith(']');
-}
-
-function hasSufficientStaticPathOverlap(
-  matchedPathname: string,
-  candidatePathname: string,
-  i18n: ReturnType<typeof toRoutingI18n>
-): boolean {
-  const matchedSegments = removePathnameTrailingSlash(matchedPathname)
-    .split('/')
-    .filter(Boolean);
-  const candidateSegments = removePathnameTrailingSlash(candidatePathname)
-    .split('/')
-    .filter(Boolean);
-  const limit = Math.min(matchedSegments.length, candidateSegments.length);
-  let matchedStaticNonLocaleCount = 0;
-  let sharedStaticCount = 0;
-
-  for (let index = 0; index < limit; index += 1) {
-    const matchedSegment = matchedSegments[index]!;
-    const candidateSegment = candidateSegments[index]!;
-    const matchedDynamic = isDynamicRouteSegment(matchedSegment);
-    const candidateDynamic = isDynamicRouteSegment(candidateSegment);
-
-    if (!matchedDynamic) {
-      const isLocaleSegment = Boolean(i18n && index === 0 && i18n.locales.includes(matchedSegment));
-      if (!isLocaleSegment) {
-        matchedStaticNonLocaleCount += 1;
-      }
-    }
-
-    if (!matchedDynamic && !candidateDynamic) {
-      if (matchedSegment !== candidateSegment) {
-        return false;
-      }
-      sharedStaticCount += 1;
-    }
-  }
-
-  if (matchedStaticNonLocaleCount === 0) {
-    return true;
-  }
-
-  return sharedStaticCount > 0;
-}
-
 function shouldPreservePathnameWithoutTrailingSlash(pathname: string): boolean {
   const lastSegment = pathname.split('/').pop() ?? '';
   return lastSegment.includes('.');
@@ -2178,147 +2070,6 @@ function isImportableEdgeAsset(filePath: string): boolean {
   return filePath.endsWith('.js') || filePath.endsWith('.mjs');
 }
 
-function isNumericRouteMatchKey(key: string): boolean {
-  return /^[0-9]+$/.test(key);
-}
-
-function normalizeRouteMatchKey(key: string): string | null {
-  if (isNumericRouteMatchKey(key) || key === 'rscSuffix') {
-    return null;
-  }
-  return normalizeNextQueryParam(key) ?? key;
-}
-
-function decodeRouteMatchValue(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-function isSyntheticRouteMatchPlaceholder(value: string): boolean {
-  if (value.startsWith('$nxtP') || value.startsWith('%24nxtP')) {
-    return true;
-  }
-  return decodeRouteMatchValue(value).startsWith('$nxtP');
-}
-
-function hasSyntheticRouteMatchPlaceholderInPathname(pathname: string): boolean {
-  if (pathname.includes('$nxtP')) {
-    return true;
-  }
-  return pathname.toLowerCase().includes('%24nxtp');
-}
-
-function resolveRouteMatchPlaceholderValue(
-  value: string,
-  captures: Record<string, string>
-): string {
-  const decodedValue = decodeRouteMatchValue(value);
-  const placeholderMatch = decodedValue.match(/^\$([a-zA-Z][a-zA-Z0-9_]*)$/);
-  if (!placeholderMatch) {
-    return value;
-  }
-
-  const captureKey = placeholderMatch[1];
-  if (!captureKey) {
-    return value;
-  }
-  const normalizedCaptureKey = normalizeNextQueryParam(captureKey) ?? captureKey;
-  const resolvedValue = captures[captureKey] ?? captures[normalizedCaptureKey];
-  return typeof resolvedValue === 'string' && resolvedValue.length > 0
-    ? resolvedValue
-    : value;
-}
-
-function resolveRouteMatchPlaceholders(
-  routeMatches: Record<string, string> | undefined,
-  captures: Record<string, string>
-): Record<string, string> | undefined {
-  if (!routeMatches || Object.keys(captures).length === 0) {
-    return routeMatches;
-  }
-
-  let didUpdate = false;
-  const resolvedMatches: Record<string, string> = {};
-  for (const [key, value] of Object.entries(routeMatches)) {
-    if (typeof value !== 'string') {
-      resolvedMatches[key] = value;
-      continue;
-    }
-    const resolvedValue = resolveRouteMatchPlaceholderValue(value, captures);
-    if (resolvedValue !== value) {
-      didUpdate = true;
-    }
-    resolvedMatches[key] = resolvedValue;
-  }
-
-  return didUpdate ? resolvedMatches : routeMatches;
-}
-
-type DynamicRouteParamKind = 'single' | 'catchall' | 'optional-catchall';
-
-function getDynamicRouteParamKinds(pathname: string): Map<string, DynamicRouteParamKind> {
-  const kinds = new Map<string, DynamicRouteParamKind>();
-  const segments = pathname.split('/');
-  for (const segment of segments) {
-    const normalizedSegment = stripInterceptionMarkerPrefix(segment);
-    let key: string | null = null;
-    let kind: DynamicRouteParamKind | null = null;
-    if (normalizedSegment.startsWith('[[...') && normalizedSegment.endsWith(']]')) {
-      key = normalizedSegment.slice('[[...'.length, -']]'.length);
-      kind = 'optional-catchall';
-    } else if (normalizedSegment.startsWith('[...') && normalizedSegment.endsWith(']')) {
-      key = normalizedSegment.slice('[...'.length, -']'.length);
-      kind = 'catchall';
-    } else if (normalizedSegment.startsWith('[') && normalizedSegment.endsWith(']')) {
-      key = normalizedSegment.slice('['.length, -']'.length);
-      kind = 'single';
-    }
-    if (!key || !kind) {
-      continue;
-    }
-    const normalizedKey = normalizeNextQueryParam(key) ?? key;
-    kinds.set(normalizedKey, kind);
-  }
-  return kinds;
-}
-
-function normalizeRouteMatchParamValueForDynamicPath(
-  value: string,
-  normalizedKey: string,
-  dynamicParamKinds: Map<string, DynamicRouteParamKind>
-): RuntimeRequestMetaValue {
-  const kind = dynamicParamKinds.get(normalizedKey);
-  if (kind === 'catchall' || kind === 'optional-catchall') {
-    if (value.length === 0) {
-      return [];
-    }
-    return value.split('/').map((segment) => decodeRouteMatchValue(segment));
-  }
-  return decodeRouteMatchValue(value);
-}
-
-function filterRouteParamsForDynamicPathname(
-  params: RuntimeRequestMetaParams,
-  pathname: string
-): RuntimeRequestMetaParams | undefined {
-  if (!isDynamicRoute(pathname)) {
-    return params;
-  }
-
-  const dynamicParamKinds = getDynamicRouteParamKinds(pathname);
-  const filtered: RuntimeRequestMetaParams = {};
-  for (const [key, value] of Object.entries(params)) {
-    if (dynamicParamKinds.has(key)) {
-      filtered[key] = value;
-    }
-  }
-
-  return Object.keys(filtered).length > 0 ? filtered : undefined;
-}
-
 function toRequestQuery(
   searchParams: URLSearchParams
 ): RuntimeRequestMetaQuery {
@@ -2337,6 +2088,117 @@ function toRequestQuery(
   }
 
   return query;
+}
+
+type ResolveRoutesResultLegacyShape = Partial<ResolveRoutesResult> & {
+  matchedPathname?: unknown;
+};
+
+function toResolveRoutesQueryFromSearchParams(
+  searchParams: URLSearchParams
+): ResolveRoutesQuery | undefined {
+  const query: ResolveRoutesQuery = {};
+  for (const [key, value] of searchParams.entries()) {
+    const existing = query[key];
+    if (existing === undefined) {
+      query[key] = value;
+      continue;
+    }
+    if (Array.isArray(existing)) {
+      existing.push(value);
+      continue;
+    }
+    query[key] = [existing, value];
+  }
+
+  return Object.keys(query).length > 0 ? query : undefined;
+}
+
+function mergeResolveRoutesQuery(
+  base: ResolveRoutesQuery | undefined,
+  overrides: ResolveRoutesQuery | undefined
+): ResolveRoutesQuery | undefined {
+  if (!base) {
+    return overrides;
+  }
+  if (!overrides) {
+    return base;
+  }
+  return {
+    ...base,
+    ...overrides,
+  };
+}
+
+function toResolveRoutesQueryFromRouteMatches(
+  routeMatches: Record<string, string> | undefined
+): ResolveRoutesQuery | undefined {
+  if (!routeMatches) {
+    return undefined;
+  }
+
+  const query: ResolveRoutesQuery = {};
+  const normalizeRouteMatchQueryKey = (key: string): string | null => {
+    if (key.startsWith('nxtP') && key.length > 'nxtP'.length) {
+      return key.slice('nxtP'.length);
+    }
+    if (key.startsWith('nxtI') && key.length > 'nxtI'.length) {
+      return key.slice('nxtI'.length);
+    }
+    return null;
+  };
+  for (const [key, value] of Object.entries(routeMatches)) {
+    if (typeof value !== 'string' || value.length === 0) {
+      continue;
+    }
+    if (/^[0-9]+$/.test(key)) {
+      continue;
+    }
+
+    query[key] = value;
+    const normalizedKey = normalizeRouteMatchQueryKey(key);
+    if (normalizedKey) {
+      query[normalizedKey] = value;
+    }
+  }
+
+  return Object.keys(query).length > 0 ? query : undefined;
+}
+
+function normalizeResolveRoutesResultShape(
+  result: ResolveRoutesResult,
+  resolveUrl: URL
+): ResolveRoutesResult {
+  if (typeof result.resolvedPathname === 'string') {
+    return result;
+  }
+
+  const legacyResult = result as ResolveRoutesResultLegacyShape;
+  const matchedPathname =
+    typeof legacyResult.matchedPathname === 'string'
+      ? legacyResult.matchedPathname
+      : undefined;
+  if (!matchedPathname) {
+    return result;
+  }
+
+  const routeMatches =
+    legacyResult.routeMatches && isRecord(legacyResult.routeMatches)
+      ? (legacyResult.routeMatches as Record<string, string>)
+      : undefined;
+  const searchQuery = toResolveRoutesQueryFromSearchParams(resolveUrl.searchParams);
+  const routeQuery = toResolveRoutesQueryFromRouteMatches(routeMatches);
+  const resolvedQuery = mergeResolveRoutesQuery(searchQuery, routeQuery);
+
+  return {
+    ...result,
+    resolvedPathname: matchedPathname,
+    ...(resolvedQuery ? { resolvedQuery } : {}),
+    invocationTarget: {
+      pathname: resolveUrl.pathname,
+      query: resolvedQuery ?? {},
+    },
+  };
 }
 
 function toRequestQueryFromResolveRoutesQuery(
@@ -2418,170 +2280,6 @@ function mergeRequestMetaValuesIntoSearchParams(
   }
 }
 
-function removeSyntheticRoutePlaceholderQueryValues(
-  query: RuntimeRequestMetaQuery
-): RuntimeRequestMetaQuery {
-  const stripInternalParamQueryKeys =
-    process.env.ADAPTER_BUN_STRIP_INTERNAL_PARAM_QUERY === '1';
-  for (const [key, value] of Object.entries(query)) {
-    if (stripInternalParamQueryKeys && normalizeNextQueryParam(key)) {
-      delete query[key];
-      continue;
-    }
-
-    if (typeof value === 'string') {
-      if (isSyntheticRouteMatchPlaceholder(value)) {
-        delete query[key];
-      }
-      continue;
-    }
-    if (!Array.isArray(value)) {
-      continue;
-    }
-
-    const filteredValues = value.filter(
-      (entry) => !isSyntheticRouteMatchPlaceholder(entry)
-    );
-    if (filteredValues.length === 0) {
-      delete query[key];
-    } else if (filteredValues.length === 1) {
-      query[key] = filteredValues[0];
-    } else if (filteredValues.length !== value.length) {
-      query[key] = filteredValues;
-    }
-  }
-
-  return query;
-}
-
-function removeInternalRouteParamQueryValues(
-  query: RuntimeRequestMetaQuery
-): RuntimeRequestMetaQuery {
-  for (const key of Object.keys(query)) {
-    if (normalizeNextQueryParam(key)) {
-      delete query[key];
-    }
-  }
-  return query;
-}
-
-function getDynamicRouteParamKindsForPathname(
-  pathname: string | undefined
-): Map<string, DynamicRouteParamKind> | null {
-  if (!pathname) {
-    return null;
-  }
-
-  const normalizedPathname = pathname.endsWith('.rsc')
-    ? pathname.slice(0, -'.rsc'.length)
-    : pathname;
-  if (!isDynamicRoute(normalizedPathname)) {
-    return null;
-  }
-
-  return getDynamicRouteParamKinds(normalizedPathname);
-}
-
-function mergeRouteMatchesIntoQuery(
-  query: RuntimeRequestMetaQuery,
-  routeMatches: Record<string, string> | undefined,
-  routePathname?: string
-): RuntimeRequestMetaQuery {
-  if (!routeMatches) {
-    return query;
-  }
-
-  // Route matches can include helper captures (for example catch-all probes)
-  // that should not be forwarded to static route handlers.
-  const dynamicParamKinds = getDynamicRouteParamKindsForPathname(routePathname);
-  if (!dynamicParamKinds) {
-    return query;
-  }
-
-  for (const [key, value] of Object.entries(routeMatches)) {
-    const normalizedKey = normalizeRouteMatchKey(key);
-    if (
-      !normalizedKey ||
-      typeof value !== 'string' ||
-      isSyntheticRouteMatchPlaceholder(value) ||
-      !dynamicParamKinds.has(normalizedKey)
-    ) {
-      continue;
-    }
-
-    const normalizedValue = normalizeRouteMatchParamValueForDynamicPath(
-      value,
-      normalizedKey,
-      dynamicParamKinds
-    );
-    if (normalizedValue === undefined) {
-      continue;
-    }
-
-    const existing = query[normalizedKey];
-    if (existing === undefined) {
-      query[normalizedKey] = normalizedValue;
-      continue;
-    }
-
-    if (Array.isArray(existing)) {
-      if (Array.isArray(normalizedValue)) {
-        for (const entry of normalizedValue) {
-          if (!existing.includes(entry)) {
-            existing.push(entry);
-          }
-        }
-      } else if (!existing.includes(normalizedValue)) {
-        existing.push(normalizedValue);
-      }
-      continue;
-    }
-
-    if (Array.isArray(normalizedValue)) {
-      const nextValues = [existing];
-      for (const entry of normalizedValue) {
-        if (!nextValues.includes(entry)) {
-          nextValues.push(entry);
-        }
-      }
-      query[normalizedKey] = nextValues;
-      continue;
-    }
-
-    if (existing !== normalizedValue) {
-      query[normalizedKey] = [existing, normalizedValue];
-    }
-  }
-
-  return query;
-}
-
-function shouldMergeRouteMatchesIntoRequestQuery(
-  output: RuntimeFunctionOutput | undefined
-): boolean {
-  if (!output) {
-    return true;
-  }
-
-  const normalizedFilePath = output.filePath.replace(/\\/g, '/');
-  if (normalizedFilePath.includes('/server/pages/')) {
-    return true;
-  }
-  if (normalizedFilePath.includes('/server/app/')) {
-    return false;
-  }
-
-  // Fallback for outputs where filePath doesn't include app/pages segment.
-  if (output.sourcePage.endsWith('/page')) {
-    return false;
-  }
-  if (output.sourcePage.endsWith('/route') && !output.sourcePage.startsWith('/api/')) {
-    return false;
-  }
-
-  return true;
-}
-
 function isAppFunctionOutput(output: RuntimeFunctionOutput | undefined): boolean {
   if (!output) {
     return false;
@@ -2658,8 +2356,7 @@ function toRequestMeta({
 
   const didRewritePathname =
     requestPathname !== matchedPathname &&
-    !pathnameEqualsWithRootAlias(requestPathname, matchedPathname) &&
-    !pathnameMatchesRoutePathname(requestPathname, matchedPathname);
+    !pathnameEqualsWithRootAlias(requestPathname, matchedPathname);
 
   if (didRewritePathname) {
     meta.rewrittenPathname = matchedPathname;
@@ -2670,28 +2367,6 @@ function toRequestMeta({
   }
 
   return meta;
-}
-
-function toRouteMatchesHeaderValue(
-  routeMatches: Record<string, string> | undefined
-): string | undefined {
-  if (!routeMatches) {
-    return undefined;
-  }
-
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(routeMatches)) {
-    if (typeof value !== 'string' || value.length === 0) {
-      continue;
-    }
-    if (!key.startsWith('nxtP') && !key.startsWith('nxtI')) {
-      continue;
-    }
-    params.set(key, value);
-  }
-
-  const serialized = params.toString();
-  return serialized.length > 0 ? serialized : undefined;
 }
 
 function applyRscRequestMeta(
@@ -2934,6 +2609,8 @@ const runtimeMiddlewareMatcher = await loadMiddlewareMatcher(
   runtimeMiddleware
 );
 const runtimeFunctionOutputs = manifest.runtime?.functions ?? [];
+const runtimeResolvedPathnameToSourcePage =
+  manifest.runtime?.resolvedPathnameToSourcePage ?? {};
 const prerenderDynamicRoutes = await loadPrerenderDynamicRoutes(manifestDistDir);
 
 if (ENABLE_DEBUG_ROUTING) {
@@ -2944,26 +2621,30 @@ if (ENABLE_DEBUG_ROUTING) {
 }
 
 const functionOutputByPathname = new Map<string, RuntimeFunctionOutput>();
+const functionOutputsBySourcePage = new Map<string, RuntimeFunctionOutput[]>();
 for (const output of runtimeFunctionOutputs) {
   functionOutputByPathname.set(output.pathname, output);
+  const existing = functionOutputsBySourcePage.get(output.sourcePage);
+  if (existing) {
+    existing.push(output);
+  } else {
+    functionOutputsBySourcePage.set(output.sourcePage, [output]);
+  }
 }
 
-const dynamicFunctionOutputPathnames = getSortedRoutes(
-  runtimeFunctionOutputs
-    .map((output) => output.pathname)
-    .filter((pathname) => isDynamicRoute(pathname))
-);
-
-const dynamicFunctionMatchers = new Map<string, RuntimeDynamicRouteMatcher>();
-for (const pathname of dynamicFunctionOutputPathnames) {
-  const routeRegex = getNamedRouteRegex(normalizePathnameForRouteMatching(pathname), {
-    prefixRouteKeys: false,
-    includeSuffix: true,
-  });
-  dynamicFunctionMatchers.set(
-    pathname,
-    getRouteMatcher(routeRegex) as RuntimeDynamicRouteMatcher
-  );
+const sourcePageByResolvedPathname = new Map<string, string>();
+if (isRecord(runtimeResolvedPathnameToSourcePage)) {
+  for (const [pathname, sourcePage] of Object.entries(
+    runtimeResolvedPathnameToSourcePage
+  )) {
+    if (typeof pathname !== 'string' || pathname.length === 0) {
+      continue;
+    }
+    if (typeof sourcePage !== 'string' || sourcePage.length === 0) {
+      continue;
+    }
+    sourcePageByResolvedPathname.set(pathname, sourcePage);
+  }
 }
 
 function getFallbackParamsForOutput(
@@ -3035,83 +2716,6 @@ function toInvokeOutputPathname(output: RuntimeFunctionOutput | undefined): stri
   return pathname;
 }
 
-function toMatcherPathname(pathname: string): string {
-  return pathname.endsWith('.rsc')
-    ? pathname.slice(0, -'.rsc'.length)
-    : pathname;
-}
-
-function toRequestMetaParamsFromMatcher(
-  matched: RuntimeDynamicRouteMatcherResult | false
-): RuntimeRequestMetaParams | undefined {
-  if (!matched) {
-    return undefined;
-  }
-
-  const params: RuntimeRequestMetaParams = {};
-  for (const [key, value] of Object.entries(matched)) {
-    if (value === undefined) {
-      continue;
-    }
-    params[key] = Array.isArray(value)
-      ? value.map((entry) => decodeRouteMatchValue(entry))
-      : decodeRouteMatchValue(value);
-  }
-
-  return Object.keys(params).length > 0 ? params : undefined;
-}
-
-function toRequestMetaParamsFromRouteMatches(
-  routeMatches: Record<string, string> | undefined,
-  dynamicPathname?: string
-): RuntimeRequestMetaParams | undefined {
-  if (!routeMatches) {
-    return undefined;
-  }
-
-  const dynamicParamKinds =
-    dynamicPathname && isDynamicRoute(dynamicPathname)
-      ? getDynamicRouteParamKinds(dynamicPathname)
-      : null;
-
-  const params: RuntimeRequestMetaParams = {};
-  for (const [key, value] of Object.entries(routeMatches)) {
-    const normalizedKey = normalizeRouteMatchKey(key);
-    if (
-      !normalizedKey ||
-      typeof value !== 'string' ||
-      isSyntheticRouteMatchPlaceholder(value)
-    ) {
-      continue;
-    }
-    params[normalizedKey] = dynamicParamKinds
-      ? normalizeRouteMatchParamValueForDynamicPath(
-          value,
-          normalizedKey,
-          dynamicParamKinds
-        )
-      : decodeRouteMatchValue(value);
-  }
-
-  return Object.keys(params).length > 0 ? params : undefined;
-}
-
-function mergeRequestMetaParams(
-  params: RuntimeRequestMetaParams | undefined,
-  overrides: RuntimeRequestMetaParams | undefined
-): RuntimeRequestMetaParams | undefined {
-  if (!params) {
-    return overrides;
-  }
-  if (!overrides) {
-    return params;
-  }
-  return {
-    ...params,
-    ...overrides,
-  };
-}
-
 function withOptionalSuffix(pathname: string, suffix?: string): string {
   if (!suffix || pathname.endsWith(suffix)) {
     return pathname;
@@ -3130,72 +2734,6 @@ function toSingleParamValue(
     return typeof firstValue === 'string' ? firstValue : null;
   }
   return null;
-}
-
-function toCatchAllParamValues(
-  value: RuntimeRequestMetaValue
-): string[] | null {
-  if (typeof value === 'string') {
-    return value.length > 0 ? value.split('/').filter((entry) => entry.length > 0) : [];
-  }
-  if (Array.isArray(value)) {
-    return value;
-  }
-  return null;
-}
-
-function resolveDynamicPathnameWithParams(
-  dynamicPathname: string,
-  params: RuntimeRequestMetaParams | undefined
-): string | null {
-  if (!params || !isDynamicRoute(dynamicPathname)) {
-    return null;
-  }
-
-  const dynamicSegments = dynamicPathname.split('/');
-  const concreteSegments: string[] = [];
-  for (const segment of dynamicSegments) {
-    if (segment.length === 0) {
-      continue;
-    }
-
-    if (segment.startsWith('[[...') && segment.endsWith(']]')) {
-      const key = segment.slice('[[...'.length, -']]'.length);
-      const rawValue = params[key];
-      const values = toCatchAllParamValues(rawValue);
-      if (!values || values.length === 0) {
-        continue;
-      }
-      concreteSegments.push(...values.map((entry) => encodeURIComponent(entry)));
-      continue;
-    }
-
-    if (segment.startsWith('[...') && segment.endsWith(']')) {
-      const key = segment.slice('[...'.length, -']'.length);
-      const rawValue = params[key];
-      const values = toCatchAllParamValues(rawValue);
-      if (!values || values.length === 0) {
-        return null;
-      }
-      concreteSegments.push(...values.map((entry) => encodeURIComponent(entry)));
-      continue;
-    }
-
-    if (segment.startsWith('[') && segment.endsWith(']')) {
-      const key = segment.slice('['.length, -']'.length);
-      const rawValue = params[key];
-      const value = toSingleParamValue(rawValue);
-      if (!value) {
-        return null;
-      }
-      concreteSegments.push(encodeURIComponent(value));
-      continue;
-    }
-
-    concreteSegments.push(segment);
-  }
-
-  return concreteSegments.length > 0 ? `/${concreteSegments.join('/')}` : '/';
 }
 
 function getIndexAlias(pathname: string): string | null {
@@ -3284,12 +2822,7 @@ function getRoutingPathnameCandidates(pathnames: string[]): string[] {
   for (const pathname of pathnames) {
     addManifestPathnameCandidates(candidates, pathname);
   }
-  const candidateList = Array.from(candidates);
-  try {
-    return getSortedRoutes(candidateList);
-  } catch {
-    return candidateList;
-  }
+  return Array.from(candidates);
 }
 
 const routingPathnames = getRoutingPathnameCandidates([
@@ -3309,6 +2842,56 @@ function getFunctionOutputByPathname(pathname: string): RuntimeFunctionOutput | 
 
   for (const candidate of candidates) {
     const output = functionOutputByPathname.get(candidate);
+    if (output) {
+      return output;
+    }
+  }
+
+  return undefined;
+}
+
+function getSourcePageForResolvedPathname(pathname: string): string | undefined {
+  const candidates = new Set<string>();
+  addManifestPathnameCandidates(candidates, pathname);
+  if (runtimeI18n) {
+    const withoutLocalePrefix = stripLocalePrefixFromPathname(
+      pathname,
+      basePath,
+      runtimeI18n
+    );
+    if (withoutLocalePrefix !== pathname) {
+      addManifestPathnameCandidates(candidates, withoutLocalePrefix);
+    }
+  }
+
+  for (const candidate of candidates) {
+    const sourcePage = sourcePageByResolvedPathname.get(candidate);
+    if (sourcePage) {
+      return sourcePage;
+    }
+  }
+
+  return undefined;
+}
+
+function getSourcePageOutputByPathname(
+  sourcePage: string,
+  pathname: string
+): RuntimeFunctionOutput | undefined {
+  const outputs = functionOutputsBySourcePage.get(sourcePage);
+  if (!outputs || outputs.length === 0) {
+    return undefined;
+  }
+
+  const outputByPathname = new Map<string, RuntimeFunctionOutput>();
+  for (const output of outputs) {
+    outputByPathname.set(output.pathname, output);
+  }
+
+  const candidates = new Set<string>();
+  addManifestPathnameCandidates(candidates, pathname);
+  for (const candidate of candidates) {
+    const output = outputByPathname.get(candidate);
     if (output) {
       return output;
     }
@@ -3341,109 +2924,98 @@ function preferRscFunctionOutput(
   return output;
 }
 
+function resolveFunctionOutputBySourcePage({
+  sourcePage,
+  matchedPathname,
+  requestPathname,
+  rscSuffix,
+  preferRscOutput,
+}: {
+  sourcePage: string;
+  matchedPathname: string;
+  requestPathname: string;
+  rscSuffix?: string;
+  preferRscOutput: boolean;
+}): ResolvedFunctionOutput | null {
+  const sourcePageOutputs = functionOutputsBySourcePage.get(sourcePage);
+  if (!sourcePageOutputs || sourcePageOutputs.length === 0) {
+    return null;
+  }
+
+  const candidatePathnames: string[] = [];
+  const pushPathname = (pathname: string): void => {
+    if (!pathname) {
+      return;
+    }
+    if (!candidatePathnames.includes(pathname)) {
+      candidatePathnames.push(pathname);
+    }
+  };
+
+  pushPathname(withOptionalSuffix(matchedPathname, rscSuffix));
+  pushPathname(matchedPathname);
+  pushPathname(withOptionalSuffix(requestPathname, rscSuffix));
+  pushPathname(requestPathname);
+
+  if (runtimeI18n) {
+    const strippedMatchedPathname = stripLocalePrefixFromPathname(
+      matchedPathname,
+      basePath,
+      runtimeI18n
+    );
+    if (strippedMatchedPathname !== matchedPathname) {
+      pushPathname(withOptionalSuffix(strippedMatchedPathname, rscSuffix));
+      pushPathname(strippedMatchedPathname);
+    }
+    const strippedRequestPathname = stripLocalePrefixFromPathname(
+      requestPathname,
+      basePath,
+      runtimeI18n
+    );
+    if (strippedRequestPathname !== requestPathname) {
+      pushPathname(withOptionalSuffix(strippedRequestPathname, rscSuffix));
+      pushPathname(strippedRequestPathname);
+    }
+  }
+
+  for (const candidatePathname of candidatePathnames) {
+    const output = getSourcePageOutputByPathname(sourcePage, candidatePathname);
+    if (output) {
+      return { output: preferRscFunctionOutput(output, preferRscOutput) };
+    }
+  }
+
+  const fallbackOutput =
+    sourcePageOutputs.find((output) =>
+      preferRscOutput ? output.pathname.endsWith('.rsc') : !output.pathname.endsWith('.rsc')
+    ) ?? sourcePageOutputs[0];
+  return fallbackOutput
+    ? { output: preferRscFunctionOutput(fallbackOutput, preferRscOutput) }
+    : null;
+}
+
 function resolveFunctionOutput(
   matchedPathname: string,
   requestPathname: string,
   rscSuffix?: string,
-  preferRscOutput: boolean = false,
-  routeMatches?: Record<string, string>
+  preferRscOutput: boolean = false
 ): ResolvedFunctionOutput | null {
   const preferredMatchedPathname = withOptionalSuffix(matchedPathname, rscSuffix);
-  const requestContainsLiteralBrackets =
-    requestPathname.includes('[') ||
-    requestPathname.includes(']') ||
-    /%5B|%5D/i.test(requestPathname);
-  let restrictDynamicFallbackToMatchedPath = false;
-  const matchedPathParams = toRequestMetaParamsFromRouteMatches(
-    routeMatches,
-    matchedPathname
-  );
-  const filteredMatchedPathParams = matchedPathParams
-    ? filterRouteParamsForDynamicPathname(matchedPathParams, matchedPathname)
-    : undefined;
   const exactOutput =
     getFunctionOutputByPathname(preferredMatchedPathname) ??
     getFunctionOutputByPathname(matchedPathname);
   if (exactOutput) {
-    if (!isAppFunctionOutput(exactOutput)) {
-      const appOutputForRequestPathname = resolveAppFunctionOutputForRequestPathname(
-        requestPathname,
-        rscSuffix,
-        preferRscOutput
-      );
-      if (appOutputForRequestPathname) {
-        return appOutputForRequestPathname;
-      }
+    const mappedByExactOutput = resolveFunctionOutputBySourcePage({
+      sourcePage: exactOutput.sourcePage,
+      matchedPathname,
+      requestPathname,
+      rscSuffix,
+      preferRscOutput,
+    });
+    if (mappedByExactOutput) {
+      return mappedByExactOutput;
     }
-
-    const exactOutputMatcherPathname = toMatcherPathname(exactOutput.pathname);
-    const exactMatcher =
-      dynamicFunctionMatchers.get(exactOutputMatcherPathname) ??
-      dynamicFunctionMatchers.get(exactOutput.pathname);
-    if (!exactMatcher) {
-      return { output: preferRscFunctionOutput(exactOutput, preferRscOutput) };
-    }
-
-    const preferredRequestPathname = withOptionalSuffix(requestPathname, rscSuffix);
-    const exactMatcherParams =
-      toRequestMetaParamsFromMatcher(exactMatcher(preferredRequestPathname)) ??
-      toRequestMetaParamsFromMatcher(exactMatcher(requestPathname));
-    const routeMatchedParams = toRequestMetaParamsFromRouteMatches(
-      routeMatches,
-      exactOutputMatcherPathname
-    );
-    const filteredRouteMatchedParams = routeMatchedParams
-      ? filterRouteParamsForDynamicPathname(routeMatchedParams, exactOutput.pathname)
-      : undefined;
-    const exactParams = mergeRequestMetaParams(
-      exactMatcherParams,
-      filteredRouteMatchedParams
-    );
-    const concretePathname = resolveDynamicPathnameWithParams(
-      exactOutput.pathname,
-      exactParams
-    );
-    if (concretePathname) {
-      const concreteOutput = getFunctionOutputByPathname(concretePathname);
-      if (concreteOutput && !isDynamicRoute(concreteOutput.pathname)) {
-        return {
-          output: preferRscFunctionOutput(concreteOutput, preferRscOutput),
-        };
-      }
-    }
-    if (exactParams) {
-      return { output: preferRscFunctionOutput(exactOutput, preferRscOutput), params: exactParams };
-    }
-
     return { output: preferRscFunctionOutput(exactOutput, preferRscOutput) };
-  }
-
-  if (isDynamicRoute(matchedPathname)) {
-    if (filteredMatchedPathParams) {
-      const concreteMatchedPathname = resolveDynamicPathnameWithParams(
-        matchedPathname,
-        filteredMatchedPathParams
-      );
-      if (concreteMatchedPathname) {
-        const concreteOutput = getFunctionOutputByPathname(
-          withOptionalSuffix(concreteMatchedPathname, rscSuffix)
-        ) ?? getFunctionOutputByPathname(concreteMatchedPathname);
-        if (concreteOutput && !isDynamicRoute(concreteOutput.pathname)) {
-          return {
-            output: preferRscFunctionOutput(concreteOutput, preferRscOutput),
-          };
-        }
-      }
-    }
-    // Requests like "/dynamic/[first]" can be routed to a concrete prerender
-    // pathname with no direct function output. Fall through so the dynamic
-    // matcher set can resolve the canonical handler (e.g. [slug]).
-    // For non-bracket requests that already matched a dynamic pathname, still
-    // attempt dynamic fallback resolution but only against compatible dynamic
-    // function templates to avoid unrelated handler selection.
-    if (!requestContainsLiteralBrackets) {
-      restrictDynamicFallbackToMatchedPath = true;
-    }
   }
 
   const matchedWithoutBasePath = getPathnameWithoutBasePath(matchedPathname, basePath);
@@ -3455,147 +3027,31 @@ function resolveFunctionOutput(
     return null;
   }
 
-  const candidatePathnames = new Set<string>();
-  addManifestPathnameCandidates(candidatePathnames, preferredMatchedPathname);
-  addManifestPathnameCandidates(candidatePathnames, matchedPathname);
-  addManifestPathnameCandidates(
-    candidatePathnames,
-    withOptionalSuffix(requestPathname, rscSuffix)
-  );
-  addManifestPathnameCandidates(candidatePathnames, requestPathname);
-
-  for (const candidatePathname of candidatePathnames) {
-    const candidateContainsLiteralBrackets =
-      candidatePathname.includes('[') ||
-      candidatePathname.includes(']') ||
-      /%5B|%5D/i.test(candidatePathname);
-    // When the incoming request is concrete (no literal brackets), avoid
-    // matching dynamic function templates against template candidates like
-    // "/foo/[id]". That can incorrectly select a handler and mask 404s.
-    if (!requestContainsLiteralBrackets && candidateContainsLiteralBrackets) {
-      continue;
+  const candidateSourcePages: string[] = [];
+  const pushSourcePage = (sourcePage: string | undefined): void => {
+    if (!sourcePage) {
+      return;
     }
-
-    for (const dynamicPathname of dynamicFunctionOutputPathnames) {
-      if (restrictDynamicFallbackToMatchedPath) {
-        const dynamicCandidatePathname = toMatcherPathname(dynamicPathname);
-        const compatibleWithMatchedPath =
-          pathnameMatchesRoutePathname(matchedPathname, dynamicCandidatePathname) ||
-          pathnameMatchesRoutePathname(dynamicCandidatePathname, matchedPathname);
-        if (!compatibleWithMatchedPath) {
-          continue;
-        }
-        if (
-          !hasSufficientStaticPathOverlap(
-            matchedPathname,
-            dynamicCandidatePathname,
-            runtimeI18n
-          )
-        ) {
-          continue;
-        }
-      }
-
-      const matcher = dynamicFunctionMatchers.get(dynamicPathname);
-      if (!matcher) {
-        continue;
-      }
-
-      let matchedParams = matcher(candidatePathname);
-      if (!matchedParams) {
-        const normalizedCandidatePathname =
-          normalizePathnameForRouteMatching(candidatePathname);
-        if (normalizedCandidatePathname !== candidatePathname) {
-          matchedParams = matcher(normalizedCandidatePathname);
-        }
-      }
-      if (!matchedParams) {
-        continue;
-      }
-
-      const output = functionOutputByPathname.get(dynamicPathname);
-      if (!output) {
-        continue;
-      }
-
-      const paramsFromMatcher = toRequestMetaParamsFromMatcher(matchedParams);
-      const routeMatchedParams = toRequestMetaParamsFromRouteMatches(
-        routeMatches,
-        dynamicPathname
-      );
-      const filteredRouteMatchedParams = routeMatchedParams
-        ? filterRouteParamsForDynamicPathname(routeMatchedParams, dynamicPathname)
-        : undefined;
-      const params = mergeRequestMetaParams(
-        paramsFromMatcher,
-        filteredRouteMatchedParams
-      );
-      const resolvedOutput = preferRscFunctionOutput(output, preferRscOutput);
-      return params ? { output: resolvedOutput, params } : { output: resolvedOutput };
+    if (!candidateSourcePages.includes(sourcePage)) {
+      candidateSourcePages.push(sourcePage);
     }
-  }
+  };
 
-  return null;
-}
+  pushSourcePage(getSourcePageForResolvedPathname(preferredMatchedPathname));
+  pushSourcePage(getSourcePageForResolvedPathname(matchedPathname));
+  pushSourcePage(getSourcePageForResolvedPathname(withOptionalSuffix(requestPathname, rscSuffix)));
+  pushSourcePage(getSourcePageForResolvedPathname(requestPathname));
 
-function resolveAppFunctionOutputForRequestPathname(
-  requestPathname: string,
-  rscSuffix?: string,
-  preferRscOutput: boolean = false
-): ResolvedFunctionOutput | null {
-  const candidatePathnames = new Set<string>();
-  addManifestPathnameCandidates(
-    candidatePathnames,
-    withOptionalSuffix(requestPathname, rscSuffix)
-  );
-  addManifestPathnameCandidates(candidatePathnames, requestPathname);
-  if (runtimeI18n) {
-    const withoutLocalePrefix = stripLocalePrefixFromPathname(
+  for (const sourcePage of candidateSourcePages) {
+    const mappedOutput = resolveFunctionOutputBySourcePage({
+      sourcePage,
+      matchedPathname,
       requestPathname,
-      basePath,
-      runtimeI18n
-    );
-    if (withoutLocalePrefix !== requestPathname) {
-      addManifestPathnameCandidates(
-        candidatePathnames,
-        withOptionalSuffix(withoutLocalePrefix, rscSuffix)
-      );
-      addManifestPathnameCandidates(candidatePathnames, withoutLocalePrefix);
-    }
-  }
-
-  for (const candidatePathname of candidatePathnames) {
-    const exactOutput = getFunctionOutputByPathname(candidatePathname);
-    if (exactOutput && isAppFunctionOutput(exactOutput)) {
-      return { output: preferRscFunctionOutput(exactOutput, preferRscOutput) };
-    }
-
-    for (const dynamicPathname of dynamicFunctionOutputPathnames) {
-      const output = functionOutputByPathname.get(dynamicPathname);
-      if (!output || !isAppFunctionOutput(output)) {
-        continue;
-      }
-
-      const matcher = dynamicFunctionMatchers.get(dynamicPathname);
-      if (!matcher) {
-        continue;
-      }
-
-      let matchedParams = matcher(candidatePathname);
-      if (!matchedParams) {
-        const normalizedCandidatePathname =
-          normalizePathnameForRouteMatching(candidatePathname);
-        if (normalizedCandidatePathname !== candidatePathname) {
-          matchedParams = matcher(normalizedCandidatePathname);
-        }
-      }
-      if (!matchedParams) {
-        continue;
-      }
-
-      const params = toRequestMetaParamsFromMatcher(matchedParams);
-      const resolvedOutput = preferRscFunctionOutput(output, preferRscOutput);
-      return params ? { output: resolvedOutput, params } : { output: resolvedOutput };
+      rscSuffix,
+      preferRscOutput,
+    });
+    if (mappedOutput) {
+      return mappedOutput;
     }
   }
 
@@ -5566,11 +5022,12 @@ const server = http.createServer(async (req, res) => {
           requestRoutingI18n = runtimeI18n;
         }
       }
-      resolvedRoutingResult = await resolveRoutes({
-        url: resolveRoutesUrl,
-        buildId,
-        basePath,
-        requestBody: createBodyStream(requestBody),
+      resolvedRoutingResult = normalizeResolveRoutesResultShape(
+        await resolveRoutes({
+          url: resolveRoutesUrl,
+          buildId,
+          basePath,
+          requestBody: createBodyStream(requestBody),
         headers: routingHeaders,
         pathnames: routingPathnames,
         i18n: requestRoutingI18n,
@@ -5640,8 +5097,10 @@ const server = http.createServer(async (req, res) => {
             middlewareBodyResponse = response;
           }
           return middlewareResult;
-        },
-      });
+          },
+        }),
+        resolveRoutesUrl
+      );
 
       if (
         runtimeI18n &&
@@ -6073,17 +5532,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    const invocationTargetPathname = resolvedRoutingResult.invocationTarget?.pathname;
-    const routeCapturePathname =
-      invocationTargetPathname &&
-      !hasSyntheticRouteMatchPlaceholderInPathname(invocationTargetPathname)
-        ? invocationTargetPathname
-        : sourcePathname;
-    routeMatches = resolveRouteMatchPlaceholders(
-      routeMatches,
-      getRouteCapturesForPathname(routeCapturePathname, matchedPathname)
-    );
-
     const rscSuffix = routeMatches?.rscSuffix;
     const invocationPathname =
       middlewareRewriteUrl?.pathname ??
@@ -6122,8 +5570,7 @@ const server = http.createServer(async (req, res) => {
           nextDataCandidatePathname,
           nextDataCandidatePathname,
           undefined,
-          false,
-          routeMatches
+          false
         );
         if (nextDataOutput?.output.pathname.includes('/_next/data/')) {
           resolvedFunctionOutput = nextDataOutput;
@@ -6136,8 +5583,7 @@ const server = http.createServer(async (req, res) => {
         matchedPathname,
         invocationPathname,
         typeof rscSuffix === 'string' ? rscSuffix : undefined,
-        preferRscOutput,
-        routeMatches
+        preferRscOutput
       );
     }
     if (middlewareRewriteUrl && !nextDataNormalizedPathname) {
@@ -6156,8 +5602,7 @@ const server = http.createServer(async (req, res) => {
           rewrittenMiddlewarePathname,
           rewrittenMiddlewarePathname,
           typeof rscSuffix === 'string' ? rscSuffix : undefined,
-          preferRscOutput,
-          routeMatches
+          preferRscOutput
         );
         if (rewrittenOutput) {
           const matchedHasInterception = hasInterceptionMarkerInPathname(matchedPathname);
@@ -6234,21 +5679,9 @@ const server = http.createServer(async (req, res) => {
     const hasRequestMetaSourceQuery =
       Boolean(requestMetaSourceQuery) &&
       Object.keys(requestMetaSourceQuery as Record<string, unknown>).length > 0;
-    const requestQueryBase = removeSyntheticRoutePlaceholderQueryValues(
-      hasRequestMetaSourceQuery
-        ? toRequestQueryFromResolveRoutesQuery(requestMetaSourceQuery)
-        : toRequestQuery(requestUrl.searchParams)
-    );
-    removeInternalRouteParamQueryValues(requestQueryBase);
-    const requestQuery = shouldMergeRouteMatchesIntoRequestQuery(
-      resolvedFunctionOutput?.output
-    )
-      ? mergeRouteMatchesIntoQuery(
-          requestQueryBase,
-          routeMatches,
-          resolvedFunctionOutput?.output.pathname ?? matchedPathname
-        )
-      : requestQueryBase;
+    const requestQuery = hasRequestMetaSourceQuery
+      ? toRequestQueryFromResolveRoutesQuery(requestMetaSourceQuery)
+      : toRequestQuery(requestUrl.searchParams);
     const fallbackParams = getFallbackParamsForOutput(resolvedFunctionOutput?.output);
     let requestMetaParams =
       process.env.ADAPTER_BUN_DISABLE_REQUEST_META_PARAMS === '1'

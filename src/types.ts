@@ -117,6 +117,10 @@ export interface BunRuntimeFunctionOutput {
   env?: Record<string, string>;
 }
 
+export interface BunResolvedPathnameSourcePageMap {
+  [resolvedPathname: string]: string;
+}
+
 export interface BunDeploymentManifest {
   schemaVersion: 1;
   generatedAt: string;
@@ -153,6 +157,7 @@ export interface BunDeploymentManifest {
     routing?: BunRuntimeRouting | null;
     middleware?: BunRuntimeFunctionOutput | null;
     functions?: BunRuntimeFunctionOutput[];
+    resolvedPathnameToSourcePage?: BunResolvedPathnameSourcePageMap;
   };
   staticAssets: BunStaticAsset[];
   summary: {

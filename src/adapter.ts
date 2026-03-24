@@ -20,6 +20,7 @@ import type {
   BunRuntimeAssetBinding,
   BunDeploymentManifest,
   BunRuntimeFunctionOutput,
+  BunResolvedPathnameSourcePageMap,
   BuildCompleteContext,
 } from './types.ts';
 
@@ -609,6 +610,76 @@ function collectRuntimeFunctionOutputs(
   );
 }
 
+function addResolvedPathnameSourcePageEntry(
+  map: Map<string, string>,
+  pathname: string,
+  sourcePage: string
+): void {
+  if (!pathname || !sourcePage) {
+    return;
+  }
+
+  map.set(pathname, sourcePage);
+  if (pathname === '/index') {
+    map.set('/', sourcePage);
+  } else if (pathname === '/') {
+    map.set('/index', sourcePage);
+  }
+}
+
+function collectResolvedPathnameToSourcePage({
+  outputs,
+  runtimeFunctionOutputs,
+}: {
+  outputs: BuildCompleteContext['outputs'];
+  runtimeFunctionOutputs: BunRuntimeFunctionOutput[];
+}): BunResolvedPathnameSourcePageMap {
+  const sourcePageByResolvedPathname = new Map<string, string>();
+  const sourcePageByOutputId = new Map<string, string>();
+
+  for (const output of [
+    ...outputs.pages,
+    ...outputs.pagesApi,
+    ...outputs.appPages,
+    ...outputs.appRoutes,
+  ]) {
+    sourcePageByOutputId.set(output.id, output.sourcePage);
+  }
+
+  if (outputs.middleware) {
+    sourcePageByOutputId.set(outputs.middleware.id, outputs.middleware.sourcePage);
+  }
+
+  for (const output of runtimeFunctionOutputs) {
+    if (!sourcePageByOutputId.has(output.id)) {
+      sourcePageByOutputId.set(output.id, output.sourcePage);
+    }
+    addResolvedPathnameSourcePageEntry(
+      sourcePageByResolvedPathname,
+      output.pathname,
+      output.sourcePage
+    );
+  }
+
+  for (const prerender of outputs.prerenders) {
+    const parentSourcePage = sourcePageByOutputId.get(prerender.parentOutputId);
+    if (!parentSourcePage) {
+      continue;
+    }
+    addResolvedPathnameSourcePageEntry(
+      sourcePageByResolvedPathname,
+      prerender.pathname,
+      parentSourcePage
+    );
+  }
+
+  return Object.fromEntries(
+    [...sourcePageByResolvedPathname.entries()].sort(([left], [right]) =>
+      left.localeCompare(right)
+    )
+  );
+}
+
 function isStaticMetadataRoutePathname(pathname: string): boolean {
   return (
     pathname.endsWith('/robots.txt') ||
@@ -967,6 +1038,10 @@ async function onBuildComplete(
         includeAssets: ctx.outputs.middleware.runtime === 'edge',
       })
     : undefined;
+  const resolvedPathnameToSourcePage = collectResolvedPathnameToSourcePage({
+    outputs: ctx.outputs,
+    runtimeFunctionOutputs,
+  });
 
   const deploymentManifest = buildDeploymentManifest({
     adapterName: ADAPTER_NAME,
@@ -982,6 +1057,7 @@ async function onBuildComplete(
     routing: runtimeRouting,
     middlewareOutput: runtimeMiddleware,
     functionOutputs: runtimeFunctionOutputs,
+    resolvedPathnameToSourcePage,
   });
 
   await writeJsonFile(
