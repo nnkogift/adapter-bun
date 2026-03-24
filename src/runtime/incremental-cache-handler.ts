@@ -582,6 +582,7 @@ export default class BunSqliteIncrementalCacheHandler
     const queryTags = getFetchContextTags(ctx);
     const storedTags = readStoredHeaderTags(row.headers);
     const tagsToCheck = normalizeTags([...queryTags, ...storedTags]);
+    let hasStaleTag = false;
 
     if (tagsToCheck.length > 0) {
       const tagEntries = store.getTagManifestEntries?.(tagsToCheck);
@@ -598,7 +599,7 @@ export default class BunSqliteIncrementalCacheHandler
             return null;
           }
           if (tagEntry.staleAt !== undefined && tagEntry.staleAt > row.createdAt) {
-            continue;
+            hasStaleTag = true;
           }
         }
       }
@@ -632,7 +633,9 @@ export default class BunSqliteIncrementalCacheHandler
     }
 
     return {
-      lastModified: row.createdAt,
+      // Next.js treats -1 as stale and serves stale data while triggering
+      // background regeneration for the entry.
+      lastModified: hasStaleTag ? -1 : row.createdAt,
       value,
     };
   }

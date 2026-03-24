@@ -515,6 +515,7 @@ export default class FetchIncrementalCacheHandler
     const queryTags = getFetchContextTags(ctx);
     const storedTags = readStoredHeaderTags(row.headers);
     const tagsToCheck = normalizeTags([...queryTags, ...storedTags]);
+    let hasStaleTag = false;
     debugIncrementalCacheLog(
       'get hit',
       cacheKey,
@@ -553,6 +554,7 @@ export default class FetchIncrementalCacheHandler
             return null;
           }
           if (tagEntry.staleAt !== undefined && tagEntry.staleAt > row.createdAt) {
+            hasStaleTag = true;
             debugIncrementalCacheLog(
               'get stale tag',
               cacheKey,
@@ -617,7 +619,9 @@ export default class FetchIncrementalCacheHandler
     debugIncrementalCacheLog('get return', cacheKey, 'kind=', ctx.kind);
 
     return {
-      lastModified: row.createdAt,
+      // Next.js treats -1 as stale and serves stale data while triggering
+      // background regeneration for the entry.
+      lastModified: hasStaleTag ? -1 : row.createdAt,
       value,
     };
   }
