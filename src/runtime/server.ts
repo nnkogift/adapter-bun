@@ -2159,6 +2159,71 @@ function isInternalRouteParamPlaceholderValue(value: string): boolean {
   return decodedValue.startsWith('$nxtP') || decodedValue.startsWith('$nxtI');
 }
 
+function hasInternalRouteParamPlaceholderInPathname(pathname: string): boolean {
+  if (!pathname) {
+    return false;
+  }
+
+  const candidates = [pathname];
+  try {
+    candidates.push(decodeURIComponent(pathname));
+  } catch {
+    // Keep the raw pathname fallback when it cannot be decoded.
+  }
+
+  return candidates.some(
+    (candidate) =>
+      candidate.includes('$nxtP') || candidate.includes('$nxtI')
+  );
+}
+
+function hasInternalRouteParamPlaceholderInParams(
+  params: RuntimeRequestMetaParams | undefined
+): boolean {
+  if (!params) {
+    return false;
+  }
+
+  for (const value of Object.values(params)) {
+    if (typeof value === 'string') {
+      if (isInternalRouteParamPlaceholderValue(value)) {
+        return true;
+      }
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (isInternalRouteParamPlaceholderValue(entry)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+function selectPathnameForParamExtraction(
+  pathnames: Array<string | null | undefined>
+): string | undefined {
+  for (const pathname of pathnames) {
+    if (typeof pathname !== 'string' || pathname.length === 0) {
+      continue;
+    }
+    if (!hasInternalRouteParamPlaceholderInPathname(pathname)) {
+      return pathname;
+    }
+  }
+
+  for (const pathname of pathnames) {
+    if (typeof pathname === 'string' && pathname.length > 0) {
+      return pathname;
+    }
+  }
+
+  return undefined;
+}
+
 function normalizeInternalRouteParamQueryKey(key: string): string | null {
   if (key.startsWith('nxtP') && key.length > 'nxtP'.length) {
     return key.slice('nxtP'.length);
@@ -6139,6 +6204,14 @@ const server = http.createServer(async (req, res) => {
       resolvedRoutingResult.invocationTarget?.pathname ??
       middlewareRewriteUrl?.pathname ??
       sourcePathname;
+    const paramsExtractionPathname = selectPathnameForParamExtraction([
+      middlewareRewriteUrl?.pathname,
+      sourcePathname,
+      requestUrl.pathname,
+      resolvedUrl.pathname,
+      invocationPathname,
+    ]);
+    const outputRequestPathname = paramsExtractionPathname ?? invocationPathname;
     const explicitRscPath =
       isRscRequest ||
       invocationPathname.endsWith('.rsc') ||
@@ -6190,7 +6263,7 @@ const server = http.createServer(async (req, res) => {
       if (invocationPathOutput) {
         const invocationPathDynamicParams = getDynamicParamsForOutputRequestPathname(
           invocationPathOutput,
-          invocationPathname,
+          outputRequestPathname,
           typeof rscSuffix === 'string' ? rscSuffix : undefined
         );
         resolvedFunctionOutput = invocationPathDynamicParams
@@ -6206,7 +6279,7 @@ const server = http.createServer(async (req, res) => {
     if (!resolvedFunctionOutput) {
       resolvedFunctionOutput = resolveFunctionOutput(
         matchedPathname,
-        invocationPathname,
+        outputRequestPathname,
         typeof rscSuffix === 'string' ? rscSuffix : undefined,
         preferRscOutput
       );
@@ -6257,7 +6330,7 @@ const server = http.createServer(async (req, res) => {
       if (matchedHasLocalePrefix) {
         const invocationResolvedFunctionOutput = resolveFunctionOutput(
           invocationPathname,
-          invocationPathname,
+          outputRequestPathname,
           typeof rscSuffix === 'string' ? rscSuffix : undefined,
           explicitRscPath
         );
@@ -6272,6 +6345,25 @@ const server = http.createServer(async (req, res) => {
             matchedPathname = resolvedFunctionOutput.output.pathname;
           }
         }
+      }
+    }
+    if (
+      resolvedFunctionOutput?.output &&
+      hasInternalRouteParamPlaceholderInParams(resolvedFunctionOutput.params)
+    ) {
+      const resolvedOutputParams = getDynamicParamsForOutputRequestPathname(
+        resolvedFunctionOutput.output,
+        outputRequestPathname,
+        typeof rscSuffix === 'string' ? rscSuffix : undefined
+      );
+      if (
+        resolvedOutputParams &&
+        !hasInternalRouteParamPlaceholderInParams(resolvedOutputParams)
+      ) {
+        resolvedFunctionOutput = {
+          ...resolvedFunctionOutput,
+          params: resolvedOutputParams,
+        };
       }
     }
     if (debugRequest) {
@@ -6318,12 +6410,29 @@ const server = http.createServer(async (req, res) => {
       process.env.ADAPTER_BUN_DISABLE_REQUEST_META_PARAMS === '1'
         ? undefined
         : resolvedFunctionOutput?.params;
-    if (!requestMetaParams && resolvedFunctionOutput?.output) {
-      requestMetaParams = getDynamicParamsForOutputRequestPathname(
-        resolvedFunctionOutput.output,
+    if (
+      (!requestMetaParams ||
+        hasInternalRouteParamPlaceholderInParams(requestMetaParams)) &&
+      resolvedFunctionOutput?.output
+    ) {
+      const paramPathnameCandidates = [
+        outputRequestPathname,
         invocationPathname,
-        typeof rscSuffix === 'string' ? rscSuffix : undefined
-      );
+      ];
+      for (const paramPathname of paramPathnameCandidates) {
+        const candidateParams = getDynamicParamsForOutputRequestPathname(
+          resolvedFunctionOutput.output,
+          paramPathname,
+          typeof rscSuffix === 'string' ? rscSuffix : undefined
+        );
+        if (!candidateParams) {
+          continue;
+        }
+        requestMetaParams = candidateParams;
+        if (!hasInternalRouteParamPlaceholderInParams(candidateParams)) {
+          break;
+        }
+      }
     }
     if (
       process.env.ADAPTER_BUN_FORCE_PLACEHOLDER_PARAMS_ON_FALLBACK === '1' &&
