@@ -1,9 +1,9 @@
 import { getSharedPrerenderCacheStore } from './cache-store.js';
 import type {
   CacheEntry,
-  CacheHandler as NextUseCacheHandler,
+  NextUseCacheHandler,
   Timestamp,
-} from 'next/dist/server/lib/cache-handlers/types';
+} from '../next-compat-types.js';
 
 const CACHE_TAGS_HEADER = 'x-next-cache-tags';
 const CACHE_STALE_HEADER = 'x-next-cache-stale';

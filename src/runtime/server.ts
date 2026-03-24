@@ -19,22 +19,22 @@ import {
 } from '@next/routing';
 import {
   ACTION_HEADER,
+  computeCacheBustingSearchParam,
+  createOpaqueFallbackRouteParams,
+  getMiddlewareRouteMatcher,
+  getNamedRouteRegex,
+  getRouteMatcher,
+  getSortedRoutes,
+  isDynamicRoute,
   NEXT_RSC_UNION_QUERY,
   NEXT_ROUTER_PREFETCH_HEADER,
   NEXT_ROUTER_SEGMENT_PREFETCH_HEADER,
   NEXT_ROUTER_STATE_TREE_HEADER,
   NEXT_URL,
+  normalizeNextQueryParam,
   RSC_HEADER,
-} from 'next/dist/client/components/app-router-headers.js';
-import { normalizeNextQueryParam } from 'next/dist/server/web/utils.js';
-import { createOpaqueFallbackRouteParams } from 'next/dist/server/request/fallback-params.js';
-import { setCacheBustingSearchParamWithHash } from 'next/dist/client/components/router-reducer/set-cache-busting-search-param.js';
-import { computeCacheBustingSearchParam } from 'next/dist/shared/lib/router/utils/cache-busting-search-param.js';
-import { isDynamicRoute } from 'next/dist/shared/lib/router/utils/is-dynamic.js';
-import { getRouteMatcher } from 'next/dist/shared/lib/router/utils/route-matcher.js';
-import { getNamedRouteRegex } from 'next/dist/shared/lib/router/utils/route-regex.js';
-import { getSortedRoutes } from 'next/dist/shared/lib/router/utils/sorted-routes.js';
-import { getMiddlewareRouteMatcher } from 'next/dist/shared/lib/router/utils/middleware-route-matcher.js';
+  setCacheBustingSearchParamWithHash,
+} from './next-compat.js';
 import { getSharedPrerenderCacheStore } from './cache-store.js';
 import { handleCacheHttpRequest } from './cache-http-server.js';
 
@@ -3757,8 +3757,66 @@ const nodeMiddlewareHandlerCache = new Map<string, EdgeRouteHandler>();
 const nodeMiddlewareHandlerLoadPromises = new Map<string, Promise<EdgeRouteHandler>>();
 const edgeHandlerCache = new Map<string, EdgeRouteHandler>();
 const edgeChunkLoadPromises = new Map<string, Promise<void>>();
-type RuntimeImageOptimizerModule = typeof import('next/dist/server/image-optimizer.js');
-type RuntimeServeStaticModule = typeof import('next/dist/server/serve-static.js');
+type RuntimeImageParamsResultError = { errorMessage: string };
+type RuntimeImageParamsResultSuccess = {
+  href: string;
+  isAbsolute: boolean;
+  isStatic: boolean;
+  [key: string]: unknown;
+};
+type RuntimeImageParamsResult =
+  | RuntimeImageParamsResultError
+  | RuntimeImageParamsResultSuccess;
+type RuntimeImageUpstream = {
+  buffer: Buffer;
+  contentType: string | null;
+  cacheControl: string | null;
+  etag: string;
+};
+interface RuntimeImageOptimizerModule {
+  ImageError: new (...args: any[]) => Error & { statusCode: number };
+  ImageOptimizerCache: {
+    validateParams: (
+      req: IncomingMessage,
+      query: Record<string, string | string[]>,
+      nextConfig: unknown,
+      isDev: boolean
+    ) => RuntimeImageParamsResult;
+  };
+  extractEtag: (etag: string | null, buffer: Buffer) => string;
+  fetchExternalImage: (
+    href: string,
+    dangerouslyAllowLocalIP: boolean,
+    maximumResponseBody: number
+  ) => Promise<RuntimeImageUpstream>;
+  imageOptimizer: (
+    imageUpstream: RuntimeImageUpstream,
+    paramsResult: RuntimeImageParamsResultSuccess,
+    nextConfig: unknown,
+    options: { isDev: boolean }
+  ) => Promise<{
+    buffer: Buffer;
+    contentType: string;
+    etag: string;
+    maxAge: number;
+  }>;
+  sendResponse: (
+    req: IncomingMessage,
+    res: ServerResponse,
+    href: string,
+    extension: string,
+    buffer: Buffer,
+    etag: string,
+    isStatic: boolean,
+    xCache: string,
+    imagesConfig: unknown,
+    maxAge: number,
+    isDev: boolean
+  ) => void;
+}
+interface RuntimeServeStaticModule {
+  getExtension: (contentType: string) => string | undefined;
+}
 type RuntimeCreateAtomicTimerGroup = (
   delayMs?: number
 ) => (callback: () => void) => ReturnType<typeof setTimeout>;
@@ -4114,10 +4172,7 @@ async function handleNextImageRequest(
     return false;
   }
 
-  const nextConfigForImages =
-    runtimeNextConfig as unknown as Parameters<
-      RuntimeImageOptimizerModule['ImageOptimizerCache']['validateParams']
-    >[2];
+  const nextConfigForImages = runtimeNextConfig as RuntimeNextConfig;
   const imageOptimizer = getImageOptimizerModule();
 
   if (runtimeNextConfig.output === 'export' || process.env.NEXT_MINIMAL) {

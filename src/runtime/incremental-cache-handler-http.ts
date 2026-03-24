@@ -12,20 +12,16 @@ import {
   NULL_CACHE_ENTRY_MARKER,
 } from './incremental-cache-codec.js';
 import type {
-  CacheHandler as NextIncrementalCacheHandler,
-  CacheHandlerContext,
-  CacheHandlerValue,
-} from 'next/dist/server/lib/incremental-cache';
-import type {
   GetIncrementalFetchCacheContext,
   GetIncrementalResponseCacheContext,
   IncrementalCacheValue,
+  NextIncrementalCacheHandler,
+  NextIncrementalCacheHandlerContext as CacheHandlerContext,
+  NextIncrementalCacheHandlerValue as CacheHandlerValue,
   SetIncrementalFetchCacheContext,
   SetIncrementalResponseCacheContext,
-} from 'next/dist/server/response-cache';
-import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
-import { getRouteMatcher } from 'next/dist/shared/lib/router/utils/route-matcher.js';
-import { getNamedRouteRegex } from 'next/dist/shared/lib/router/utils/route-regex.js';
+} from '../next-compat-types.js';
+import { getNamedRouteRegex, getRouteMatcher } from './next-compat.js';
 
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
 const NEXT_CACHE_ROUTE_TAG_PREFIX = '_N_T_';
@@ -43,28 +39,6 @@ registerGlobalCacheHandlers(cacheHandler);
 function debugIncrementalCacheLog(...args: unknown[]): void {
   if (ENABLE_DEBUG_INCREMENTAL_CACHE) {
     console.log('[adapter-bun][incremental-cache-http]', ...args);
-  }
-}
-
-function updateInMemoryTagsManifest(
-  tags: string[],
-  update: PrerenderTagManifestUpdate & { now: number }
-): void {
-  for (const tag of tags) {
-    const current = tagsManifest.get(tag) ?? {};
-    if (update.mode === 'stale') {
-      current.stale = update.now;
-      if (
-        typeof update.expireSeconds === 'number' &&
-        Number.isFinite(update.expireSeconds) &&
-        update.expireSeconds > 0
-      ) {
-        current.expired = update.now + update.expireSeconds * 1000;
-      }
-    } else {
-      current.expired = update.now;
-    }
-    tagsManifest.set(tag, current);
   }
 }
 
@@ -481,7 +455,6 @@ async function updateTagManifests(
   update: PrerenderTagManifestUpdate & { now: number }
 ): Promise<void> {
   if (tags.length === 0) return;
-  updateInMemoryTagsManifest(tags, update);
   await store.updateTagManifest?.(tags, update);
 }
 

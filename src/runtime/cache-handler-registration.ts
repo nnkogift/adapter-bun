@@ -1,4 +1,4 @@
-import type { CacheHandler as NextUseCacheHandler } from 'next/dist/server/lib/cache-handlers/types';
+import type { NextUseCacheHandler } from '../next-compat-types.js';
 
 const handlersSymbol = Symbol.for('@next/cache-handlers');
 

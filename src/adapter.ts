@@ -4,7 +4,7 @@ import path from 'node:path';
 import { Database } from 'bun:sqlite';
 import type { NextAdapter } from 'next';
 import type { AdapterOutput } from 'next';
-import type { IncrementalCacheValue } from 'next/dist/server/response-cache';
+import type { IncrementalCacheValue } from './next-compat-types.js';
 import {
   buildDeploymentManifest,
   collectOutputPathnames,

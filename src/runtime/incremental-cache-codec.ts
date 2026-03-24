@@ -1,4 +1,4 @@
-import type { IncrementalCacheValue } from 'next/dist/server/response-cache';
+import type { IncrementalCacheValue } from '../next-compat-types.js';
 import {
   bytesFromUtf8,
   decodeBase64ToBytes,
