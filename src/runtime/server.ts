@@ -6278,12 +6278,12 @@ const server = http.createServer(async (req, res) => {
       sourcePathname;
     const paramsExtractionPathname = selectPathnameForParamExtraction([
       middlewareRewriteUrl?.pathname,
-      runtimeRewritePathnameForParams,
       resolvedRoutingResult.invocationTarget?.pathname,
       sourcePathname,
       requestUrl.pathname,
       resolvedUrl.pathname,
       invocationPathname,
+      runtimeRewritePathnameForParams,
     ]);
     const outputRequestPathname = paramsExtractionPathname ?? invocationPathname;
     const explicitRscPath =
@@ -6484,15 +6484,13 @@ const server = http.createServer(async (req, res) => {
       process.env.ADAPTER_BUN_DISABLE_REQUEST_META_PARAMS === '1'
         ? undefined
         : resolvedFunctionOutput?.params;
-    if (
-      (!requestMetaParams ||
-        hasInternalRouteParamPlaceholderInParams(requestMetaParams)) &&
-      resolvedFunctionOutput?.output
-    ) {
+    if (resolvedFunctionOutput?.output) {
       const paramPathnameCandidates = [
-        outputRequestPathname,
-        runtimeRewritePathnameForParams,
         invocationPathname,
+        outputRequestPathname,
+        requestUrl.pathname,
+        resolvedUrl.pathname,
+        runtimeRewritePathnameForParams,
       ];
       for (const paramPathname of paramPathnameCandidates) {
         if (!paramPathname) {
