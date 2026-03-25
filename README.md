@@ -1,21 +1,34 @@
 # adapter-bun
 
-A Next.js adapter that runs your app on [Bun](https://bun.sh).
+A Next.js adapter for running production builds on [Bun](https://bun.sh).
 
-Takes the output of `next build` and produces a self-contained `bun-dist/` directory you can start with `bun bun-dist/server.js`.
+At build time, it hooks into Next.js (`modifyConfig` + `onBuildComplete`) and writes a `bun-dist/` runtime package with:
+
+- a Bun-launched server entry (`server.js`)
+- adapter runtime/cache modules (`runtime/*.js`)
+- staged static assets (`static/`)
+- a deployment manifest (`deployment-manifest.json`)
+- a SQLite cache database (`cache.db`)
+
+## Current status
+
+This repo is currently marked `private` in `package.json`, so use it as a local/workspace dependency.
 
 ## Quick start
 
-Install the adapter alongside Next.js:
+Install as a local dependency (example path):
 
 ```bash
-bun add adapter-bun
+bun add adapter-bun@file:../adapter-bun
 ```
 
-Point your `next.config.ts` at it:
+Point `next.config.ts` at the adapter:
 
 ```ts
 import type { NextConfig } from 'next';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 const config: NextConfig = {
   adapterPath: require.resolve('adapter-bun'),
@@ -31,124 +44,184 @@ bun --bun next build
 bun bun-dist/server.js
 ```
 
-## Configuration
+## Important runtime note
 
-Pass options to `createBunAdapter()` in your adapter entry:
+`bun-dist/` is not a fully self-contained Next.js bundle. The runtime server still boots Next.js from your project directory and `.next` build output (by default it assumes `bun-dist/` is inside the project root). If needed, set `NEXT_PROJECT_DIR` to override the project root at runtime.
+
+## Adapter options
+
+To configure options, create your own adapter entry:
 
 ```ts
+// bun-adapter.ts
 import { createBunAdapter } from 'adapter-bun';
 
 export default createBunAdapter({
-  outDir: 'bun-dist',       // output directory (default: 'bun-dist')
-  port: 3000,               // listen port (default: 3000)
-  hostname: '0.0.0.0',      // bind address (default: '0.0.0.0')
-  deploymentHost: 'app.example.com', // CSRF allow-list for Server Actions
-  cacheHandlerMode: 'http', // default; edge-safe cache transport over fetch
+  outDir: 'bun-dist',
+  port: 3000,
+  hostname: '0.0.0.0',
+  deploymentHost: 'app.example.com',
+  cacheHandlerMode: 'http',
+  cacheEndpointPath: '/_adapter/cache',
+  cacheAuthToken: 'dev-secret-token',
 });
 ```
 
-`deploymentHost` can also be set via the `BUN_ADAPTER_DEPLOYMENT_HOST` environment variable.
+Then point `adapterPath` at that file:
 
-`cacheHandlerMode` defaults to `http`. In that mode the generated Bun server mounts an internal cache endpoint and the handlers talk to it over `fetch` instead of importing `bun:sqlite` directly inside Edge bundles. Set `cacheHandlerMode: 'sqlite'` only if you explicitly want direct Bun-local SQLite access.
+```ts
+// next.config.ts
+import type { NextConfig } from 'next';
+import { createRequire } from 'node:module';
 
-## What it supports
+const require = createRequire(import.meta.url);
 
-- **App Router** — static pages, dynamic SSR, streaming, `generateStaticParams`
-- **Pages Router** — `getStaticProps`, `getServerSideProps`, `getStaticPaths` with fallback
-- **API Routes** — both app route handlers and pages API routes
-- **Middleware** — edge middleware with rewrites, redirects, and response headers
-- **ISR** — time-based revalidation and on-demand revalidation via `revalidateTag()`, `revalidatePath()`, and `res.revalidate()`
-- **Image optimization** — `next/image` backed by Sharp
-- **Draft mode** — preview bypass cookies
-- **`next.config` routing** — headers, redirects, rewrites (including external rewrites)
-- **Mixed routers** — app and pages router in the same project
-- **Edge runtime** — edge functions and middleware run in an isolated `edge-runtime` sandbox
+const config: NextConfig = {
+  adapterPath: require.resolve('./bun-adapter.ts'),
+};
 
-## How it works
-
-### Build time
-
-The adapter hooks into Next.js via the `onBuildComplete` callback. It takes the `.next/` build output and produces a deployment-ready directory:
-
+export default config;
 ```
+
+### Option reference
+
+- `outDir?: string`  
+  Output directory (`bun-dist` by default).
+- `port?: number`  
+  Default listen port written into `deployment-manifest.json`.
+- `hostname?: string`  
+  Default listen hostname written into `deployment-manifest.json`.
+- `deploymentHost?: string`  
+  Canonical deployed host used for Server Actions CSRF allow-listing.
+- `cacheHandlerMode?: 'http' | 'sqlite'`  
+  Cache transport for Next cache handlers. Defaults to `http`.
+- `cacheEndpointPath?: string`  
+  Internal cache endpoint path (HTTP mode).
+- `cacheAuthToken?: string`  
+  Shared secret for the internal cache endpoint (HTTP mode).
+
+`deploymentHost` can also be set via `BUN_ADAPTER_DEPLOYMENT_HOST`.
+
+## Runtime environment variables
+
+- `PORT`  
+  Overrides manifest port at runtime.
+- `NEXT_HOSTNAME`  
+  Preferred hostname for internal Next origin calculation.
+- `NEXT_PROJECT_DIR`  
+  Overrides inferred project root (default: parent of `bun-dist`).
+- `BUN_ADAPTER_CACHE_HTTP_TOKEN`  
+  Overrides cache endpoint auth token in `http` mode.
+- `BUN_ADAPTER_KEEP_ALIVE_TIMEOUT`  
+  Overrides Node HTTP keep-alive timeout (ms).
+
+## Generated output
+
+Typical `bun-dist/` contents:
+
+```txt
 bun-dist/
-  server.js                 # entry point (Bun.serve)
-  deployment-manifest.json  # routes, functions, assets, config
-  cache.db                  # SQLite — prerender + image cache
-  bundle/                   # function artifacts (route handlers)
-  static/                   # static assets (/_next/static + public/)
-  runtime/                  # router, cache, invokers
-  node_modules/             # traced dependencies
-```
-
-Functions are consolidated into a shared `bundle/` directory with deduplicated assets. Prerender seeds (SSG pages) are written into the SQLite cache so they're served immediately on first request.
-
-### Runtime
-
-`server.js` starts a Bun HTTP server. Each request flows through:
-
-1. **Route resolution** — `@next/routing` matches the URL against the route graph (middleware routes, file-based routes, dynamic routes, config rewrites/redirects)
-2. **Middleware** — if the app has middleware, it runs in an edge runtime sandbox and can rewrite, redirect, or modify headers
-3. **Dispatch** — the matched route is handed to the appropriate handler:
-   - **Static** — file served from `static/` with appropriate cache headers
-   - **Prerender (ISR)** — served from SQLite cache; stale entries trigger background revalidation
-   - **Function** — Node.js handler invoked via a per-request HTTP server; edge handlers run in `edge-runtime`
-   - **Image** — optimized via Sharp with its own cache layer
-   - **External rewrite** — proxied to the external URL
-4. **Cache evaluation** — prerender responses are checked against the tag manifest for staleness/expiration before serving
-
-### Caching
-
-The adapter uses SQLite (`cache.db`) for persistent caching:
-
-- **Prerender cache** — stores rendered pages with TTL and tag-based invalidation
-- **Image cache** — stores optimized images with TTL
-- **Tag manifest** — tracks `revalidateTag()` / `revalidatePath()` invalidations
-- **Revalidation locks** — prevents duplicate background regeneration
-
-When `revalidateTag()` or `revalidatePath()` is called inside a route handler or server action, the adapter bridges Next.js's in-memory tag manifest with the SQLite store so invalidations persist across requests.
-
-### On-demand revalidation
-
-Three mechanisms are supported:
-
-- **`revalidateTag(tag)`** / **`revalidatePath(path)`** from `next/cache` — works inside route handlers and server actions; synced to SQLite via the tag manifest bridge
-- **`res.revalidate(path)`** — pages router ISR; the adapter patches `fetch` to rewrite self-referencing HTTPS calls to HTTP
-
-## Project structure
-
-```
-src/
-  adapter.ts                # build hook + server template
-  manifest.ts               # deployment + router manifest generation
-  staging.ts                # stages assets, functions, prerender seeds
-  types.ts                  # adapter types
+  server.js
+  deployment-manifest.json
+  runtime-next-config.json
+  cache.db
   runtime/
-    router.ts               # request router (createRouterRuntime)
-    isr.ts                  # prerender cache logic + types
-    image.ts                # image optimization cache
-    sqlite-cache.ts         # SQLite cache stores
-    function-invoker.ts     # dispatches to node/edge invokers
-    function-invoker-node.ts   # Node.js function runtime
-    function-invoker-edge.ts   # Edge function runtime + middleware
-    function-invoker-shared.ts # shared invoker utilities
-    static.ts               # static file serving
-    revalidate.ts           # background revalidation queue
-    tag-manifest-bridge.ts  # syncs Next.js revalidateTag to SQLite
-    next-routing.ts         # lazy-loads @next/routing
-    types.ts                # runtime types
+    cache-handler.js
+    cache-handler-http.js
+    cache-http-client.js
+    cache-http-server.js
+    incremental-cache-handler.js
+    incremental-cache-handler-http.js
+    sqlite-cache.js
+    ...
+  static/
+    _next/static/...
+    public assets...
+```
+
+At runtime, SQLite sidecar files (`cache.db-wal`, `cache.db-shm`) are also expected.
+
+## Feature coverage
+
+Validated via the fixture app and deploy E2E harness:
+
+- App Router pages and route handlers
+- Pages Router pages (`getStaticProps`, `getServerSideProps`, `getStaticPaths`)
+- API routes (App + Pages)
+- ISR and on-demand revalidation (`revalidateTag`, `revalidatePath`, `res.revalidate`)
+- Middleware/proxy behavior
+- `next.config` headers, rewrites, redirects
+- `next/image` optimization
+- Draft mode
+- Mixed App + Pages router projects
+
+## How caching works
+
+- SQLite schema stores prerender entries, image entries, tag manifest metadata, and revalidation locks/targets.
+- Prerender fallback outputs from `next build` are seeded into `cache.db` during `onBuildComplete`.
+- In `cacheHandlerMode: 'http'` (default), cache handlers talk to an internal authenticated HTTP endpoint (`/_adapter/cache` by default), which avoids direct `bun:sqlite` imports in Edge-oriented paths.
+- In `cacheHandlerMode: 'sqlite'`, handlers read/write SQLite directly.
+
+## Public exports
+
+`adapter-bun` exports:
+
+- default adapter (`bunAdapter`)
+- `createBunAdapter`
+- `ADAPTER_NAME`
+- `DEFAULT_BUN_ADAPTER_OUT_DIR`
+- `SqlitePrerenderCacheStore`
+- `SqliteImageCacheStore`
+- `createSqliteCacheStores`
+- types: `BunAdapterOptions`, `BunDeploymentManifest`, `BunStaticAsset`, `SqliteCacheOptions`
+
+## Repo layout
+
+```txt
+src/
+  adapter.ts
+  manifest.ts
+  staging.ts
+  types.ts
+  runtime/
+    server.ts
+    isr.ts
+    sqlite-cache.ts
+    cache-store.ts
+    cache-handler.ts
+    cache-handler-http.ts
+    cache-handler-registration.ts
+    incremental-cache-handler.ts
+    incremental-cache-handler-http.ts
+    incremental-cache-codec.ts
+    cache-http-client.ts
+    cache-http-server.ts
+    cache-http-protocol.ts
+    binary.ts
 ```
 
 ## Development
 
 ```bash
-# build the adapter
+# install deps
+bun install
+
+# build dist/
 bun run build
 
 # type-check
 bun run typecheck
+```
 
-# run live E2E checks against a real bun-dist server
+Fixture live validation:
+
+```bash
 cd fixtures/verbose-mixed-router
 bun run build:e2e
+```
+
+Next.js deploy harness (full local E2E against Next repo):
+
+```bash
+./scripts/e2e-local.sh [next-ref] [test-file]
 ```
