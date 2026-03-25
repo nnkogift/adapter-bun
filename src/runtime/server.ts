@@ -5931,8 +5931,12 @@ const server = http.createServer(async (req, res) => {
         String(requestMeta.hostname ?? '')
       );
     }
-    if (process.env.ADAPTER_BUN_USE_ORIGINAL_REQ_URL === '1') {
-      req.url = `${requestUrl.pathname}${requestUrl.search}`;
+    const shouldUseOriginalReqUrl = Boolean(nextDataRoutePathname);
+    const originalReqSearch = nextDataRoutePathname
+      ? resolvedUrl.search
+      : requestUrl.search;
+    if (shouldUseOriginalReqUrl) {
+      req.url = `${requestUrl.pathname}${originalReqSearch}`;
     } else {
       req.url = `${invocationUrl.pathname}${invocationUrl.search}`;
     }
@@ -5986,9 +5990,7 @@ const server = http.createServer(async (req, res) => {
         req,
         res,
         resolvedFunctionOutput.output,
-        process.env.ADAPTER_BUN_USE_ORIGINAL_REQ_URL === '1'
-          ? requestUrl
-          : invocationUrl,
+        shouldUseOriginalReqUrl ? requestUrl : invocationUrl,
         requestBody,
         requestMeta
       );
