@@ -1,6 +1,4 @@
 import { createFetchPrerenderCacheStore } from './cache-http-client.js';
-import cacheHandler from './cache-handler-http.js';
-import { registerGlobalCacheHandlers } from './cache-handler-registration.js';
 import type { PrerenderTagManifestUpdate } from './isr.js';
 import {
   decodeCacheValue,
@@ -28,8 +26,6 @@ const store = createFetchPrerenderCacheStore();
 const ENABLE_DEBUG_INCREMENTAL_CACHE =
   process.env.NEXT_PRIVATE_DEBUG_CACHE === '1' ||
   process.env.ADAPTER_BUN_DEBUG_CACHE === '1';
-
-registerGlobalCacheHandlers(cacheHandler);
 
 function debugIncrementalCacheLog(...args: unknown[]): void {
   if (ENABLE_DEBUG_INCREMENTAL_CACHE) {
@@ -199,9 +195,14 @@ function resolveRevalidateSeconds(
   return null;
 }
 
+function getRuntimeBuildId(): string | null {
+  const buildId = process.env.BUN_ADAPTER_BUILD_ID;
+  return typeof buildId === 'string' && buildId.length > 0 ? buildId : null;
+}
+
 function toSeededDataCacheKey(cacheKey: string): string | null {
-  const buildId = process.env.__NEXT_BUILD_ID;
-  if (typeof buildId !== 'string' || buildId.length === 0) {
+  const buildId = getRuntimeBuildId();
+  if (!buildId) {
     return null;
   }
 

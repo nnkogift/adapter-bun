@@ -1272,6 +1272,73 @@ function getNormalizedHostHeader(
   return normalizedHost && normalizedHost.length > 0 ? normalizedHost : undefined;
 }
 
+function getNormalizedProtocolHeader(
+  value: string | string[] | undefined
+): string | undefined {
+  const protocol = Array.isArray(value) ? value[0] : value;
+  if (!protocol || typeof protocol !== 'string') {
+    return undefined;
+  }
+
+  const normalized = protocol.split(',')[0]?.trim().toLowerCase();
+  if (normalized === 'http' || normalized === 'https') {
+    return normalized;
+  }
+
+  return undefined;
+}
+
+function getProtocolFromForwardedHeader(
+  value: string | string[] | undefined
+): string | undefined {
+  const forwardedHeader = Array.isArray(value) ? value[0] : value;
+  if (!forwardedHeader || typeof forwardedHeader !== 'string') {
+    return undefined;
+  }
+
+  const normalized = forwardedHeader.split(',')[0]?.trim() ?? '';
+  const match = normalized.match(/(?:^|;)\\s*proto=([^;\\s]+)/i);
+  if (!match) {
+    return undefined;
+  }
+
+  const protocol = match[1]?.replace(/^"|"$/g, '').toLowerCase();
+  return protocol === 'http' || protocol === 'https' ? protocol : undefined;
+}
+
+function resolveRequestOrigin(
+  headers: Record<string, string | string[] | undefined>,
+  fallbackOrigin: string
+): string {
+  let fallbackHost = '127.0.0.1';
+  let fallbackProtocol = 'http';
+  try {
+    const fallbackUrl = new URL(fallbackOrigin);
+    fallbackHost = fallbackUrl.host;
+    fallbackProtocol = fallbackUrl.protocol.replace(/:$/, '') || 'http';
+  } catch {}
+
+  const host =
+    getNormalizedHostHeader(headers['x-forwarded-host']) ??
+    getNormalizedHostHeader(headers.host) ??
+    fallbackHost;
+  const protocol =
+    getNormalizedProtocolHeader(headers['x-forwarded-proto']) ??
+    getProtocolFromForwardedHeader(headers.forwarded) ??
+    fallbackProtocol;
+
+  return `${protocol}://${host}`;
+}
+
+function toRequestUrl(req: IncomingMessage, fallbackOrigin: string): URL {
+  const origin = resolveRequestOrigin(req.headers, fallbackOrigin);
+  try {
+    return new URL(req.url || '/', origin);
+  } catch {
+    return new URL('/', origin);
+  }
+}
+
 function applyHostHeaderToUrl(url: URL, hostHeader: string | string[] | undefined): URL {
   const normalizedHost = getNormalizedHostHeader(hostHeader);
   if (!normalizedHost) {
@@ -1778,7 +1845,8 @@ function maybeStripDefaultLocaleFromLocation(
   location: string,
   basePath: string,
   i18n: ReturnType<typeof toRoutingI18n>,
-  requestHasLocalePrefix: boolean
+  requestHasLocalePrefix: boolean,
+  requestOrigin: string
 ): string {
   if (!i18n || requestHasLocalePrefix) {
     return location;
@@ -1786,7 +1854,7 @@ function maybeStripDefaultLocaleFromLocation(
 
   let parsed: URL;
   try {
-    parsed = new URL(location, process.env.__NEXT_PRIVATE_ORIGIN);
+    parsed = new URL(location, requestOrigin);
   } catch {
     return location;
   }
@@ -1801,8 +1869,7 @@ function maybeStripDefaultLocaleFromLocation(
     return location;
   }
 
-  const origin = process.env.__NEXT_PRIVATE_ORIGIN || '';
-  return parsed.origin === origin
+  return parsed.origin === requestOrigin
     ? `${parsed.pathname}${parsed.search}${parsed.hash}`
     : parsed.toString();
 }
@@ -2863,21 +2930,9 @@ const port =
     ? requestedPort
     : resolveManifestPort(manifest);
 const listenHostname = resolveManifestHostname(manifest);
-
-const configuredHostname = process.env.NEXT_HOSTNAME || '';
-const appHostname =
-  configuredHostname &&
-  !isWildcardHostname(configuredHostname)
-    ? configuredHostname
-    : !isWildcardHostname(listenHostname)
-      ? listenHostname
-      : 'localhost';
-const protocol = process.env.__NEXT_EXPERIMENTAL_HTTPS === '1' ? 'https' : 'http';
-
-// Next's forwarded action/redirect fetches rely on this internal origin.
-process.env.__NEXT_PRIVATE_ORIGIN = `${protocol}://${appHostname}:${port}`;
+const defaultInternalOrigin = `http://127.0.0.1:${port}`;
 if (buildId) {
-  process.env.__NEXT_BUILD_ID = buildId;
+  process.env.BUN_ADAPTER_BUILD_ID = buildId;
 }
 
 const internalRevalidate: RuntimeInternalRevalidate = async ({
@@ -2896,7 +2951,10 @@ const internalRevalidate: RuntimeInternalRevalidate = async ({
     requestHeaders.set(key, value);
   }
 
-  const targetUrl = new URL(urlPath, process.env.__NEXT_PRIVATE_ORIGIN);
+  const targetUrl = new URL(
+    urlPath,
+    resolveRequestOrigin(headers, defaultInternalOrigin)
+  );
   const response = await fetch(targetUrl, {
     method: 'HEAD',
     headers: requestHeaders,
@@ -2921,8 +2979,10 @@ if (cacheRuntime.handlerMode === 'http') {
     cacheRuntime.authToken ||
     crypto.randomUUID();
   process.env.BUN_ADAPTER_CACHE_HTTP_TOKEN = cacheAuthToken;
-  process.env.BUN_ADAPTER_CACHE_HTTP_URL =
-    process.env.__NEXT_PRIVATE_ORIGIN + cacheRuntime.endpointPath;
+  process.env.BUN_ADAPTER_CACHE_HTTP_URL = new URL(
+    cacheRuntime.endpointPath,
+    defaultInternalOrigin
+  ).toString();
 }
 
 const runtimeRoutingConfig = manifest.runtime?.routing ?? null;
@@ -4284,10 +4344,12 @@ function getNextImageMaximumResponseBody(imagesConfig: RuntimeNextImageConfig): 
 async function fetchInternalImageForOptimizer({
   href,
   req,
+  requestOrigin,
   maximumResponseBody,
 }: {
   href: string;
   req: IncomingMessage;
+  requestOrigin: string;
   maximumResponseBody: number;
 }): Promise<{
   buffer: Buffer;
@@ -4296,7 +4358,7 @@ async function fetchInternalImageForOptimizer({
   etag: string;
 }> {
   const imageOptimizer = getImageOptimizerModule();
-  const targetUrl = new URL(href, process.env.__NEXT_PRIVATE_ORIGIN);
+  const targetUrl = new URL(href, requestOrigin);
   const requestHeaders = new Headers();
   const acceptHeader = getSingleHeaderValue(req.headers.accept);
   if (typeof acceptHeader === 'string' && acceptHeader.length > 0) {
@@ -4412,10 +4474,11 @@ async function handleNextImageRequest(
       : await fetchInternalImageForOptimizer({
           href: paramsResult.href,
           req,
+          requestOrigin: requestUrl.origin,
           maximumResponseBody,
         });
 
-    const hrefPathname = new URL(paramsResult.href, process.env.__NEXT_PRIVATE_ORIGIN).pathname;
+    const hrefPathname = new URL(paramsResult.href, requestUrl.origin).pathname;
     if (isNextImagePathname(hrefPathname)) {
       throw new Error('Invariant attempted to optimize _next/image itself');
     }
@@ -4777,8 +4840,6 @@ function createEdgeIncrementalCache(
     if (typeof incrementalCache.resetRequestCache === 'function') {
       incrementalCache.resetRequestCache();
     }
-    (globalThis as { __incrementalCache?: RuntimeIncrementalCache }).__incrementalCache =
-      incrementalCache;
     return incrementalCache;
   } catch (error) {
     if (ENABLE_DEBUG_ROUTING) {
@@ -4906,7 +4967,11 @@ async function runEdgeFunctionOutput(
   requestMeta?: RuntimeRequestMeta,
   timeoutMs?: number
 ): Promise<Response> {
-  applyEdgeEnv(output.env);
+  const edgeEnv = {
+    ...(output.env ?? {}),
+    ...(buildId ? { BUN_ADAPTER_BUILD_ID: buildId } : {}),
+  };
+  applyEdgeEnv(edgeEnv);
 
   const resolvedEntryKey = output.edgeRuntime?.entryKey ?? deriveEdgeEntryKey(output);
   const name = toEdgeFunctionName(resolvedEntryKey);
@@ -4942,7 +5007,7 @@ async function runEdgeFunctionOutput(
     name,
     paths: toEdgeFunctionPaths(output),
     edgeFunctionEntry: {
-      env: output.env ?? {},
+      env: edgeEnv,
       wasm: output.wasmBindings ?? [],
       ...(output.assetBindings && output.assetBindings.length > 0
         ? { assets: output.assetBindings }
@@ -5567,7 +5632,7 @@ const server = http.createServer(async (req, res) => {
   markConnectionClose(res);
 
   if (cacheRuntime.handlerMode === 'http') {
-    const requestUrl = new URL(req.url || '/', process.env.__NEXT_PRIVATE_ORIGIN);
+    const requestUrl = toRequestUrl(req, defaultInternalOrigin);
     if (requestUrl.pathname === cacheRuntime.endpointPath) {
       await handleCacheHttpRequest(req, res, getSharedPrerenderCacheStore(), {
         authToken: process.env.BUN_ADAPTER_CACHE_HTTP_TOKEN,
@@ -5647,7 +5712,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    const requestUrl = new URL(req.url || '/', process.env.__NEXT_PRIVATE_ORIGIN);
+    const requestUrl = toRequestUrl(req, defaultInternalOrigin);
     ensureForwardedRequestHeaders(req, requestUrl);
     const routingBaseUrl = applyHostHeaderToUrl(requestUrl, req.headers.host);
     if (hasInvalidPathnameEncoding(requestUrl.pathname)) {
@@ -5855,7 +5920,7 @@ const server = http.createServer(async (req, res) => {
           try {
             isDefaultLocaleRedirect =
               removePathnameTrailingSlash(
-                new URL(locationHeader, process.env.__NEXT_PRIVATE_ORIGIN).pathname
+                new URL(locationHeader, requestUrl.origin).pathname
               ) === removePathnameTrailingSlash(defaultLocaleRootPathname);
           } catch {
             isDefaultLocaleRedirect = false;
@@ -5999,7 +6064,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const locationUrl = new URL(
             routeLocationHeader,
-            process.env.__NEXT_PRIVATE_ORIGIN
+            requestUrl.origin
           );
           if (
             removePathnameTrailingSlash(locationUrl.pathname) ===
@@ -6038,7 +6103,8 @@ const server = http.createServer(async (req, res) => {
         resolvedRoutingResult.redirect.url.toString(),
         basePath,
         runtimeI18n,
-        requestHasLocalePrefix
+        requestHasLocalePrefix,
+        requestUrl.origin
       );
       if (routeHeaders) {
         applyResponseHeaders(res, routeHeaders);
@@ -6096,7 +6162,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const redirectUrl = new URL(
             routeLocationHeader,
-            process.env.__NEXT_PRIVATE_ORIGIN
+            requestUrl.origin
           );
           const requestPathname = removePathnameTrailingSlash(requestUrl.pathname);
           const redirectPathname = removePathnameTrailingSlash(redirectUrl.pathname);
@@ -6105,8 +6171,7 @@ const server = http.createServer(async (req, res) => {
           if (shouldPropagateSearch) {
             redirectUrl.search = requestUrl.search;
           }
-          const currentOrigin = process.env.__NEXT_PRIVATE_ORIGIN ?? '';
-          const shouldPreserveOrigin = redirectUrl.origin !== currentOrigin;
+          const shouldPreserveOrigin = redirectUrl.origin !== requestUrl.origin;
           redirectLocation = shouldPreserveOrigin
             ? redirectUrl.toString()
             : `${redirectUrl.pathname}${redirectUrl.search}${redirectUrl.hash}`;
@@ -6118,7 +6183,8 @@ const server = http.createServer(async (req, res) => {
         redirectLocation,
         basePath,
         runtimeI18n,
-        requestHasLocalePrefix
+        requestHasLocalePrefix,
+        requestUrl.origin
       );
       if (routeHeaders) {
         applyResponseHeaders(res, routeHeaders);
@@ -6259,7 +6325,7 @@ const server = http.createServer(async (req, res) => {
     if (middlewareRewriteHeader) {
       middlewareRewriteUrl = new URL(
         middlewareRewriteHeader,
-        process.env.__NEXT_PRIVATE_ORIGIN
+        requestUrl.origin
       );
       resolvedUrl.pathname = middlewareRewriteUrl.pathname;
       if (!resolvedRoutingQuery) {
@@ -6681,7 +6747,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (!res.headersSent) {
-      const requestUrl = new URL(req.url || '/', process.env.__NEXT_PRIVATE_ORIGIN);
+      const requestUrl = toRequestUrl(req, defaultInternalOrigin);
       const isNextDataRequest =
         getSingleHeaderValue(req.headers['x-nextjs-data']) === '1' ||
         requestUrl.pathname.includes('/_next/data/');
@@ -6721,7 +6787,7 @@ const server = http.createServer(async (req, res) => {
             } catch {
               errorRequestBody = new Uint8Array(0);
             }
-            const errorUrl = new URL(errorOutput.pathname, process.env.__NEXT_PRIVATE_ORIGIN);
+            const errorUrl = new URL(errorOutput.pathname, requestUrl.origin);
             req.url = errorUrl.pathname;
             res.statusCode = 500;
             await invokeFunctionOutput(

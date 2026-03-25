@@ -208,14 +208,6 @@ export NEXT_DEPLOYMENT_ID="bun-adapter-${DEPLOY_RANDOM}"
 export VERCEL_IMMUTABLE_ASSET_TOKEN="$NEXT_DEPLOYMENT_ID"
 export IMMUTABLE_ASSET_TOKEN="$NEXT_DEPLOYMENT_ID"
 
-# Forward experimental feature flags from the test harness.
-if [ -n "${__NEXT_CACHE_COMPONENTS:-}" ]; then
-  export NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS="${__NEXT_CACHE_COMPONENTS}"
-fi
-if [ -n "${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS:-}" ]; then
-  export __NEXT_CACHE_COMPONENTS="${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS}"
-fi
-
 bash -lc "$BUILD_SCRIPT" 2>&1 | tee -a "$NEXT_TEST_DIR/.adapter-build.log" >&2
 
 # 7. Record build ID markers for logs script

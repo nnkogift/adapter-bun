@@ -6,7 +6,6 @@ import type {
 } from './isr.js';
 import {
   CACHE_HTTP_AUTH_HEADER,
-  DEFAULT_CACHE_HTTP_ENDPOINT_PATH,
   deserializePrerenderCacheEntry,
   serializePrerenderCacheEntry,
   type CacheHttpRequest,
@@ -35,11 +34,6 @@ function resolveEndpointUrl(explicitUrl?: string): string {
   const configuredUrl = readRuntimeEnv('BUN_ADAPTER_CACHE_HTTP_URL');
   if (configuredUrl) {
     return configuredUrl;
-  }
-
-  const privateOrigin = readRuntimeEnv('__NEXT_PRIVATE_ORIGIN');
-  if (privateOrigin) {
-    return new URL(DEFAULT_CACHE_HTTP_ENDPOINT_PATH, privateOrigin).toString();
   }
 
   throw new Error(
@@ -74,17 +68,6 @@ async function loadFallbackStore(): Promise<PrerenderCacheStore> {
   return fallbackStorePromise;
 }
 
-function getTransportFetch(): typeof fetch {
-  const candidate = globalThis.fetch as
-    | (typeof fetch & { _nextOriginalFetch?: typeof fetch })
-    | undefined;
-  if (!candidate) {
-    throw new Error('[adapter-bun] global fetch is not available');
-  }
-
-  return candidate._nextOriginalFetch ?? candidate;
-}
-
 async function parseJsonResponse(response: Response): Promise<CacheHttpResponse> {
   try {
     return (await response.json()) as CacheHttpResponse;
@@ -108,7 +91,7 @@ export class FetchPrerenderCacheStore implements PrerenderCacheStore {
 
   async #request(payload: CacheHttpRequest): Promise<CacheHttpResponse> {
     const endpointUrl = resolveEndpointUrl(this.#configuredUrl);
-    const response = await getTransportFetch()(endpointUrl, {
+    const init: RequestInit = {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -118,7 +101,11 @@ export class FetchPrerenderCacheStore implements PrerenderCacheStore {
       },
       body: JSON.stringify(payload),
       cache: 'no-store',
-    });
+      next: {
+        internal: true,
+      } as unknown as RequestInit['next'],
+    };
+    const response = await fetch(endpointUrl, init);
 
     const parsed = await parseJsonResponse(response);
     if (!response.ok) {

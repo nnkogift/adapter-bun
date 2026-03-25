@@ -1,6 +1,4 @@
 import type { PrerenderTagManifestUpdate } from './isr.js';
-import cacheHandler from './cache-handler.js';
-import { registerGlobalCacheHandlers } from './cache-handler-registration.js';
 import { getSharedPrerenderCacheStore } from './cache-store.js';
 import type {
   GetIncrementalFetchCacheContext,
@@ -25,8 +23,6 @@ const KNOWN_CACHE_KINDS = new Set([
   'REDIRECT',
   'IMAGE',
 ]);
-
-registerGlobalCacheHandlers(cacheHandler);
 
 function normalizeTags(tags: string[]): string[] {
   const unique = new Set<string>();
@@ -261,9 +257,14 @@ function decodeStoredBodyText(row: {
   return Buffer.from(decodeStoredBodyBytes(row)).toString('utf8');
 }
 
+function getRuntimeBuildId(): string | null {
+  const buildId = process.env.BUN_ADAPTER_BUILD_ID;
+  return typeof buildId === 'string' && buildId.length > 0 ? buildId : null;
+}
+
 function toSeededDataCacheKey(cacheKey: string): string | null {
-  const buildId = process.env.__NEXT_BUILD_ID;
-  if (typeof buildId !== 'string' || buildId.length === 0) {
+  const buildId = getRuntimeBuildId();
+  if (!buildId) {
     return null;
   }
 

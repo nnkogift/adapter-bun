@@ -38,7 +38,6 @@ const CACHE_RUNTIME_MODULES = [
   'next-compat.js',
   'cache-handler.js',
   'cache-handler-http.js',
-  'cache-handler-registration.js',
   'cache-http-client.js',
   'cache-http-protocol.js',
   'cache-http-server.js',
@@ -1103,9 +1102,7 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
         ? [...new Set([...existingAllowedOrigins, deploymentHost])]
         : existingAllowedOrigins;
 
-      // Inject the IncrementalCache handler. The module also registers the
-      // corresponding use-cache handler through Next's global cache symbol so
-      // Edge bundles do not need nextConfig.cacheHandlers imports injected.
+      // Inject the IncrementalCache handler runtime.
       const handlerModules = getRuntimeHandlerModuleNames(options);
 
       // Stage the cache handler runtime into the output dir so the path is
@@ -1137,11 +1134,6 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
             }
           : {}),
         cacheHandler: incrementalCacheHandlerPath,
-        // Enable cacheComponents when the experimental flag is set via env.
-        ...(process.env.__NEXT_CACHE_COMPONENTS === 'true' ||
-        process.env.NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS === 'true'
-          ? { cacheComponents: true }
-          : {}),
       } as typeof config;
     },
     async onBuildComplete(ctx) {
