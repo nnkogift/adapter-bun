@@ -20,7 +20,6 @@ import {
 import {
   ACTION_HEADER,
   computeCacheBustingSearchParam,
-  createOpaqueFallbackRouteParams,
   getMiddlewareRouteMatcher,
   isDynamicRoute,
   NEXT_RSC_UNION_QUERY,
@@ -50,11 +49,7 @@ type RuntimeRouteHandlerContext = {
 };
 
 type RuntimeRequestMetaValue = string | string[] | undefined;
-type RuntimeRequestMetaQuery = Record<string, RuntimeRequestMetaValue>;
 type RuntimeRequestMetaParams = Record<string, RuntimeRequestMetaValue>;
-type RuntimeFallbackParams = NonNullable<
-  ReturnType<typeof createOpaqueFallbackRouteParams>
->;
 type RuntimeRevalidateHeaders = Record<string, string | string[]>;
 type RuntimeInternalRevalidate = (config: {
   urlPath: string;
@@ -65,22 +60,8 @@ type RuntimeInternalRevalidate = (config: {
 interface RuntimeRequestMeta {
   initURL?: string;
   initProtocol?: string;
-  invokePath?: string;
-  invokeOutput?: string;
-  invokeQuery?: RuntimeRequestMetaQuery;
-  invokeStatus?: number;
-  middlewareInvoke?: boolean;
-  query?: RuntimeRequestMetaQuery;
-  params?: RuntimeRequestMetaParams;
-  rewrittenPathname?: string;
-  isRSCRequest?: true;
-  isPrefetchRSCRequest?: true;
-  segmentPrefetchRSCRequest?: string;
-  cacheBustingSearchParam?: string;
-  isNextDataReq?: true;
+  hostname?: string;
   revalidate?: RuntimeInternalRevalidate;
-  fallbackParams?: RuntimeFallbackParams;
-  renderFallbackShell?: boolean;
 }
 
 type NodeRouteHandler = (
@@ -2221,26 +2202,6 @@ function isImportableEdgeAsset(filePath: string): boolean {
   return filePath.endsWith('.js') || filePath.endsWith('.mjs');
 }
 
-function toRequestQuery(
-  searchParams: URLSearchParams
-): RuntimeRequestMetaQuery {
-  const query: RuntimeRequestMetaQuery = {};
-  for (const [key, value] of searchParams.entries()) {
-    const existing = query[key];
-    if (existing === undefined) {
-      query[key] = value;
-      continue;
-    }
-    if (Array.isArray(existing)) {
-      existing.push(value);
-      continue;
-    }
-    query[key] = [existing, value];
-  }
-
-  return query;
-}
-
 type ResolveRoutesResultLegacyShape = Partial<ResolveRoutesResult> & {
   matchedPathname?: unknown;
 };
@@ -2263,60 +2224,6 @@ function toResolveRoutesQueryFromSearchParams(
   }
 
   return Object.keys(query).length > 0 ? query : undefined;
-}
-
-function isInternalRouteParamPlaceholderValue(value: string): boolean {
-  let decodedValue = value;
-  try {
-    decodedValue = decodeURIComponent(value);
-  } catch {
-    decodedValue = value;
-  }
-  return decodedValue.startsWith('$nxtP') || decodedValue.startsWith('$nxtI');
-}
-
-function hasInternalRouteParamPlaceholderInPathname(pathname: string): boolean {
-  if (!pathname) {
-    return false;
-  }
-
-  const candidates = [pathname];
-  try {
-    candidates.push(decodeURIComponent(pathname));
-  } catch {
-    // Keep the raw pathname fallback when it cannot be decoded.
-  }
-
-  return candidates.some(
-    (candidate) =>
-      candidate.includes('$nxtP') || candidate.includes('$nxtI')
-  );
-}
-
-function hasInternalRouteParamPlaceholderInParams(
-  params: RuntimeRequestMetaParams | undefined
-): boolean {
-  if (!params) {
-    return false;
-  }
-
-  for (const value of Object.values(params)) {
-    if (typeof value === 'string') {
-      if (isInternalRouteParamPlaceholderValue(value)) {
-        return true;
-      }
-      continue;
-    }
-    if (Array.isArray(value)) {
-      for (const entry of value) {
-        if (isInternalRouteParamPlaceholderValue(entry)) {
-          return true;
-        }
-      }
-    }
-  }
-
-  return false;
 }
 
 function hasUnresolvedRouteMatchPlaceholder(
@@ -2342,44 +2249,12 @@ function selectPathnameForParamExtraction(
   pathnames: Array<string | null | undefined>
 ): string | undefined {
   for (const pathname of pathnames) {
-    if (typeof pathname !== 'string' || pathname.length === 0) {
-      continue;
-    }
-    if (!hasInternalRouteParamPlaceholderInPathname(pathname)) {
-      return pathname;
-    }
-  }
-
-  for (const pathname of pathnames) {
     if (typeof pathname === 'string' && pathname.length > 0) {
       return pathname;
     }
   }
 
   return undefined;
-}
-
-function normalizeInternalRouteParamQueryKey(key: string): string | null {
-  if (key.startsWith('nxtP') && key.length > 'nxtP'.length) {
-    return key.slice('nxtP'.length);
-  }
-  if (key.startsWith('nxtI') && key.length > 'nxtI'.length) {
-    return key.slice('nxtI'.length);
-  }
-  return null;
-}
-
-function isInternalRouteParamQueryKey(key: string): boolean {
-  return key.startsWith('nxtP') || key.startsWith('nxtI');
-}
-
-function isInternalRequestQueryKey(key: string): boolean {
-  return (
-    key === 'nextLocale' ||
-    key === '__nextLocale' ||
-    key === '__nextDefaultLocale' ||
-    isInternalRouteParamQueryKey(key)
-  );
 }
 
 function mergeResolveRoutesQuery(
@@ -2400,32 +2275,18 @@ function mergeResolveRoutesQuery(
 
 function toResolveRoutesQueryFromRouteMatches(
   routeMatches: Record<string, string> | undefined,
-  matchedPathname: string
+  _matchedPathname: string
 ): ResolveRoutesQuery | undefined {
   if (!routeMatches) {
     return undefined;
   }
 
-  const includeNormalizedInternalRouteParams = isDynamicRoute(matchedPathname);
   const query: ResolveRoutesQuery = {};
   for (const [key, value] of Object.entries(routeMatches)) {
     if (typeof value !== 'string' || value.length === 0) {
       continue;
     }
-    if (isInternalRouteParamPlaceholderValue(value)) {
-      continue;
-    }
     if (/^[0-9]+$/.test(key)) {
-      continue;
-    }
-    const normalizedKey = normalizeInternalRouteParamQueryKey(key);
-    if (normalizedKey) {
-      if (includeNormalizedInternalRouteParams) {
-        query[normalizedKey] = value;
-      }
-      continue;
-    }
-    if (isInternalRequestQueryKey(key)) {
       continue;
     }
     query[key] = value;
@@ -2473,72 +2334,6 @@ function normalizeResolveRoutesResultShape(
   };
 }
 
-function toRequestQueryFromResolveRoutesQuery(
-  query: ResolveRoutesQuery | undefined,
-  matchedPathname: string,
-  includeDynamicRouteParamsInQuery: boolean
-): RuntimeRequestMetaQuery {
-  if (!query) {
-    return {};
-  }
-
-  const includeNormalizedInternalRouteParams =
-    includeDynamicRouteParamsInQuery && isDynamicRoute(matchedPathname);
-  const appendRequestQueryValue = (
-    target: RuntimeRequestMetaQuery,
-    key: string,
-    value: string
-  ): void => {
-    const existing = target[key];
-    if (existing === undefined) {
-      target[key] = value;
-      return;
-    }
-    if (existing === value) {
-      return;
-    }
-    if (Array.isArray(existing)) {
-      if (existing.includes(value)) {
-        return;
-      }
-      existing.push(value);
-      return;
-    }
-    target[key] = [existing, value];
-  };
-
-  const requestQuery: RuntimeRequestMetaQuery = {};
-  for (const [key, value] of Object.entries(query)) {
-    const filteredValues = (Array.isArray(value) ? value : [value]).filter(
-      (entry) =>
-        typeof entry === 'string' && !isInternalRouteParamPlaceholderValue(entry)
-    );
-    if (filteredValues.length === 0) {
-      continue;
-    }
-
-    const normalizedKey = normalizeInternalRouteParamQueryKey(key);
-    if (normalizedKey) {
-      if (!includeNormalizedInternalRouteParams) {
-        continue;
-      }
-      for (const entry of filteredValues) {
-        appendRequestQueryValue(requestQuery, normalizedKey, entry);
-      }
-      continue;
-    }
-    if (isInternalRequestQueryKey(key)) {
-      continue;
-    }
-
-    for (const entry of filteredValues) {
-      appendRequestQueryValue(requestQuery, key, entry);
-    }
-  }
-
-  return requestQuery;
-}
-
 function toSearchStringFromResolveRoutesQuery(
   query: ResolveRoutesQuery | undefined
 ): string {
@@ -2559,48 +2354,6 @@ function toSearchStringFromResolveRoutesQuery(
 
   const search = searchParams.toString();
   return search.length > 0 ? `?${search}` : '';
-}
-
-function toSearchStringFromRequestMetaQuery(query: RuntimeRequestMetaQuery): string {
-  const searchParams = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) {
-    if (value === undefined) {
-      continue;
-    }
-    if (Array.isArray(value)) {
-      for (const entry of value) {
-        searchParams.append(key, entry);
-      }
-      continue;
-    }
-    searchParams.append(key, value);
-  }
-
-  const search = searchParams.toString();
-  return search.length > 0 ? `?${search}` : '';
-}
-
-function mergeRequestMetaValuesIntoSearchParams(
-  searchParams: URLSearchParams,
-  values: RuntimeRequestMetaQuery | RuntimeRequestMetaParams | undefined
-): void {
-  if (!values) {
-    return;
-  }
-
-  for (const [key, value] of Object.entries(values)) {
-    searchParams.delete(key);
-    if (value === undefined) {
-      continue;
-    }
-    if (Array.isArray(value)) {
-      for (const entry of value) {
-        searchParams.append(key, entry);
-      }
-      continue;
-    }
-    searchParams.append(key, value);
-  }
 }
 
 function isAppFunctionOutput(output: RuntimeFunctionOutput | undefined): boolean {
@@ -2626,219 +2379,21 @@ function isAppFunctionOutput(output: RuntimeFunctionOutput | undefined): boolean
   return false;
 }
 
-function interpolateDynamicMatchedPathname(
-  pathname: string,
-  params: RuntimeRequestMetaParams | undefined
-): string {
-  if (!isDynamicRoute(pathname) || !params) {
-    return pathname;
-  }
-
-  const pathnameSegments = pathname.split('/').filter((segment) => segment.length > 0);
-  const interpolatedSegments: string[] = [];
-
-  for (const segment of pathnameSegments) {
-    const optionalCatchAllMatch = /^\[\[\.\.\.([^\]]+)\]\]$/.exec(segment);
-    if (optionalCatchAllMatch) {
-      const key = optionalCatchAllMatch[1];
-      if (!key) {
-        interpolatedSegments.push(segment);
-        continue;
-      }
-      const value = params[key];
-      if (Array.isArray(value)) {
-        interpolatedSegments.push(...value);
-      } else if (typeof value === 'string' && value.length > 0) {
-        interpolatedSegments.push(value);
-      }
-      continue;
-    }
-
-    const catchAllMatch = /^\[\.\.\.([^\]]+)\]$/.exec(segment);
-    if (catchAllMatch) {
-      const key = catchAllMatch[1];
-      if (!key) {
-        interpolatedSegments.push(segment);
-        continue;
-      }
-      const value = params[key];
-      if (Array.isArray(value) && value.length > 0) {
-        interpolatedSegments.push(...value);
-        continue;
-      }
-      if (typeof value === 'string' && value.length > 0) {
-        interpolatedSegments.push(value);
-      }
-      continue;
-    }
-
-    const dynamicMatch = /^\[([^\]]+)\]$/.exec(segment);
-    if (dynamicMatch) {
-      const key = dynamicMatch[1];
-      if (!key) {
-        interpolatedSegments.push(segment);
-        continue;
-      }
-      const value = toSingleParamValue(params[key]);
-      if (typeof value === 'string' && value.length > 0) {
-        interpolatedSegments.push(value);
-      }
-      continue;
-    }
-
-    interpolatedSegments.push(segment);
-  }
-
-  return interpolatedSegments.length > 0 ? `/${interpolatedSegments.join('/')}` : '/';
-}
-
 function toRequestMeta({
   requestUrl,
-  matchedPathname,
-  requestPathname,
-  invokeOutput,
-  routeStatus,
-  query,
-  params,
   revalidate,
-  fallbackParams,
-  renderFallbackShell,
 }: {
   requestUrl: URL;
-  matchedPathname: string;
-  requestPathname: string;
-  invokeOutput: string;
-  routeStatus?: number;
-  query: RuntimeRequestMetaQuery;
-  params?: RuntimeRequestMetaParams;
   revalidate?: RuntimeInternalRevalidate;
-  fallbackParams?: RuntimeFallbackParams;
-  renderFallbackShell?: boolean;
 }): RuntimeRequestMeta {
-  const forceMatchedInvokePath =
-    process.env.ADAPTER_BUN_FORCE_MATCHED_INVOKE_PATH === '1' &&
-    isDynamicRoute(matchedPathname);
-  const useMatchedPathAsInvokePath =
-    forceMatchedInvokePath ||
-    (matchedPathname !== requestPathname &&
-      matchedPathname.includes('(.') &&
-      !isDynamicRoute(matchedPathname));
   const meta: RuntimeRequestMeta = {
     initURL: requestUrl.toString(),
     initProtocol: requestUrl.protocol.replace(/:$/, '') || 'http',
-    // Static interception routes need the internal matched pathname (for
-    // example `/(.)simple-page`) so Next renders the intercepted tree instead
-    // of fast-pathing to the non-interception route.
-    invokePath: useMatchedPathAsInvokePath ? matchedPathname : requestPathname,
-    invokeOutput,
-    invokeQuery: query,
-    middlewareInvoke: false,
-    query,
+    hostname: requestUrl.hostname,
     ...(revalidate ? { revalidate } : {}),
-    ...(fallbackParams ? { fallbackParams } : {}),
-    ...(renderFallbackShell ? { renderFallbackShell } : {}),
   };
 
-  if (typeof routeStatus === 'number') {
-    meta.invokeStatus = routeStatus;
-  }
-
-  const didRewritePathname =
-    requestPathname !== interpolateDynamicMatchedPathname(matchedPathname, params) &&
-    !pathnameEqualsWithRootAlias(
-      requestPathname,
-      interpolateDynamicMatchedPathname(matchedPathname, params)
-    );
-
-  if (didRewritePathname) {
-    meta.rewrittenPathname = matchedPathname;
-  }
-
-  if (params && Object.keys(params).length > 0) {
-    meta.params = params;
-  }
-
   return meta;
-}
-
-function applyRscRequestMeta(
-  meta: RuntimeRequestMeta,
-  headers: IncomingHttpHeaders,
-  requestUrl: URL
-): RuntimeRequestMeta {
-  const rscHeaderValue = getSingleHeaderValue(headers[RSC_HEADER]);
-  if (rscHeaderValue === '1') {
-    meta.isRSCRequest = true;
-  }
-
-  const routerPrefetchHeader = normalizeRouterPrefetchHeader(
-    getSingleHeaderValue(headers[NEXT_ROUTER_PREFETCH_HEADER])
-  );
-  if (routerPrefetchHeader === '1') {
-    meta.isPrefetchRSCRequest = true;
-  }
-
-  const segmentPrefetchHeader = getSingleHeaderValue(
-    headers[NEXT_ROUTER_SEGMENT_PREFETCH_HEADER]
-  );
-  if (typeof segmentPrefetchHeader === 'string' && segmentPrefetchHeader.length > 0) {
-    meta.segmentPrefetchRSCRequest = segmentPrefetchHeader;
-  } else if (routerPrefetchHeader === '1') {
-    // Some segment-prefetch requests (`next-router-prefetch: 1`) arrive
-    // without an explicit segment header in transit; treat those as index
-    // segment prefetches. Do not apply this fallback for full prefetches
-    // (`next-router-prefetch: 2`).
-    meta.segmentPrefetchRSCRequest = '/_index';
-  }
-
-  const cacheBustingSearchParam = requestUrl.searchParams.get(NEXT_RSC_UNION_QUERY);
-  if (typeof cacheBustingSearchParam === 'string' && cacheBustingSearchParam.length > 0) {
-    meta.cacheBustingSearchParam = cacheBustingSearchParam;
-  }
-
-  if (meta.query && NEXT_RSC_UNION_QUERY in meta.query) {
-    delete meta.query[NEXT_RSC_UNION_QUERY];
-  }
-  if (meta.invokeQuery && NEXT_RSC_UNION_QUERY in meta.invokeQuery) {
-    delete meta.invokeQuery[NEXT_RSC_UNION_QUERY];
-  }
-
-  return meta;
-}
-
-async function loadPrerenderDynamicRoutes(
-  distDir: string | undefined
-): Promise<Map<string, RuntimePrerenderManifestDynamicRoute>> {
-  const dynamicRoutes = new Map<string, RuntimePrerenderManifestDynamicRoute>();
-  if (!distDir) {
-    return dynamicRoutes;
-  }
-
-  const prerenderManifestPath = path.join(distDir, 'prerender-manifest.json');
-  const prerenderManifestFile = Bun.file(prerenderManifestPath);
-  if (!(await prerenderManifestFile.exists())) {
-    return dynamicRoutes;
-  }
-
-  try {
-    const prerenderManifestValue =
-      (await prerenderManifestFile.json()) as RuntimePrerenderManifest;
-    if (!isRecord(prerenderManifestValue.dynamicRoutes)) {
-      return dynamicRoutes;
-    }
-    for (const [pathname, routeValue] of Object.entries(
-      prerenderManifestValue.dynamicRoutes
-    )) {
-      if (!isRecord(routeValue)) {
-        continue;
-      }
-      dynamicRoutes.set(pathname, routeValue as RuntimePrerenderManifestDynamicRoute);
-    }
-  } catch {
-    return dynamicRoutes;
-  }
-
-  return dynamicRoutes;
 }
 
 function createEmptyPrerenderManifest(): RuntimePrerenderManifest {
@@ -2996,7 +2551,6 @@ const runtimeMiddlewareMatcher = await loadMiddlewareMatcher(
 const runtimeFunctionOutputs = manifest.runtime?.functions ?? [];
 const runtimeResolvedPathnameToSourcePage =
   manifest.runtime?.resolvedPathnameToSourcePage ?? {};
-const prerenderDynamicRoutes = await loadPrerenderDynamicRoutes(manifestDistDir);
 
 if (ENABLE_DEBUG_ROUTING) {
   debugRoutingLog(
@@ -3039,56 +2593,6 @@ for (const [sourcePage, outputs] of functionOutputsBySourcePage.entries()) {
 }
 const dynamicOutputMatchers = createDynamicOutputMatchers(functionOutputsBySourcePage);
 
-function getFallbackParamsForOutput(
-  output: RuntimeFunctionOutput | undefined
-): RuntimeFallbackParams | undefined {
-  if (process.env.ADAPTER_BUN_DISABLE_FALLBACK_PARAMS === '1') {
-    return undefined;
-  }
-  if (!output) {
-    return undefined;
-  }
-
-  const routePathname = output.pathname.endsWith('.rsc')
-    ? output.pathname.slice(0, -'.rsc'.length)
-    : output.pathname;
-  const prerenderDynamicRoute = prerenderDynamicRoutes.get(routePathname);
-  if (!prerenderDynamicRoute) {
-    return undefined;
-  }
-
-  if (
-    prerenderDynamicRoute.fallback === undefined ||
-    prerenderDynamicRoute.fallback === null ||
-    prerenderDynamicRoute.fallback === false
-  ) {
-    return undefined;
-  }
-
-  if (
-    !Array.isArray(prerenderDynamicRoute.fallbackRouteParams) ||
-    prerenderDynamicRoute.fallbackRouteParams.length === 0
-  ) {
-    return undefined;
-  }
-
-  if (ENABLE_DEBUG_ROUTING && routePathname.includes('/with-fallback-params/')) {
-    debugRoutingLog(
-      'fallback-params-source',
-      routePathname,
-      JSON.stringify(prerenderDynamicRoute.fallbackRouteParams)
-    );
-  }
-
-  return (
-    createOpaqueFallbackRouteParams(
-      prerenderDynamicRoute.fallbackRouteParams as Parameters<
-        typeof createOpaqueFallbackRouteParams
-      >[0]
-    ) ?? undefined
-  );
-}
-
 function toInvokeOutputPathname(output: RuntimeFunctionOutput | undefined): string {
   if (!output) {
     return '';
@@ -3113,19 +2617,6 @@ function withOptionalSuffix(pathname: string, suffix?: string): string {
     return pathname;
   }
   return `${pathname}${suffix}`;
-}
-
-function toSingleParamValue(
-  value: RuntimeRequestMetaValue
-): string | null {
-  if (typeof value === 'string') {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    const firstValue = value[0];
-    return typeof firstValue === 'string' ? firstValue : null;
-  }
-  return null;
 }
 
 function getIndexAlias(pathname: string): string | null {
@@ -4978,8 +4469,6 @@ async function runEdgeFunctionOutput(
   const run = getSandboxRun();
   const hasBody = canRequestHaveBody(method) && requestBody.byteLength > 0;
   const edgeRequestUrl = new URL(requestUrl);
-  mergeRequestMetaValuesIntoSearchParams(edgeRequestUrl.searchParams, requestMeta?.query);
-  mergeRequestMetaValuesIntoSearchParams(edgeRequestUrl.searchParams, requestMeta?.params);
   if (ENABLE_DEBUG_ROUTING && requestUrl.pathname.includes('/_next/data/')) {
     debugRoutingLog(
       'edge-next-data-invoke',
@@ -4988,15 +4477,7 @@ async function runEdgeFunctionOutput(
       'requestUrl=',
       requestUrl.toString(),
       'edgeRequestUrl=',
-      edgeRequestUrl.toString(),
-      'x-nextjs-data=',
-      String(getSingleHeaderValue(headers['x-nextjs-data']) ?? ''),
-      'isNextDataReq=',
-      String(Boolean(requestMeta?.isNextDataReq)),
-      'invokePath=',
-      String(requestMeta?.invokePath ?? ''),
-      'invokeOutput=',
-      String(requestMeta?.invokeOutput ?? '')
+      edgeRequestUrl.toString()
     );
   }
 
@@ -5022,7 +4503,6 @@ async function runEdgeFunctionOutput(
         name: output.pathname.includes('/_next/data/')
           ? output.sourcePage
           : output.pathname,
-        ...(requestMeta?.params ? { params: requestMeta.params } : {}),
       },
       ...(hasBody ? { body: createCloneableBody(requestBody) } : {}),
       signal: abortController.signal,
@@ -5248,15 +4728,7 @@ async function invokeFunctionOutput(
     ENABLE_DEBUG_ROUTING &&
     shouldDebugRequest(req.url) &&
     getSingleHeaderValue(req.headers[RSC_HEADER]) === '1';
-  const shouldRewriteFallbackPlaceholders =
-    process.env.ADAPTER_BUN_REWRITE_FALLBACK_PLACEHOLDERS === '1' &&
-    requestMeta?.renderFallbackShell === true &&
-    Boolean(requestMeta.fallbackParams) &&
-    Boolean(requestMeta.params) &&
-    getSingleHeaderValue(req.headers[RSC_HEADER]) === '1' &&
-    req.method !== 'HEAD';
   let restoreDebugRscStreamPatch: (() => void) | null = null;
-  let restoreFallbackPlaceholderPatch: (() => void) | null = null;
   if (shouldDebugRscStream) {
     const mutableRes = res as any;
     const originalWrite = res.write.bind(res) as (...args: unknown[]) => boolean;
@@ -5350,71 +4822,6 @@ async function invokeFunctionOutput(
     };
   }
 
-  if (shouldRewriteFallbackPlaceholders) {
-    const mutableRes = res as any;
-    const originalWrite = res.write.bind(res) as (...args: unknown[]) => boolean;
-    const originalEnd = res.end.bind(res) as (...args: unknown[]) => ServerResponse;
-    const payloadChunks: Buffer[] = [];
-    const pushChunk = (chunk: unknown, encoding: unknown): void => {
-      if (chunk === undefined || chunk === null) {
-        return;
-      }
-      if (Buffer.isBuffer(chunk)) {
-        payloadChunks.push(chunk);
-        return;
-      }
-      if (chunk instanceof Uint8Array) {
-        payloadChunks.push(Buffer.from(chunk));
-        return;
-      }
-      if (typeof chunk === 'string') {
-        payloadChunks.push(Buffer.from(chunk, encoding as BufferEncoding | undefined));
-      }
-    };
-
-    const replacementPairs: Array<[string, string]> = [];
-    for (const [paramKey, fallbackParamValue] of requestMeta.fallbackParams!.entries()) {
-      const placeholderValue = fallbackParamValue[0];
-      if (typeof placeholderValue !== 'string' || placeholderValue.length === 0) {
-        continue;
-      }
-      const concreteParamValue = toSingleParamValue(requestMeta.params?.[paramKey]);
-      if (typeof concreteParamValue === 'string' && concreteParamValue.length > 0) {
-        replacementPairs.push([placeholderValue, concreteParamValue]);
-      }
-    }
-
-    if (replacementPairs.length > 0) {
-      mutableRes.write = (...args: unknown[]) => {
-        const [chunk, encoding] = args;
-        pushChunk(chunk, encoding);
-        return true;
-      };
-      mutableRes.end = (...args: unknown[]) => {
-        const [chunk, encoding] = args;
-        pushChunk(chunk, encoding);
-
-        const payload = Buffer.concat(payloadChunks).toString('utf8');
-        let rewrittenPayload = payload;
-        for (const [placeholder, concreteValue] of replacementPairs) {
-          rewrittenPayload = rewrittenPayload.split(placeholder).join(concreteValue);
-        }
-
-        if (rewrittenPayload !== payload && res.hasHeader('content-length')) {
-          res.removeHeader('content-length');
-        }
-        if (rewrittenPayload.length > 0) {
-          originalWrite(rewrittenPayload, 'utf8');
-        }
-        return originalEnd();
-      };
-      restoreFallbackPlaceholderPatch = () => {
-        mutableRes.write = originalWrite;
-        mutableRes.end = originalEnd;
-      };
-    }
-  }
-
   // Keep action responses streaming-capable. Buffering res.write() breaks
   // streamed server action payloads (for example ReadableStream responses).
 
@@ -5425,9 +4832,6 @@ async function invokeFunctionOutput(
   });
   if (restoreDebugRscStreamPatch) {
     restoreDebugRscStreamPatch();
-  }
-  if (restoreFallbackPlaceholderPatch) {
-    restoreFallbackPlaceholderPatch();
   }
   if (restoreNotFoundFallbackPatch) {
     restoreNotFoundFallbackPatch();
@@ -6342,6 +5746,9 @@ const server = http.createServer(async (req, res) => {
       resolvedRoutingResult.invocationTarget?.pathname ??
       middlewareRewriteUrl?.pathname ??
       sourcePathname;
+    const invocationUrl = new URL(requestUrl);
+    invocationUrl.pathname = invocationPathname;
+    invocationUrl.search = resolvedUrl.search;
     const paramsExtractionPathname = selectPathnameForParamExtraction([
       middlewareRewriteUrl?.pathname,
       resolvedRoutingResult.invocationTarget?.pathname,
@@ -6487,25 +5894,6 @@ const server = http.createServer(async (req, res) => {
         }
       }
     }
-    if (
-      resolvedFunctionOutput?.output &&
-      hasInternalRouteParamPlaceholderInParams(resolvedFunctionOutput.params)
-    ) {
-      const resolvedOutputParams = getDynamicParamsForOutputRequestPathname(
-        resolvedFunctionOutput.output,
-        outputRequestPathname,
-        typeof rscSuffix === 'string' ? rscSuffix : undefined
-      );
-      if (
-        resolvedOutputParams &&
-        !hasInternalRouteParamPlaceholderInParams(resolvedOutputParams)
-      ) {
-        resolvedFunctionOutput = {
-          ...resolvedFunctionOutput,
-          params: resolvedOutputParams,
-        };
-      }
-    }
     if (debugRequest) {
       debugRoutingLog(
         'resolved-output',
@@ -6526,141 +5914,27 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
-    // Do not forward Next internal matched-path headers to runtime handlers.
-    delete req.headers['x-now-route-matches'];
-    delete req.headers['x-matched-path'];
-
-    const requestMetaSourceQuery =
-      resolvedRoutingResult.invocationTarget?.query ??
-      resolvedRoutingResult.resolvedQuery;
-    const hasRequestMetaSourceQuery =
-      Boolean(requestMetaSourceQuery) &&
-      Object.keys(requestMetaSourceQuery as Record<string, unknown>).length > 0;
-    const requestMetaQueryPathname =
-      toInvokeOutputPathname(resolvedFunctionOutput?.output) || matchedPathname;
-    const requestQuery = hasRequestMetaSourceQuery
-      ? toRequestQueryFromResolveRoutesQuery(
-          requestMetaSourceQuery,
-          requestMetaQueryPathname,
-          !isAppFunctionOutput(resolvedFunctionOutput?.output)
-        )
-      : toRequestQuery(requestUrl.searchParams);
-    const fallbackParams = getFallbackParamsForOutput(resolvedFunctionOutput?.output);
-    let requestMetaParams =
-      process.env.ADAPTER_BUN_DISABLE_REQUEST_META_PARAMS === '1'
-        ? undefined
-        : resolvedFunctionOutput?.params;
-    if (resolvedFunctionOutput?.output) {
-      const paramPathnameCandidates = [
-        invocationPathname,
-        outputRequestPathname,
-        requestUrl.pathname,
-        resolvedUrl.pathname,
-        runtimeRewritePathnameForParams,
-      ];
-      for (const paramPathname of paramPathnameCandidates) {
-        if (!paramPathname) {
-          continue;
-        }
-        const candidateParams = getDynamicParamsForOutputRequestPathname(
-          resolvedFunctionOutput.output,
-          paramPathname,
-          typeof rscSuffix === 'string' ? rscSuffix : undefined
-        );
-        if (!candidateParams) {
-          continue;
-        }
-        requestMetaParams = candidateParams;
-        if (!hasInternalRouteParamPlaceholderInParams(candidateParams)) {
-          break;
-        }
-      }
-    }
-    const requestMetaQuery =
-      process.env.ADAPTER_BUN_CLEAR_QUERY_ON_FALLBACK === '1' && fallbackParams
-        ? {}
-        : requestQuery;
-    resolvedUrl.search = toSearchStringFromRequestMetaQuery(requestQuery);
-    const routerStateTreeHeader = getSingleHeaderValue(
-      req.headers[NEXT_ROUTER_STATE_TREE_HEADER]
-    );
-    const shouldForceRenderFallbackShell =
-      (process.env.ADAPTER_BUN_FORCE_RENDER_FALLBACK_SHELL === '1' ||
-        (process.env.ADAPTER_BUN_FORCE_RENDER_FALLBACK_SHELL_ON_REFETCH === '1' &&
-          typeof routerStateTreeHeader === 'string' &&
-          routerStateTreeHeader.includes('refetch'))) &&
-      Boolean(fallbackParams) &&
-      isAppFunctionOutput(resolvedFunctionOutput?.output);
-    const requestMeta = applyRscRequestMeta(
-      toRequestMeta({
-        requestUrl,
-        matchedPathname,
-        requestPathname: sourcePathname,
-        invokeOutput:
-          toInvokeOutputPathname(resolvedFunctionOutput?.output) || matchedPathname,
-        routeStatus,
-        query: requestMetaQuery,
-        params: requestMetaParams,
-        revalidate: internalRevalidate,
-        fallbackParams,
-        renderFallbackShell: shouldForceRenderFallbackShell,
-      }),
-      req.headers,
-      resolvedUrl
-    );
+    const requestMeta = toRequestMeta({
+      requestUrl,
+      revalidate: internalRevalidate,
+    });
     if (debugRequest) {
       debugRoutingLog(
         'request-meta',
         req.method,
         req.url,
-        'invokePath=',
-        String(requestMeta.invokePath ?? ''),
-        'invokeOutput=',
-        String(requestMeta.invokeOutput ?? ''),
-        'rewritten=',
-        String(requestMeta.rewrittenPathname ?? ''),
-        'isPrefetch=',
-        String(Boolean(requestMeta.isPrefetchRSCRequest)),
-        'segment=',
-        String(requestMeta.segmentPrefetchRSCRequest ?? ''),
-        'query=',
-        JSON.stringify(requestMeta.query ?? {}),
-        'params=',
-        JSON.stringify(requestMeta.params ?? {}),
-        'renderFallbackShell=',
-        String(Boolean(requestMeta.renderFallbackShell)),
-        'fallbackParams=',
-        String(requestMeta.fallbackParams?.size ?? 0)
+        'initURL=',
+        String(requestMeta.initURL ?? ''),
+        'initProtocol=',
+        String(requestMeta.initProtocol ?? ''),
+        'hostname=',
+        String(requestMeta.hostname ?? '')
       );
     }
-    if (nextDataNormalizedPathname) {
-      requestMeta.isNextDataReq = true;
-      req.url = `${requestUrl.pathname}${requestUrl.search}`;
-    } else if (middlewareRewriteUrl) {
-      const matchedLocale = getLocaleFromPathname(
-        matchedPathname,
-        basePath,
-        runtimeI18n
-      );
-      const requestLocale =
-        getLocaleFromPathname(sourcePathname, basePath, runtimeI18n) ??
-        runtimeI18n?.defaultLocale;
-      // Preserve original request URLs for middleware rewrites by default, but
-      // when middleware rewrites into a different non-default locale we need to
-      // invoke with the rewritten pathname so Next can resolve locale context.
-      const shouldUseRewrittenMiddlewareUrl =
-        Boolean(runtimeI18n) &&
-        typeof matchedLocale === 'string' &&
-        typeof requestLocale === 'string' &&
-        matchedLocale !== requestLocale &&
-        matchedLocale !== runtimeI18n?.defaultLocale;
-      req.url = shouldUseRewrittenMiddlewareUrl
-        ? `${resolvedUrl.pathname}${resolvedUrl.search}`
-        : `${requestUrl.pathname}${resolvedUrl.search}`;
-    } else if (process.env.ADAPTER_BUN_USE_ORIGINAL_REQ_URL === '1') {
+    if (process.env.ADAPTER_BUN_USE_ORIGINAL_REQ_URL === '1') {
       req.url = `${requestUrl.pathname}${requestUrl.search}`;
     } else {
-      req.url = `${resolvedUrl.pathname}${resolvedUrl.search}`;
+      req.url = `${invocationUrl.pathname}${invocationUrl.search}`;
     }
 
     if (resolvedFunctionOutput) {
@@ -6712,7 +5986,9 @@ const server = http.createServer(async (req, res) => {
         req,
         res,
         resolvedFunctionOutput.output,
-        nextDataNormalizedPathname ? requestUrl : resolvedUrl,
+        process.env.ADAPTER_BUN_USE_ORIGINAL_REQ_URL === '1'
+          ? requestUrl
+          : invocationUrl,
         requestBody,
         requestMeta
       );
