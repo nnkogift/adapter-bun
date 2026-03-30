@@ -130,11 +130,18 @@ jobs:
           NEXT_TELEMETRY_DISABLED: 1
         run: node run-tests.js --timings -g ${{ matrix.group }} -c 2 --type e2e
 
+      - name: Derive adapter artifact suffix
+        if: ${{ always() && github.ref == 'refs/heads/main' && (inputs.nextjsRef || 'canary') == 'canary' }}
+        id: artifact_suffix
+        run: echo "value=${GROUP//\//-}" >> "$GITHUB_OUTPUT"
+        env:
+          GROUP: ${{ matrix.group }}
+
       - name: Upload adapter test result artifacts
         if: ${{ always() && github.ref == 'refs/heads/main' && (inputs.nextjsRef || 'canary') == 'canary' }}
         uses: actions/upload-artifact@v4
         with:
-          name: adapter-test-reports-${{ replace(matrix.group, '/', '-') }}
+          name: adapter-test-reports-${{ steps.artifact_suffix.outputs.value }}
           path: next.js/test/**/*.results.json
           if-no-files-found: ignore
           retention-days: 1
