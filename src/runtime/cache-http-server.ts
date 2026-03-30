@@ -12,14 +12,6 @@ export interface CacheHttpServerOptions {
   authToken?: string;
 }
 
-const ENABLE_DEBUG_CACHE = process.env.ADAPTER_BUN_DEBUG_CACHE === '1';
-
-function debugCacheLog(...args: unknown[]): void {
-  if (ENABLE_DEBUG_CACHE) {
-    console.log('[adapter-bun][cache]', ...args);
-  }
-}
-
 function setJsonResponse(
   res: ServerResponse,
   statusCode: number,
@@ -111,7 +103,6 @@ export async function handleCacheHttpRequest(
   try {
     switch (request.op) {
       case 'getEntry': {
-        debugCacheLog('getEntry', request.cacheKey);
         const entry = await store.get(request.cacheKey);
         setJsonResponse(res, 200, {
           ok: true,
@@ -121,12 +112,6 @@ export async function handleCacheHttpRequest(
       }
 
       case 'setEntry': {
-        debugCacheLog(
-          'setEntry',
-          request.cacheKey,
-          'pathname=',
-          request.entry.pathname
-        );
         await store.set(request.cacheKey, deserializePrerenderCacheEntry(request.entry));
         setJsonResponse(res, 200, {
           ok: true,
@@ -135,7 +120,6 @@ export async function handleCacheHttpRequest(
       }
 
       case 'findByPrefix': {
-        debugCacheLog('findByPrefix', request.cacheKeyPrefix);
         const entries = store.findByPrefix
           ? await store.findByPrefix(request.cacheKeyPrefix)
           : [];
@@ -147,7 +131,6 @@ export async function handleCacheHttpRequest(
       }
 
       case 'getTagManifestEntries': {
-        debugCacheLog('getTagManifestEntries', request.tags.join(','));
         const manifest = store.getTagManifestEntries
           ? await store.getTagManifestEntries(request.tags)
           : {};
@@ -159,7 +142,6 @@ export async function handleCacheHttpRequest(
       }
 
       case 'updateTagManifest': {
-        debugCacheLog('updateTagManifest', request.tags.join(','), request.update.mode);
         if (store.updateTagManifest) {
           await store.updateTagManifest(request.tags, request.update);
         }

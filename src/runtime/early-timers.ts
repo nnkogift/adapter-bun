@@ -8,27 +8,16 @@ type PatchedSetImmediate = ((...immediateArgs: unknown[]) => unknown) & {
   __adapterBunPatched?: boolean;
 };
 
-const ENABLE_DEBUG_TIMERS = process.env.ADAPTER_BUN_DEBUG_TIMERS === '1';
-
 function patchSetTimeoutForBunEarly(): void {
   if (process.env.ADAPTER_BUN_DISABLE_EARLY_TIMERS === '1') {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] early setTimeout patch disabled');
-    }
     return;
   }
   if (typeof process.versions?.bun !== 'string') {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] early setTimeout patch skipped: not bun');
-    }
     return;
   }
 
   const currentSetTimeout = globalThis.setTimeout as PatchedSetTimeout;
   if (currentSetTimeout.__adapterBunEarlyPatched) {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] early setTimeout patch skipped: already patched');
-    }
     return;
   }
 
@@ -71,9 +60,6 @@ function patchSetTimeoutForBunEarly(): void {
 
   patchedSetTimeout.__adapterBunEarlyPatched = true;
   globalThis.setTimeout = patchedSetTimeout;
-  if (ENABLE_DEBUG_TIMERS) {
-    console.log('[adapter-bun][timers] early setTimeout patch applied');
-  }
 
   try {
     const require = createRequire(import.meta.url);
@@ -104,9 +90,6 @@ function patchSetImmediateForBunEarly(): void {
 
   const currentSetImmediate = globalThis.setImmediate as PatchedSetImmediate;
   if (currentSetImmediate.__adapterBunPatched) {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] early setImmediate patch skipped: already patched');
-    }
     return;
   }
 
@@ -131,9 +114,6 @@ function patchSetImmediateForBunEarly(): void {
 
   globalThis.setImmediate = patchedSetImmediate as unknown as typeof setImmediate;
   globalThis.clearImmediate = patchedClearImmediate;
-  if (ENABLE_DEBUG_TIMERS) {
-    console.log('[adapter-bun][timers] early setImmediate patch applied');
-  }
 
   try {
     const require = createRequire(import.meta.url);

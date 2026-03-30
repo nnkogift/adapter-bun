@@ -18,15 +18,6 @@ const inMemoryBodyChunks = new Map<
   }
 >();
 const MAX_IN_MEMORY_CHUNK_ENTRIES = 512;
-const ENABLE_DEBUG_CACHE =
-  process.env.NEXT_PRIVATE_DEBUG_CACHE === '1' ||
-  process.env.ADAPTER_BUN_DEBUG_CACHE === '1';
-
-function debugCacheLog(...args: unknown[]): void {
-  if (ENABLE_DEBUG_CACHE) {
-    console.log('[adapter-bun][cache-handler-http]', ...args);
-  }
-}
 
 function readStoredTags(headers: Record<string, string>): string[] {
   const raw = headers[CACHE_TAGS_HEADER];
@@ -85,31 +76,14 @@ class FetchCacheHandler implements NextUseCacheHandler {
 
     const row = await store.get(cacheKey);
     if (!row) {
-      debugCacheLog('get miss', cacheKey);
       return undefined;
     }
 
     const now = Date.now();
     if (row.expiresAt !== null && row.expiresAt <= now) {
-      debugCacheLog(
-        'get miss expired',
-        cacheKey,
-        'expiresAt=',
-        row.expiresAt,
-        'now=',
-        now
-      );
       return undefined;
     }
     if (row.revalidateAt !== null && row.revalidateAt <= now) {
-      debugCacheLog(
-        'get miss stale',
-        cacheKey,
-        'revalidateAt=',
-        row.revalidateAt,
-        'now=',
-        now
-      );
       return undefined;
     }
 
@@ -122,18 +96,6 @@ class FetchCacheHandler implements NextUseCacheHandler {
         ? Math.max(0, Math.floor((row.expiresAt - row.createdAt) / 1000))
         : revalidateSec * 2;
     const tags = readStoredTags(row.headers);
-    debugCacheLog(
-      'get hit',
-      cacheKey,
-      'createdAt=',
-      row.createdAt,
-      'revalidateAt=',
-      row.revalidateAt,
-      'expiresAt=',
-      row.expiresAt,
-      'tags=',
-      tags.join(',')
-    );
 
     if (tags.length > 0) {
       const tagEntries = await store.getTagManifestEntries?.(tags);
@@ -148,18 +110,6 @@ class FetchCacheHandler implements NextUseCacheHandler {
             tagEntry.expiredAt <= now &&
             tagEntry.expiredAt > row.createdAt
           ) {
-            debugCacheLog(
-              'get miss expired tag',
-              cacheKey,
-              'tag=',
-              tag,
-              'expiredAt=',
-              tagEntry.expiredAt,
-              'now=',
-              now,
-              'createdAt=',
-              row.createdAt
-            );
             return undefined;
           }
 
@@ -168,16 +118,6 @@ class FetchCacheHandler implements NextUseCacheHandler {
             tagEntry.staleAt > row.createdAt
           ) {
             revalidateSec = -1;
-            debugCacheLog(
-              'get stale tag',
-              cacheKey,
-              'tag=',
-              tag,
-              'staleAt=',
-              tagEntry.staleAt,
-              'createdAt=',
-              row.createdAt
-            );
           }
         }
       }
@@ -189,16 +129,6 @@ class FetchCacheHandler implements NextUseCacheHandler {
       cachedBody && cachedBody.createdAt === row.createdAt && cachedBody.chunks.length > 0
         ? toReadableStreamFromChunks(cachedBody.chunks)
         : toReadableStreamFromChunks([decodeStoredBodyBytes(row)]);
-    debugCacheLog(
-      'get return',
-      cacheKey,
-      'revalidate=',
-      revalidateSec,
-      'stale=',
-      staleSec,
-      'expire=',
-      expireSec
-    );
 
     return {
       value: stream,
@@ -276,24 +206,7 @@ class FetchCacheHandler implements NextUseCacheHandler {
         expiresAt:
           entry.expire > 0 ? createdAt + entry.expire * 1000 : null,
       });
-      debugCacheLog(
-        'set ok',
-        cacheKey,
-        'timestamp=',
-        createdAt,
-        'stale=',
-        entry.stale,
-        'revalidate=',
-        entry.revalidate,
-        'expire=',
-        entry.expire,
-        'tags=',
-        entry.tags.join(',')
-      );
-    } catch (error) {
-      if (ENABLE_DEBUG_CACHE) {
-        console.error('[adapter-bun][cache-handler-http] set failed', cacheKey, error);
-      }
+    } catch {
       return;
     } finally {
       resolvePending();

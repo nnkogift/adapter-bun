@@ -902,64 +902,9 @@ function normalizeRepeatedSlashes(url: string): string {
   const urlParts = url.split('?');
   const urlNoQuery = urlParts[0] ?? '';
   return (
-    urlNoQuery.replace(/\\/g, '/').replace(/\/\/+/g, '/') +
-    (urlParts[1] ? `?${urlParts.slice(1).join('?')}` : '')
+      urlNoQuery.replace(/\\/g, '/').replace(/\/\/+/g, '/') +
+      (urlParts[1] ? `?${urlParts.slice(1).join('?')}` : '')
   );
-}
-
-const ENABLE_DEBUG_ROUTING = process.env.ADAPTER_BUN_DEBUG_ROUTING === '1';
-const ENABLE_DEBUG_CONNECTIONS = process.env.ADAPTER_BUN_DEBUG_CONNECTIONS === '1';
-const ENABLE_DEBUG_TIMERS = process.env.ADAPTER_BUN_DEBUG_TIMERS === '1';
-let nextDebugSocketId = 1;
-const debugSocketIds = new WeakMap<IncomingMessage['socket'], number>();
-
-function getDebugSocketId(socket: IncomingMessage['socket'] | undefined): number {
-  if (!socket) {
-    return 0;
-  }
-  const existing = debugSocketIds.get(socket);
-  if (existing) {
-    return existing;
-  }
-  const id = nextDebugSocketId;
-  nextDebugSocketId += 1;
-  debugSocketIds.set(socket, id);
-  return id;
-}
-
-function shouldDebugRequest(url: string | undefined): boolean {
-  if (!ENABLE_DEBUG_ROUTING || !url) {
-    return false;
-  }
-
-  if (process.env.ADAPTER_BUN_DEBUG_ROUTING_ALL === '1') {
-    return true;
-  }
-
-  return (
-    url.includes('/blog/') ||
-    url.includes('/blog-post-') ||
-    url.includes('_rsc=') ||
-    url.includes('/_next/data/')
-  );
-}
-
-function debugRoutingLog(...args: unknown[]): void {
-  if (ENABLE_DEBUG_ROUTING) {
-    console.log('[adapter-bun][debug]', ...args);
-  }
-}
-
-function debugHeadersToJson(headers: Headers | undefined): string {
-  if (!headers) {
-    return '{}';
-  }
-
-  const entries: Record<string, string> = {};
-  headers.forEach((value, key) => {
-    entries[key] = value;
-  });
-  return JSON.stringify(entries);
 }
 
 function normalizeRouterPrefetchHeader(
@@ -2599,13 +2544,6 @@ const runtimeFunctionOutputs = manifest.runtime?.functions ?? [];
 const runtimeResolvedPathnameToSourcePage =
   manifest.runtime?.resolvedPathnameToSourcePage ?? {};
 
-if (ENABLE_DEBUG_ROUTING) {
-  debugRoutingLog(
-    'function-outputs',
-    JSON.stringify(runtimeFunctionOutputs.map((output) => output.pathname))
-  );
-}
-
 const functionOutputByPathname = new Map<string, RuntimeFunctionOutput>();
 const functionOutputsBySourcePage = new Map<string, RuntimeFunctionOutput[]>();
 for (const output of runtimeFunctionOutputs) {
@@ -3576,15 +3514,9 @@ let runtimeServeStaticModule: RuntimeServeStaticModule | null = null;
 
 function patchNextAtomicTimerGroupForBun(): void {
   if (process.env.ADAPTER_BUN_DISABLE_ATOMIC_TIMER_PATCH === '1') {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] skip createAtomicTimerGroup patch: disabled');
-    }
     return;
   }
   if (typeof process.versions?.bun !== 'string') {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] skip createAtomicTimerGroup patch: not bun');
-    }
     return;
   }
 
@@ -3598,11 +3530,6 @@ function patchNextAtomicTimerGroupForBun(): void {
     };
     const currentFactory = schedulingModule.createAtomicTimerGroup;
     if (typeof currentFactory !== 'function' || currentFactory.__adapterBunPatched) {
-      if (ENABLE_DEBUG_TIMERS) {
-        console.log(
-          '[adapter-bun][timers] skip createAtomicTimerGroup patch: missing or already patched'
-        );
-      }
       return;
     }
 
@@ -3627,16 +3554,7 @@ function patchNextAtomicTimerGroupForBun(): void {
 
     patchedFactory.__adapterBunPatched = true;
     schedulingModule.createAtomicTimerGroup = patchedFactory;
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] patched createAtomicTimerGroup export');
-    }
-  } catch (error) {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log(
-        '[adapter-bun][timers] failed createAtomicTimerGroup patch',
-        error instanceof Error ? error.message : String(error)
-      );
-    }
+  } catch {
     // Ignore and continue with Next's default scheduling behavior.
   }
 }
@@ -3645,15 +3563,9 @@ patchNextAtomicTimerGroupForBun();
 
 function patchSetTimeoutForBunAtomicGroups(): void {
   if (process.env.ADAPTER_BUN_DISABLE_ATOMIC_TIMER_PATCH === '1') {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] skip setTimeout atomic patch: disabled');
-    }
     return;
   }
   if (typeof process.versions?.bun !== 'string') {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] skip setTimeout atomic patch: not bun');
-    }
     return;
   }
 
@@ -3661,9 +3573,6 @@ function patchSetTimeoutForBunAtomicGroups(): void {
     __adapterBunPatched?: boolean;
   };
   if (currentSetTimeout.__adapterBunPatched) {
-    if (ENABLE_DEBUG_TIMERS) {
-      console.log('[adapter-bun][timers] skip setTimeout atomic patch: already patched');
-    }
     return;
   }
 
@@ -3720,8 +3629,6 @@ function patchSetTimeoutForBunAtomicGroups(): void {
         callbacks: Array<() => void>;
       }
     | null = null;
-  let debugLoggedAtomicIntercept = false;
-  let debugLoggedShortTimeouts = 0;
   const batchAllShortTimeouts = process.env.ADAPTER_BUN_BATCH_ALL_SHORT_TIMEOUTS === '1';
 
   const wrappedSetTimeout = ((
@@ -3732,26 +3639,7 @@ function patchSetTimeoutForBunAtomicGroups(): void {
     const delayMs = typeof timeout === 'number' ? timeout : Number(timeout ?? 0);
     if (typeof handler === 'function' && Number.isFinite(delayMs) && delayMs <= 1) {
       const stack = new Error().stack ?? '';
-      if (ENABLE_DEBUG_TIMERS && debugLoggedShortTimeouts < 8) {
-        debugLoggedShortTimeouts += 1;
-        const firstStackLine = stack.split('\n')[1]?.trim() ?? '';
-        console.log(
-          '[adapter-bun][timers] short setTimeout',
-          'handler=',
-          handler.name || '<anonymous>',
-          'stack=',
-          firstStackLine
-        );
-      }
       if (batchAllShortTimeouts || isAtomicTimerGroupHandler(handler, stack)) {
-        if (ENABLE_DEBUG_TIMERS && !debugLoggedAtomicIntercept) {
-          debugLoggedAtomicIntercept = true;
-          console.log(
-            '[adapter-bun][timers] intercepted atomic setTimeout',
-            'handler=',
-            handler.name || '<anonymous>'
-          );
-        }
         if (!pendingAtomicBatch) {
           const callbacks: Array<() => void> = [() => handler(...args)];
           const timer = originalSetTimeout(() => {
@@ -3793,9 +3681,6 @@ function patchSetTimeoutForBunAtomicGroups(): void {
     }
   } catch {
     // Best effort.
-  }
-  if (ENABLE_DEBUG_TIMERS) {
-    console.log('[adapter-bun][timers] patched global setTimeout for atomic groups');
   }
 }
 
@@ -4296,14 +4181,8 @@ function getIncrementalCacheHandlerConstructor():
     if (resolvedConstructor) {
       incrementalCacheHandlerConstructor = resolvedConstructor;
     }
-  } catch (error) {
-    if (ENABLE_DEBUG_ROUTING) {
-      debugRoutingLog(
-        'incremental-cache-handler-load-failed',
-        resolvedCacheHandlerPath,
-        error instanceof Error ? error.message : String(error)
-      );
-    }
+  } catch {
+    // Ignore load failures and let Next.js fall back to the default handler.
   }
 
   return incrementalCacheHandlerConstructor ?? undefined;
@@ -4340,13 +4219,7 @@ function createEdgeIncrementalCache(
       incrementalCache.resetRequestCache();
     }
     return incrementalCache;
-  } catch (error) {
-    if (ENABLE_DEBUG_ROUTING) {
-      debugRoutingLog(
-        'incremental-cache-create-failed',
-        error instanceof Error ? error.message : String(error)
-      );
-    }
+  } catch {
     return undefined;
   }
 }
@@ -4477,17 +4350,6 @@ async function runEdgeFunctionOutput(
   const run = getSandboxRun();
   const hasBody = canRequestHaveBody(method) && requestBody.byteLength > 0;
   const edgeRequestUrl = new URL(requestUrl);
-  if (ENABLE_DEBUG_ROUTING && requestUrl.pathname.includes('/_next/data/')) {
-    debugRoutingLog(
-      'edge-next-data-invoke',
-      'output=',
-      output.pathname,
-      'requestUrl=',
-      requestUrl.toString(),
-      'edgeRequestUrl=',
-      edgeRequestUrl.toString()
-    );
-  }
 
   const abortController = new AbortController();
   const incrementalCache = createEdgeIncrementalCache(headers);
@@ -4664,56 +4526,6 @@ async function invokeFunctionOutput(
     return;
   }
 
-  if (
-    process.env.ADAPTER_BUN_DEBUG_ACTION_PAYLOAD === '1' &&
-    ENABLE_DEBUG_ROUTING &&
-    shouldDebugRequest(req.url) &&
-    isPossibleServerActionRequest(req)
-  ) {
-    const actionResponseChunks: Buffer[] = [];
-    const mutableRes = res as any;
-    const originalWrite = res.write.bind(res) as (...args: unknown[]) => boolean;
-    const originalEnd = res.end.bind(res) as (...args: unknown[]) => ServerResponse;
-    const pushChunk = (chunk: unknown, encoding: unknown): void => {
-      if (chunk === undefined || chunk === null) {
-        return;
-      }
-      if (Buffer.isBuffer(chunk)) {
-        actionResponseChunks.push(chunk);
-        return;
-      }
-      if (chunk instanceof Uint8Array) {
-        actionResponseChunks.push(Buffer.from(chunk));
-        return;
-      }
-      if (typeof chunk === 'string') {
-        actionResponseChunks.push(Buffer.from(chunk, encoding as BufferEncoding | undefined));
-      }
-    };
-
-    mutableRes.write = (...args: unknown[]) => {
-      const [chunk, encoding] = args;
-      pushChunk(chunk, encoding);
-      return originalWrite(...args);
-    };
-    mutableRes.end = (...args: unknown[]) => {
-      const [chunk, encoding] = args;
-      pushChunk(chunk, encoding);
-      const result = originalEnd(...args);
-      const payload = Buffer.concat(actionResponseChunks).toString('utf8');
-      debugRoutingLog(
-        'action-payload',
-        req.url,
-        `len=${payload.length}`,
-        'head=',
-        payload.slice(0, 2_000),
-        'tail=',
-        payload.slice(-2_000)
-      );
-      return result;
-    };
-  }
-
   const nodeHandler = await loadNodeHandler(output);
   const waitUntil = createWaitUntilCollector();
   const isAppOutput = isAppFunctionOutput(output);
@@ -4731,62 +4543,6 @@ async function invokeFunctionOutput(
   let suppressedNotFoundResponse = false;
   let restoreNotFoundFallbackPatch: (() => void) | null = null;
   const isActionRequest = isPossibleServerActionRequest(req);
-  const shouldDebugRscStream =
-    process.env.ADAPTER_BUN_DEBUG_RSC_STREAM === '1' &&
-    ENABLE_DEBUG_ROUTING &&
-    shouldDebugRequest(req.url) &&
-    getSingleHeaderValue(req.headers[RSC_HEADER]) === '1';
-  let restoreDebugRscStreamPatch: (() => void) | null = null;
-  if (shouldDebugRscStream) {
-    const mutableRes = res as any;
-    const originalWrite = res.write.bind(res) as (...args: unknown[]) => boolean;
-    const originalEnd = res.end.bind(res) as (...args: unknown[]) => ServerResponse;
-    const payloadChunks: Buffer[] = [];
-    const pushChunk = (chunk: unknown, encoding: unknown): void => {
-      if (chunk === undefined || chunk === null) {
-        return;
-      }
-      if (Buffer.isBuffer(chunk)) {
-        payloadChunks.push(chunk);
-        return;
-      }
-      if (chunk instanceof Uint8Array) {
-        payloadChunks.push(Buffer.from(chunk));
-        return;
-      }
-      if (typeof chunk === 'string') {
-        payloadChunks.push(Buffer.from(chunk, encoding as BufferEncoding | undefined));
-      }
-    };
-
-    mutableRes.write = (...args: unknown[]) => {
-      const [chunk, encoding] = args;
-      pushChunk(chunk, encoding);
-      return originalWrite(...args);
-    };
-    mutableRes.end = (...args: unknown[]) => {
-      const [chunk, encoding] = args;
-      pushChunk(chunk, encoding);
-      const result = originalEnd(...args);
-      const payload = Buffer.concat(payloadChunks).toString('utf8');
-      debugRoutingLog(
-        'rsc-payload',
-        req.method,
-        req.url,
-        'len=',
-        String(payload.length),
-        'head=',
-        payload.slice(0, 2_000),
-        'tail=',
-        payload.slice(-2_000)
-      );
-      return result;
-    };
-    restoreDebugRscStreamPatch = () => {
-      mutableRes.write = originalWrite;
-      mutableRes.end = originalEnd;
-    };
-  }
 
   if (shouldFallbackToErrorPage) {
     const mutableRes = res as any;
@@ -4838,9 +4594,6 @@ async function invokeFunctionOutput(
     waitUntil: waitUntil.waitUntil,
     ...(requestMeta ? { requestMeta } : {}),
   });
-  if (restoreDebugRscStreamPatch) {
-    restoreDebugRscStreamPatch();
-  }
   if (restoreNotFoundFallbackPatch) {
     restoreNotFoundFallbackPatch();
   }
@@ -4948,48 +4701,6 @@ async function proxyExternalRewrite(
 }
 
 const server = http.createServer(async (req, res) => {
-  if (ENABLE_DEBUG_CONNECTIONS) {
-    const socketId = getDebugSocketId(req.socket);
-    debugRoutingLog(
-      'socket-request',
-      `#${socketId}`,
-      req.method,
-      req.url,
-      'destroyed=',
-      String(req.socket.destroyed),
-      'writableEnded=',
-      String(res.writableEnded)
-    );
-    res.once('finish', () => {
-      debugRoutingLog(
-        'socket-finish',
-        `#${socketId}`,
-        req.method,
-        req.url,
-        res.statusCode,
-        'shouldKeepAlive=',
-        String(res.shouldKeepAlive),
-        'headersSent=',
-        String(res.headersSent),
-        'socketDestroyed=',
-        String(req.socket.destroyed)
-      );
-    });
-    res.once('close', () => {
-      debugRoutingLog(
-        'socket-response-close',
-        `#${socketId}`,
-        req.method,
-        req.url,
-        res.statusCode,
-        'writableEnded=',
-        String(res.writableEnded),
-        'socketDestroyed=',
-        String(req.socket.destroyed)
-      );
-    });
-  }
-
   const requestUrlNoQuery = (req.url || '').split('?', 1)[0] ?? '';
   if (requestUrlNoQuery.match(/(\\|\/\/)/)) {
     const normalizedUrl = normalizeRepeatedSlashes(req.url || '/');
@@ -4998,39 +4709,6 @@ const server = http.createServer(async (req, res) => {
     markConnectionClose(res);
     res.end(normalizedUrl);
     return;
-  }
-
-  const debugRequest = shouldDebugRequest(req.url);
-  if (debugRequest) {
-    res.once('finish', () => {
-      if (isPossibleServerActionRequest(req)) {
-        debugRoutingLog(
-          'action-response-headers',
-          req.method,
-          req.url,
-          JSON.stringify(res.getHeaders())
-        );
-      }
-      debugRoutingLog(
-        'response',
-        req.method,
-        req.url,
-        res.statusCode,
-        String(res.getHeader('content-type') ?? ''),
-        String(res.getHeader('x-nextjs-cache') ?? ''),
-        String(res.getHeader('x-nextjs-matched-path') ?? ''),
-        'action-revalidated=',
-        String(res.getHeader('x-action-revalidated') ?? ''),
-        'stale-time=',
-        String(res.getHeader('x-nextjs-stale-time') ?? ''),
-        'postponed=',
-        String(res.getHeader('x-nextjs-postponed') ?? ''),
-        'cache-control=',
-        String(res.getHeader('cache-control') ?? ''),
-        'connection=',
-        String(res.getHeader('connection') ?? '')
-      );
-    });
   }
 
   // Normalize Bun's incoming headers into a plain mutable object so Next can
@@ -5086,25 +4764,6 @@ const server = http.createServer(async (req, res) => {
         'next-router-prefetch',
         'next-router-segment-prefetch',
       ])
-    );
-  }
-  if (debugRequest) {
-    debugRoutingLog(
-      'request',
-      req.method,
-      req.url,
-      'rsc=',
-      String(getSingleHeaderValue(req.headers.rsc) ?? ''),
-      'accept=',
-      String(getSingleHeaderValue(req.headers.accept) ?? ''),
-      'prefetch=',
-      String(getSingleHeaderValue(req.headers['next-router-prefetch']) ?? ''),
-      'segment-prefetch=',
-      String(getSingleHeaderValue(req.headers['next-router-segment-prefetch']) ?? ''),
-      'state-tree=',
-      String(getSingleHeaderValue(req.headers['next-router-state-tree']) ?? ''),
-      'next-url=',
-      String(getSingleHeaderValue(req.headers['next-url']) ?? '')
     );
   }
   let allowRscContentTypeRewrite = false;
@@ -5176,15 +4835,6 @@ const server = http.createServer(async (req, res) => {
     if (isRscRequest) {
       const canonicalRscUrl = getCanonicalRscUrl(requestUrl, req.headers);
       if (canonicalRscUrl) {
-        if (debugRequest) {
-          debugRoutingLog(
-            'rsc-redirect',
-            req.method,
-            req.url,
-            'location=',
-            `${canonicalRscUrl.pathname}${canonicalRscUrl.search}`
-          );
-        }
         res.statusCode = 307;
         res.setHeader('location', `${canonicalRscUrl.pathname}${canonicalRscUrl.search}`);
         res.setHeader('content-length', '0');
@@ -5431,38 +5081,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    if (debugRequest) {
-      debugRoutingLog(
-        'resolved-routes',
-        req.method,
-        req.url,
-        'matched=',
-        resolvedRoutingResult.resolvedPathname ?? '',
-        'status=',
-        typeof resolvedRoutingResult.status === 'number'
-          ? String(resolvedRoutingResult.status)
-          : '',
-        'route-matches=',
-        JSON.stringify(resolvedRoutingResult.routeMatches ?? {})
-      );
-    }
-
     replaceRequestHeaders(req, resolvedRequestHeaders);
-    if (debugRequest) {
-      debugRoutingLog(
-        'post-route-headers',
-        req.method,
-        req.url,
-        'rsc=',
-        String(getSingleHeaderValue(req.headers.rsc) ?? ''),
-        'accept=',
-        String(getSingleHeaderValue(req.headers.accept) ?? ''),
-        'prefetch=',
-        String(getSingleHeaderValue(req.headers['next-router-prefetch']) ?? ''),
-        'state-tree=',
-        String(getSingleHeaderValue(req.headers['next-router-state-tree']) ?? '')
-      );
-    }
 
     const routeHeaders = resolvedRoutingResult.resolvedHeaders;
     let routeStatus = resolvedRoutingResult.status;
@@ -5499,15 +5118,6 @@ const server = http.createServer(async (req, res) => {
       if (!res.headersSent) {
         res.setHeader('connection', 'close');
       }
-    }
-
-    if (debugRequest) {
-      debugRoutingLog(
-        'route-headers',
-        req.method,
-        req.url,
-        debugHeadersToJson(routeHeaders)
-      );
     }
 
     if (resolvedRoutingResult.redirect) {
@@ -5912,44 +5522,12 @@ const server = http.createServer(async (req, res) => {
         }
       }
     }
-    if (debugRequest) {
-      debugRoutingLog(
-        'resolved-output',
-        req.method,
-        req.url,
-        'matched=',
-        matchedPathname,
-        'pathname=',
-        resolvedUrl.pathname,
-        'rscSuffix=',
-        typeof rscSuffix === 'string' ? rscSuffix : '',
-        'isRsc=',
-        String(isRscRequest),
-        'output=',
-        resolvedFunctionOutput?.output.pathname ?? '',
-        'runtime=',
-        resolvedFunctionOutput?.output.runtime ?? ''
-      );
-    }
 
     const requestMeta = toRequestMeta({
       requestUrl,
       requestHeaders: req.headers,
       revalidate: internalRevalidate,
     });
-    if (debugRequest) {
-      debugRoutingLog(
-        'request-meta',
-        req.method,
-        req.url,
-        'initURL=',
-        String(requestMeta.initURL ?? ''),
-        'initProtocol=',
-        String(requestMeta.initProtocol ?? ''),
-        'hostname=',
-        String(requestMeta.hostname ?? '')
-      );
-    }
 
     if (resolvedFunctionOutput) {
       const isApiOutput = isApiRoutePathname(resolvedFunctionOutput.output.pathname);
@@ -6156,31 +5734,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 });
-
-if (ENABLE_DEBUG_CONNECTIONS) {
-  server.on('connection', (socket) => {
-    const socketId = getDebugSocketId(socket);
-    debugRoutingLog(
-      'socket-open',
-      `#${socketId}`,
-      `${socket.remoteAddress ?? ''}:${socket.remotePort ?? ''}`
-    );
-    socket.on('end', () => {
-      debugRoutingLog('socket-end', `#${socketId}`);
-    });
-    socket.on('close', (hadError) => {
-      debugRoutingLog('socket-close', `#${socketId}`, 'hadError=', String(hadError));
-    });
-    socket.on('error', (error) => {
-      debugRoutingLog(
-        'socket-error',
-        `#${socketId}`,
-        error?.name ?? 'Error',
-        error?.message ?? String(error)
-      );
-    });
-  });
-}
 
 // The deploy test runner uses a shared keep-alive node-fetch agent.
 // Node's default keepAliveTimeout (5s) is too short and can reset pooled
