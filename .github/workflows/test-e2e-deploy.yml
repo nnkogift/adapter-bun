@@ -13,7 +13,7 @@ on:
 jobs:
   build:
     name: Build Next.js + adapter
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-core
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -59,7 +59,7 @@ jobs:
   test:
     name: Tests (${{ matrix.group }})
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-core
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -128,4 +128,4 @@ jobs:
           IS_TURBOPACK_TEST: 1
           NEXT_TEST_JOB: 1
           NEXT_TELEMETRY_DISABLED: 1
-        run: node run-tests.js --timings -g ${{ matrix.group }} -c 1 --type e2e
+        run: node run-tests.js --timings -g ${{ matrix.group }} -c 2 --type e2e
