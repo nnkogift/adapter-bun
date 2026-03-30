@@ -435,10 +435,7 @@ async function buildSeededAppPageCacheValue({
     if (!segmentSourcePath) {
       continue;
     }
-    segmentData.set(
-      segmentPath,
-      Buffer.from(await Bun.file(segmentSourcePath).bytes())
-    );
+    segmentData.set(segmentPath, Buffer.from(await Bun.file(segmentSourcePath).bytes()));
   }
 
   const appPageValue: IncrementalCacheValue = {

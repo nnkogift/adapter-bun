@@ -62,6 +62,9 @@ interface RuntimeRequestMeta {
   initProtocol?: string;
   hostname?: string;
   revalidate?: RuntimeInternalRevalidate;
+  isRSCRequest?: true;
+  isPrefetchRSCRequest?: true;
+  segmentPrefetchRSCRequest?: string;
 }
 
 type NodeRouteHandler = (
@@ -867,6 +870,9 @@ function getNextDataNormalizedPathname(
     return null;
   }
   normalizedPath = normalizedPath.slice(0, -'.json'.length);
+  if (normalizedPath === 'index') {
+    return basePath || '/';
+  }
   if (decodeSquareBrackets) {
     // Preserve encoded slashes (%2F) for dynamic segment matching, but decode
     // encoded square brackets so static paths like /dynamic/[first] match.
@@ -2356,6 +2362,26 @@ function toSearchStringFromResolveRoutesQuery(
   return search.length > 0 ? `?${search}` : '';
 }
 
+function applyResolveRoutesQueryToSearchParams(
+  searchParams: URLSearchParams,
+  query: ResolveRoutesQuery
+): boolean {
+  let applied = false;
+  for (const [key, value] of Object.entries(query)) {
+    const values = Array.isArray(value) ? value : [value];
+    if (values.length === 0) {
+      continue;
+    }
+
+    searchParams.delete(key);
+    for (const entry of values) {
+      searchParams.append(key, entry);
+    }
+    applied = true;
+  }
+  return applied;
+}
+
 function isAppFunctionOutput(output: RuntimeFunctionOutput | undefined): boolean {
   if (!output) {
     return false;
@@ -2381,16 +2407,37 @@ function isAppFunctionOutput(output: RuntimeFunctionOutput | undefined): boolean
 
 function toRequestMeta({
   requestUrl,
+  requestHeaders,
   revalidate,
 }: {
   requestUrl: URL;
+  requestHeaders: IncomingHttpHeaders;
   revalidate?: RuntimeInternalRevalidate;
 }): RuntimeRequestMeta {
+  const rscHeaderValue = getSingleHeaderValue(requestHeaders[RSC_HEADER]);
+  const prefetchHeaderValue = getSingleHeaderValue(
+    requestHeaders[NEXT_ROUTER_PREFETCH_HEADER]
+  );
+  const segmentPrefetchHeaderValue = getSingleHeaderValue(
+    requestHeaders[NEXT_ROUTER_SEGMENT_PREFETCH_HEADER]
+  );
   const meta: RuntimeRequestMeta = {
     initURL: requestUrl.toString(),
     initProtocol: requestUrl.protocol.replace(/:$/, '') || 'http',
     hostname: requestUrl.hostname,
     ...(revalidate ? { revalidate } : {}),
+    ...(rscHeaderValue === '1' ? { isRSCRequest: true } : {}),
+    ...(rscHeaderValue === '1' && prefetchHeaderValue === '1'
+      ? { isPrefetchRSCRequest: true }
+      : {}),
+    ...(rscHeaderValue === '1' &&
+    prefetchHeaderValue === '1' &&
+    typeof segmentPrefetchHeaderValue === 'string' &&
+    segmentPrefetchHeaderValue.length > 0
+      ? {
+          segmentPrefetchRSCRequest: segmentPrefetchHeaderValue,
+        }
+      : {}),
   };
 
   return meta;
@@ -3170,32 +3217,6 @@ function resolveAppFunctionOutputForRequestPathname(
         return mappedOutput;
       }
     }
-
-    for (const matcher of dynamicOutputMatchers) {
-      if (!appSourcePages.has(matcher.sourcePage)) {
-        continue;
-      }
-      const dynamicParams = matchDynamicOutputPathname(candidatePathname, matcher);
-      if (!dynamicParams) {
-        continue;
-      }
-      const matchedOutput = resolveFunctionOutputBySourcePage({
-        sourcePage: matcher.sourcePage,
-        matchedPathname: matcher.pathname,
-        requestPathname: candidatePathname,
-        rscSuffix,
-        preferRscOutput,
-      });
-      if (!matchedOutput || !isAppFunctionOutput(matchedOutput.output)) {
-        continue;
-      }
-      return Object.keys(dynamicParams).length > 0
-        ? {
-            ...matchedOutput,
-            params: dynamicParams,
-          }
-        : matchedOutput;
-    }
   }
 
   return null;
@@ -3207,137 +3228,82 @@ function resolveFunctionOutput(
   rscSuffix?: string,
   preferRscOutput: boolean = false
 ): ResolvedFunctionOutput | null {
-  const preferredMatchedPathname = withOptionalSuffix(matchedPathname, rscSuffix);
-  const exactOutput =
-    getFunctionOutputByPathname(preferredMatchedPathname) ??
-    getFunctionOutputByPathname(matchedPathname);
-  if (exactOutput) {
-    if (!isAppFunctionOutput(exactOutput)) {
-      const appOutputForRequestPathname = resolveAppFunctionOutputForRequestPathname(
-        requestPathname,
-        rscSuffix,
-        preferRscOutput
-      );
-      if (appOutputForRequestPathname) {
-        return appOutputForRequestPathname;
-      }
-    }
-    const exactDynamicParams = getDynamicParamsForOutputRequestPathname(
-      exactOutput,
-      requestPathname,
-      rscSuffix
-    );
-    const mappedByExactOutput = resolveFunctionOutputBySourcePage({
-      sourcePage: exactOutput.sourcePage,
-      matchedPathname,
-      requestPathname,
-      rscSuffix,
-      preferRscOutput,
-    });
-    if (mappedByExactOutput) {
-      return exactDynamicParams
-        ? {
-            ...mappedByExactOutput,
-            params: exactDynamicParams,
-          }
-        : mappedByExactOutput;
-    }
-    return exactDynamicParams
-      ? {
-          output: preferRscFunctionOutput(exactOutput, preferRscOutput),
-          params: exactDynamicParams,
-        }
-      : { output: preferRscFunctionOutput(exactOutput, preferRscOutput) };
-  }
-
-  const matchedWithoutBasePath = getPathnameWithoutBasePath(matchedPathname, basePath);
-  const requestWithoutBasePath = getPathnameWithoutBasePath(requestPathname, basePath);
-  if (
-    isNextInternalPathname(removePathnameTrailingSlash(matchedWithoutBasePath)) ||
-    isNextInternalPathname(removePathnameTrailingSlash(requestWithoutBasePath))
-  ) {
-    return null;
-  }
-
-  const candidateSourcePages: string[] = [];
-  const pushSourcePage = (sourcePage: string | undefined): void => {
-    if (!sourcePage) {
+  const candidatePathnames: string[] = [];
+  const pushCandidatePathname = (pathname: string): void => {
+    if (!pathname) {
       return;
     }
-    if (!candidateSourcePages.includes(sourcePage)) {
-      candidateSourcePages.push(sourcePage);
+    if (!candidatePathnames.includes(pathname)) {
+      candidatePathnames.push(pathname);
     }
   };
 
-  pushSourcePage(getSourcePageForResolvedPathname(preferredMatchedPathname));
-  pushSourcePage(getSourcePageForResolvedPathname(matchedPathname));
-  pushSourcePage(getSourcePageForResolvedPathname(withOptionalSuffix(requestPathname, rscSuffix)));
-  pushSourcePage(getSourcePageForResolvedPathname(requestPathname));
+  pushCandidatePathname(withOptionalSuffix(matchedPathname, rscSuffix));
+  pushCandidatePathname(matchedPathname);
+  pushCandidatePathname(withOptionalSuffix(requestPathname, rscSuffix));
+  pushCandidatePathname(requestPathname);
 
-  for (const sourcePage of candidateSourcePages) {
+  if (runtimeI18n) {
+    const strippedMatchedPathname = stripLocalePrefixFromPathname(
+      matchedPathname,
+      basePath,
+      runtimeI18n
+    );
+    if (strippedMatchedPathname !== matchedPathname) {
+      pushCandidatePathname(withOptionalSuffix(strippedMatchedPathname, rscSuffix));
+      pushCandidatePathname(strippedMatchedPathname);
+    }
+    const strippedRequestPathname = stripLocalePrefixFromPathname(
+      requestPathname,
+      basePath,
+      runtimeI18n
+    );
+    if (strippedRequestPathname !== requestPathname) {
+      pushCandidatePathname(withOptionalSuffix(strippedRequestPathname, rscSuffix));
+      pushCandidatePathname(strippedRequestPathname);
+    }
+  }
+
+  for (const candidatePathname of candidatePathnames) {
+    const exactOutput = getFunctionOutputByPathname(candidatePathname);
+    if (exactOutput) {
+      if (!isAppFunctionOutput(exactOutput)) {
+        const appOutputForRequestPathname = resolveAppFunctionOutputForRequestPathname(
+          requestPathname,
+          rscSuffix,
+          preferRscOutput
+        );
+        if (appOutputForRequestPathname) {
+          return appOutputForRequestPathname;
+        }
+      }
+      const mappedByExactOutput = resolveFunctionOutputBySourcePage({
+        sourcePage: exactOutput.sourcePage,
+        matchedPathname: candidatePathname,
+        requestPathname,
+        rscSuffix,
+        preferRscOutput,
+      });
+      return (
+        mappedByExactOutput ?? {
+          output: preferRscFunctionOutput(exactOutput, preferRscOutput),
+        }
+      );
+    }
+
+    const sourcePage = getSourcePageForResolvedPathname(candidatePathname);
+    if (!sourcePage) {
+      continue;
+    }
     const mappedOutput = resolveFunctionOutputBySourcePage({
       sourcePage,
-      matchedPathname,
+      matchedPathname: candidatePathname,
       requestPathname,
       rscSuffix,
       preferRscOutput,
     });
     if (mappedOutput) {
       return mappedOutput;
-    }
-  }
-
-  const shouldUseDynamicMatcherFallback =
-    isApiPathname(matchedPathname, basePath, runtimeI18n) ||
-    isApiPathname(requestPathname, basePath, runtimeI18n);
-  if (shouldUseDynamicMatcherFallback && dynamicOutputMatchers.length > 0) {
-    const candidatePathnames = new Set<string>();
-    const pushCandidatePathname = (pathname: string): void => {
-      if (!pathname) {
-        return;
-      }
-      addManifestPathnameCandidates(candidatePathnames, withOptionalSuffix(pathname, rscSuffix));
-      addManifestPathnameCandidates(candidatePathnames, pathname);
-      if (runtimeI18n) {
-        const strippedPathname = stripLocalePrefixFromPathname(pathname, basePath, runtimeI18n);
-        if (strippedPathname !== pathname) {
-          addManifestPathnameCandidates(
-            candidatePathnames,
-            withOptionalSuffix(strippedPathname, rscSuffix)
-          );
-          addManifestPathnameCandidates(candidatePathnames, strippedPathname);
-        }
-      }
-    };
-
-    pushCandidatePathname(preferredMatchedPathname);
-    pushCandidatePathname(matchedPathname);
-    pushCandidatePathname(withOptionalSuffix(requestPathname, rscSuffix));
-    pushCandidatePathname(requestPathname);
-
-    for (const candidatePathname of candidatePathnames) {
-      for (const matcher of dynamicOutputMatchers) {
-        const dynamicParams = matchDynamicOutputPathname(candidatePathname, matcher);
-        if (!dynamicParams) {
-          continue;
-        }
-        const matchedOutput = resolveFunctionOutputBySourcePage({
-          sourcePage: matcher.sourcePage,
-          matchedPathname: matcher.pathname,
-          requestPathname,
-          rscSuffix,
-          preferRscOutput,
-        });
-        if (!matchedOutput) {
-          continue;
-        }
-        return Object.keys(dynamicParams).length > 0
-          ? {
-              ...matchedOutput,
-              params: dynamicParams,
-            }
-          : matchedOutput;
-      }
     }
   }
 
@@ -5716,7 +5682,7 @@ const server = http.createServer(async (req, res) => {
     const resolvedRoutingQuery =
       resolvedRoutingResult.invocationTarget?.query ??
       resolvedRoutingResult.resolvedQuery;
-    if (resolvedRoutingQuery) {
+    if (resolvedRoutingQuery && Object.keys(resolvedRoutingQuery).length > 0) {
       resolvedUrl.search = toSearchStringFromResolveRoutesQuery(resolvedRoutingQuery);
     }
 
@@ -5732,11 +5698,23 @@ const server = http.createServer(async (req, res) => {
         requestUrl.origin
       );
       resolvedUrl.pathname = middlewareRewriteUrl.pathname;
-      if (!resolvedRoutingQuery) {
+      if (middlewareRewriteUrl.search.length > 0) {
+        const mergedSearchParams = new URLSearchParams(resolvedUrl.search);
+        middlewareRewriteUrl.searchParams.forEach((value, key) => {
+          mergedSearchParams.delete(key);
+          mergedSearchParams.append(key, value);
+        });
+        const mergedSearch = mergedSearchParams.toString();
+        resolvedUrl.search = mergedSearch ? `?${mergedSearch}` : '';
+      } else if (!resolvedRoutingQuery) {
         resolvedUrl.search = middlewareRewriteUrl.search;
       }
     }
 
+    const routeMatchesQuery = toResolveRoutesQueryFromRouteMatches(
+      routeMatches,
+      matchedPathname
+    );
     const runtimeRewritePathnameForParams =
       runtimeRoutingConfig && hasUnresolvedRouteMatchPlaceholder(routeMatches)
         ? resolveRuntimeRewritePathname(routingUrl, req.headers, runtimeRoutingConfig)
@@ -5788,6 +5766,14 @@ const server = http.createServer(async (req, res) => {
       nextDataCandidatePathnames.add(requestUrl.pathname);
 
       for (const nextDataCandidatePathname of nextDataCandidatePathnames) {
+        const directNextDataOutput = getFunctionOutputByPathname(nextDataCandidatePathname);
+        if (directNextDataOutput?.pathname.includes('/_next/data/')) {
+          resolvedFunctionOutput = {
+            output: directNextDataOutput,
+          };
+          break;
+        }
+
         const nextDataOutput = resolveFunctionOutput(
           nextDataCandidatePathname,
           nextDataCandidatePathname,
@@ -5808,19 +5794,9 @@ const server = http.createServer(async (req, res) => {
         )
       );
       if (invocationPathOutput) {
-        const invocationPathDynamicParams = getDynamicParamsForOutputRequestPathname(
-          invocationPathOutput,
-          outputRequestPathname,
-          typeof rscSuffix === 'string' ? rscSuffix : undefined
-        );
-        resolvedFunctionOutput = invocationPathDynamicParams
-          ? {
-              output: preferRscFunctionOutput(invocationPathOutput, preferRscOutput),
-              params: invocationPathDynamicParams,
-            }
-          : {
-              output: preferRscFunctionOutput(invocationPathOutput, preferRscOutput),
-            };
+        resolvedFunctionOutput = {
+          output: preferRscFunctionOutput(invocationPathOutput, preferRscOutput),
+        };
       }
     }
     if (!resolvedFunctionOutput) {
@@ -5916,6 +5892,7 @@ const server = http.createServer(async (req, res) => {
 
     const requestMeta = toRequestMeta({
       requestUrl,
+      requestHeaders: req.headers,
       revalidate: internalRevalidate,
     });
     if (debugRequest) {
@@ -5931,17 +5908,65 @@ const server = http.createServer(async (req, res) => {
         String(requestMeta.hostname ?? '')
       );
     }
-    const shouldUseOriginalReqUrl = Boolean(nextDataRoutePathname);
-    const originalReqSearch = nextDataRoutePathname
-      ? resolvedUrl.search
-      : requestUrl.search;
-    if (shouldUseOriginalReqUrl) {
-      req.url = `${requestUrl.pathname}${originalReqSearch}`;
-    } else {
-      req.url = `${invocationUrl.pathname}${invocationUrl.search}`;
-    }
 
     if (resolvedFunctionOutput) {
+      const isApiOutput = isApiRoutePathname(resolvedFunctionOutput.output.pathname);
+      const isNextDataRequest =
+        getSingleHeaderValue(req.headers['x-nextjs-data']) === '1' ||
+        Boolean(nextDataNormalizedPathname) ||
+        requestUrl.pathname.includes('/_next/data/');
+      const invocationRequestUrl = new URL(requestUrl);
+      if (!isApiOutput && isNextDataRequest) {
+        const rewrittenNextDataPathname = toNextDataPathname(
+          invocationUrl.pathname,
+          buildId,
+          basePath
+        );
+        invocationRequestUrl.pathname = rewrittenNextDataPathname ?? requestUrl.pathname;
+        invocationRequestUrl.search = invocationUrl.search;
+      } else {
+        invocationRequestUrl.pathname = resolvedUrl.pathname;
+        invocationRequestUrl.search = invocationUrl.search;
+      }
+
+      const shouldInjectDynamicParams = isDynamicRoute(
+        stripRscPathnameSuffix(resolvedFunctionOutput.output.pathname),
+        false
+      );
+      if (shouldInjectDynamicParams) {
+        const invocationRequestSearchParams = new URLSearchParams(
+          invocationRequestUrl.search
+        );
+        const didApplyRouteMatchesQuery =
+          routeMatchesQuery && Object.keys(routeMatchesQuery).length > 0
+            ? applyResolveRoutesQueryToSearchParams(
+                invocationRequestSearchParams,
+                routeMatchesQuery
+              )
+            : false;
+        if (!didApplyRouteMatchesQuery && resolvedFunctionOutput.params) {
+          for (const [key, value] of Object.entries(resolvedFunctionOutput.params)) {
+            if (value === undefined) {
+              continue;
+            }
+            invocationRequestSearchParams.delete(key);
+            if (Array.isArray(value)) {
+              for (const item of value) {
+                invocationRequestSearchParams.append(key, item);
+              }
+            } else {
+              invocationRequestSearchParams.append(key, value);
+            }
+          }
+        }
+        const invocationRequestSearch = invocationRequestSearchParams.toString();
+        invocationRequestUrl.search = invocationRequestSearch
+          ? `?${invocationRequestSearch}`
+          : '';
+      }
+
+      req.url = `${invocationRequestUrl.pathname}${invocationRequestUrl.search}`;
+
       if (isRscRequest) {
         allowRscContentTypeRewrite = true;
       }
@@ -5990,7 +6015,7 @@ const server = http.createServer(async (req, res) => {
         req,
         res,
         resolvedFunctionOutput.output,
-        shouldUseOriginalReqUrl ? requestUrl : invocationUrl,
+        invocationRequestUrl,
         requestBody,
         requestMeta
       );

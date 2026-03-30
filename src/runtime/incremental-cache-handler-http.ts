@@ -444,6 +444,14 @@ export default class FetchIncrementalCacheHandler
     ) {
       const postponed = (value as { postponed?: unknown }).postponed;
       const headers = (value as { headers?: unknown }).headers;
+      const rscData = (value as { rscData?: unknown }).rscData;
+      const segmentData = (value as { segmentData?: unknown }).segmentData;
+      const segmentCount =
+        segmentData instanceof Map ? segmentData.size : 0;
+      const segmentPreview =
+        segmentData instanceof Map
+          ? [...segmentData.keys()].slice(0, 3).join(',')
+          : '';
       const cacheTagsHeader =
         headers &&
         typeof headers === 'object' &&
@@ -455,6 +463,13 @@ export default class FetchIncrementalCacheHandler
         'get app-page postponed',
         cacheKey,
         typeof postponed === 'string' ? postponed.length : 0,
+        'rsc=',
+        rscData instanceof Uint8Array || Buffer.isBuffer(rscData)
+          ? String(rscData.byteLength)
+          : '0',
+        'segments=',
+        String(segmentCount),
+        segmentCount > 0 ? `segment-keys=${segmentPreview}` : '',
         'cache-tags=',
         cacheTagsHeader
       );
