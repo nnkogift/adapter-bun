@@ -121,8 +121,59 @@ export interface BunResolvedPathnameSourcePageMap {
   [resolvedPathname: string]: string;
 }
 
+export interface BunRuntimeMiddlewareRouteMatcherHas {
+  type: 'header' | 'cookie' | 'query' | 'host';
+  key?: string;
+  value?: string;
+}
+
+export interface BunRuntimeMiddlewareRouteMatcher {
+  regexp: string;
+  has?: BunRuntimeMiddlewareRouteMatcherHas[];
+  missing?: BunRuntimeMiddlewareRouteMatcherHas[];
+}
+
+export type BunRuntimeDynamicMatcherSegment =
+  | {
+      type: 'static';
+      value: string;
+    }
+  | {
+      type: 'dynamic';
+      key: string;
+    }
+  | {
+      type: 'catchall';
+      key: string;
+    }
+  | {
+      type: 'optionalCatchall';
+      key: string;
+    };
+
+export interface BunRuntimeDynamicMatcher {
+  sourcePage: string;
+  pathname: string;
+  segments: BunRuntimeDynamicMatcherSegment[];
+  staticSegmentCount: number;
+  catchAllSegmentCount: number;
+  optionalCatchAllSegmentCount: number;
+}
+
+export interface BunRuntimeLookup {
+  routingPathnames: string[];
+  pathnameAliasToCanonical: Record<string, string>;
+  functionPathnameToOutputPathname: Record<string, string>;
+  rscFunctionPathnameToOutputPathname: Record<string, string>;
+  sourcePageByPathname: Record<string, string>;
+  outputPathnamesBySourcePage: Record<string, string[]>;
+  staticAssetPathnameToAssetPathname: Record<string, string>;
+  dynamicMatchers: BunRuntimeDynamicMatcher[];
+  middlewareMatchers: BunRuntimeMiddlewareRouteMatcher[] | null;
+}
+
 export interface BunDeploymentManifest {
-  schemaVersion: 1;
+  schemaVersion: 2;
   generatedAt: string;
   adapter: {
     name: string;
@@ -158,6 +209,7 @@ export interface BunDeploymentManifest {
     middleware?: BunRuntimeFunctionOutput | null;
     functions?: BunRuntimeFunctionOutput[];
     resolvedPathnameToSourcePage?: BunResolvedPathnameSourcePageMap;
+    lookup?: BunRuntimeLookup;
   };
   staticAssets: BunStaticAsset[];
   summary: {

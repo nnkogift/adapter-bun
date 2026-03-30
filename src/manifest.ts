@@ -46,6 +46,7 @@ export function buildDeploymentManifest({
   middlewareOutput,
   functionOutputs,
   resolvedPathnameToSourcePage,
+  lookup,
 }: {
   adapterName: string;
   adapterOutDir: string;
@@ -63,9 +64,10 @@ export function buildDeploymentManifest({
   resolvedPathnameToSourcePage?: NonNullable<
     BunDeploymentManifest['runtime']
   >['resolvedPathnameToSourcePage'];
+  lookup?: NonNullable<BunDeploymentManifest['runtime']>['lookup'];
 }): BunDeploymentManifest {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt,
     adapter: {
       name: adapterName,
@@ -93,6 +95,17 @@ export function buildDeploymentManifest({
       middleware: middlewareOutput ?? null,
       functions: functionOutputs ?? [],
       resolvedPathnameToSourcePage: resolvedPathnameToSourcePage ?? {},
+      lookup: lookup ?? {
+        routingPathnames: [],
+        pathnameAliasToCanonical: {},
+        functionPathnameToOutputPathname: {},
+        rscFunctionPathnameToOutputPathname: {},
+        sourcePageByPathname: {},
+        outputPathnamesBySourcePage: {},
+        staticAssetPathnameToAssetPathname: {},
+        dynamicMatchers: [],
+        middlewareMatchers: null,
+      },
     },
     staticAssets,
     summary: {

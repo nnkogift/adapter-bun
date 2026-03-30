@@ -73,15 +73,16 @@ The adapter hooks into Next.js via the `onBuildComplete` callback. It takes the 
 ```
 bun-dist/
   server.js                 # entry point (Bun.serve)
-  deployment-manifest.json  # routes, functions, assets, config
+  deployment-manifest.json  # routes, functions, assets, config + lookup tables
   cache.db                  # SQLite — prerender + image cache
   bundle/                   # function artifacts (route handlers)
   static/                   # static assets (/_next/static + public/)
-  runtime/                  # router, cache, invokers
+  runtime/                  # cache/runtime helpers
   node_modules/             # traced dependencies
 ```
 
 Functions are consolidated into a shared `bundle/` directory with deduplicated assets. Prerender seeds (SSG pages) are written into the SQLite cache so they're served immediately on first request.
+The deployment manifest includes precomputed pathname/output/source-page lookup maps so request-time routing does less dynamic resolution work.
 
 ### Runtime
 
@@ -124,19 +125,18 @@ src/
   staging.ts                # stages assets, functions, prerender seeds
   types.ts                  # adapter types
   runtime/
-    router.ts               # request router (createRouterRuntime)
-    isr.ts                  # prerender cache logic + types
-    image.ts                # image optimization cache
+    server.ts               # main HTTP runtime implementation
     sqlite-cache.ts         # SQLite cache stores
-    function-invoker.ts     # dispatches to node/edge invokers
-    function-invoker-node.ts   # Node.js function runtime
-    function-invoker-edge.ts   # Edge function runtime + middleware
-    function-invoker-shared.ts # shared invoker utilities
-    static.ts               # static file serving
-    revalidate.ts           # background revalidation queue
-    tag-manifest-bridge.ts  # syncs Next.js revalidateTag to SQLite
-    next-routing.ts         # lazy-loads @next/routing
-    types.ts                # runtime types
+    incremental-cache-handler.ts
+    incremental-cache-handler-http.ts
+    cache-handler.ts
+    cache-handler-http.ts
+    cache-http-client.ts
+    cache-http-server.ts
+    cache-http-protocol.ts
+    cache-store.ts
+    isr.ts
+    binary.ts
 ```
 
 ## Development

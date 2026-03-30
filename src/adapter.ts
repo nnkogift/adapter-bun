@@ -17,9 +17,13 @@ import {
 } from './staging.ts';
 import type {
   BunAdapterOptions,
+  BunRuntimeDynamicMatcher,
+  BunRuntimeDynamicMatcherSegment,
   BunRuntimeAssetBinding,
   BunDeploymentManifest,
   BunRuntimeFunctionOutput,
+  BunRuntimeMiddlewareRouteMatcher,
+  BunRuntimeMiddlewareRouteMatcherHas,
   BunResolvedPathnameSourcePageMap,
   BuildCompleteContext,
 } from './types.ts';
@@ -35,7 +39,6 @@ const RSC_SUFFIX = '.rsc';
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
 const CACHE_RUNTIME_MODULES = [
   'early-timers.js',
-  'next-compat.js',
   'cache-handler.js',
   'cache-handler-http.js',
   'cache-http-client.js',
@@ -58,6 +61,9 @@ type CacheRuntimeConfig = NonNullable<
 >;
 type RuntimeRoutingConfig = NonNullable<
   NonNullable<BunDeploymentManifest['runtime']>['routing']
+>;
+type RuntimeLookupConfig = NonNullable<
+  NonNullable<BunDeploymentManifest['runtime']>['lookup']
 >;
 type BuildRoute = BuildCompleteContext['routing']['beforeFiles'][number];
 type BuildRouteHas = NonNullable<BuildRoute['has']>[number];
@@ -209,7 +215,6 @@ async function writeServerEntry(outDir: string): Promise<void> {
   const sourceCode = await Bun.file(sourcePath).text();
   const runtimeServerCode = sourceCode
     .replace("import './early-timers.js';", "import './runtime/early-timers.js';")
-    .replace("from './next-compat.js';", "from './runtime/next-compat.js';")
     .replace("from './cache-store.js';", "from './runtime/cache-store.js';")
     .replace(
       "from './cache-http-server.js';",
@@ -676,6 +681,631 @@ function collectResolvedPathnameToSourcePage({
   );
 }
 
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function removePathnameTrailingSlash(pathname: string): string {
+  return pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+}
+
+function shouldPreservePathnameWithoutTrailingSlash(pathname: string): boolean {
+  const lastSegment = pathname.split('/').pop() ?? '';
+  return lastSegment.includes('.');
+}
+
+function getPathnameIndexAlias(pathname: string): string | null {
+  const normalizedPathname =
+    pathname !== '/' && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+
+  if (normalizedPathname === '/') {
+    return '/index';
+  }
+
+  const lastSlashIndex = normalizedPathname.lastIndexOf('/');
+  if (lastSlashIndex < 0) {
+    return null;
+  }
+
+  const lastSegment = normalizedPathname.slice(lastSlashIndex + 1);
+  if (lastSegment.includes('.')) {
+    return null;
+  }
+
+  if (normalizedPathname.endsWith('/index')) {
+    const withoutIndex = normalizedPathname.slice(0, -'/index'.length);
+    return withoutIndex.length > 0 ? withoutIndex : '/';
+  }
+
+  return `${normalizedPathname}/index`;
+}
+
+function decodePathnameSegmentPreservingEncodedSlashes(segment: string): string {
+  const parts = segment.split(/%2F/gi);
+  const decodedParts = parts.map((part) => {
+    try {
+      return decodeURIComponent(part);
+    } catch {
+      return part;
+    }
+  });
+  return decodedParts.join('%2F');
+}
+
+function decodePathnameSegmentsPreservingEncodedSlashes(pathname: string): string {
+  const segments = pathname.split('/');
+  const decodedSegments = segments.map((segment) => {
+    if (segment.length === 0) {
+      return segment;
+    }
+    return decodePathnameSegmentPreservingEncodedSlashes(segment);
+  });
+  return decodedSegments.join('/');
+}
+
+function encodePathnameSegmentsPreservingEncodedSlashes(pathname: string): string {
+  const segments = pathname.split('/');
+  const encodedSegments = segments.map((segment) => {
+    if (segment.length === 0) {
+      return segment;
+    }
+
+    const parts = segment.split(/%2F/gi);
+    const encodedParts = parts.map((part) => {
+      const decodedPart = decodePathnameSegmentPreservingEncodedSlashes(part);
+      return encodeURIComponent(decodedPart);
+    });
+    return encodedParts.join('%2F');
+  });
+  return encodedSegments.join('/');
+}
+
+function addPathnameEncodingVariants(candidates: Set<string>, pathname: string): void {
+  candidates.add(pathname);
+  candidates.add(decodePathnameSegmentsPreservingEncodedSlashes(pathname));
+  candidates.add(encodePathnameSegmentsPreservingEncodedSlashes(pathname));
+}
+
+function addManifestPathnameCandidates(candidates: Set<string>, pathname: string): void {
+  addPathnameEncodingVariants(candidates, pathname);
+
+  const indexAlias = getPathnameIndexAlias(pathname);
+  if (indexAlias) {
+    addPathnameEncodingVariants(candidates, indexAlias);
+  }
+}
+
+function addLookupAlias(map: Map<string, string>, alias: string, canonical: string): void {
+  if (!alias || !canonical) {
+    return;
+  }
+  if (!map.has(alias)) {
+    map.set(alias, canonical);
+  }
+}
+
+function addLookupAliases(
+  map: Map<string, string>,
+  canonicalPathname: string
+): void {
+  const candidates = new Set<string>();
+  addManifestPathnameCandidates(candidates, canonicalPathname);
+  for (const candidate of candidates) {
+    addLookupAlias(map, candidate, canonicalPathname);
+  }
+
+  if (canonicalPathname !== '/' && !shouldPreservePathnameWithoutTrailingSlash(canonicalPathname)) {
+    if (canonicalPathname.endsWith('/')) {
+      const withoutTrailingSlash = removePathnameTrailingSlash(canonicalPathname);
+      const noTrailingCandidates = new Set<string>();
+      addManifestPathnameCandidates(noTrailingCandidates, withoutTrailingSlash);
+      for (const candidate of noTrailingCandidates) {
+        addLookupAlias(map, candidate, canonicalPathname);
+      }
+    } else {
+      const withTrailingSlash = `${canonicalPathname}/`;
+      const trailingCandidates = new Set<string>();
+      addManifestPathnameCandidates(trailingCandidates, withTrailingSlash);
+      for (const candidate of trailingCandidates) {
+        addLookupAlias(map, candidate, canonicalPathname);
+      }
+    }
+  }
+}
+
+function hasInterceptionMarkerPrefix(segment: string): boolean {
+  return (
+    segment.startsWith('(.)') ||
+    segment.startsWith('(..)') ||
+    segment.startsWith('(...)')
+  );
+}
+
+function stripInterceptionMarkerPrefix(segment: string): string {
+  let normalizedSegment = segment;
+  while (hasInterceptionMarkerPrefix(normalizedSegment)) {
+    if (normalizedSegment.startsWith('(.)')) {
+      normalizedSegment = normalizedSegment.slice('(.)'.length);
+      continue;
+    }
+    if (normalizedSegment.startsWith('(..)')) {
+      normalizedSegment = normalizedSegment.slice('(..)'.length);
+      continue;
+    }
+    if (normalizedSegment.startsWith('(...)')) {
+      normalizedSegment = normalizedSegment.slice('(...)'.length);
+      continue;
+    }
+  }
+  return normalizedSegment;
+}
+
+function normalizePathnameForRouteMatching(pathname: string): string {
+  if (!pathname.includes('(.')) {
+    return pathname;
+  }
+
+  return pathname
+    .split('/')
+    .map((segment) => stripInterceptionMarkerPrefix(segment))
+    .join('/');
+}
+
+function stripRscPathnameSuffix(pathname: string): string {
+  return pathname.endsWith(RSC_SUFFIX)
+    ? pathname.slice(0, -RSC_SUFFIX.length)
+    : pathname;
+}
+
+function isApiRoutePathname(pathname: string): boolean {
+  return pathname === '/api' || pathname.startsWith('/api/');
+}
+
+function toRuntimeDynamicMatcherSegments(pathname: string): BunRuntimeDynamicMatcherSegment[] {
+  const normalizedPathname = normalizePathnameForRouteMatching(
+    stripRscPathnameSuffix(pathname)
+  );
+  const segments = normalizedPathname.split('/').filter((segment) => segment.length > 0);
+  const routeSegments: BunRuntimeDynamicMatcherSegment[] = [];
+  for (const segment of segments) {
+    const normalizedSegment = stripInterceptionMarkerPrefix(segment);
+    if (
+      normalizedSegment.startsWith('[[...') &&
+      normalizedSegment.endsWith(']]')
+    ) {
+      const key = normalizedSegment.slice('[[...'.length, -']]'.length);
+      routeSegments.push({
+        type: 'optionalCatchall',
+        key,
+      });
+      continue;
+    }
+    if (normalizedSegment.startsWith('[...') && normalizedSegment.endsWith(']')) {
+      const key = normalizedSegment.slice('[...'.length, -']'.length);
+      routeSegments.push({
+        type: 'catchall',
+        key,
+      });
+      continue;
+    }
+    if (normalizedSegment.startsWith('[') && normalizedSegment.endsWith(']')) {
+      const key = normalizedSegment.slice('['.length, -']'.length);
+      routeSegments.push({
+        type: 'dynamic',
+        key,
+      });
+      continue;
+    }
+
+    routeSegments.push({
+      type: 'static',
+      value: normalizedSegment,
+    });
+  }
+  return routeSegments;
+}
+
+function compareRuntimeDynamicMatchers(
+  left: BunRuntimeDynamicMatcher,
+  right: BunRuntimeDynamicMatcher
+): number {
+  if (left.staticSegmentCount !== right.staticSegmentCount) {
+    return right.staticSegmentCount - left.staticSegmentCount;
+  }
+  if (left.catchAllSegmentCount !== right.catchAllSegmentCount) {
+    return left.catchAllSegmentCount - right.catchAllSegmentCount;
+  }
+  if (
+    left.optionalCatchAllSegmentCount !== right.optionalCatchAllSegmentCount
+  ) {
+    return left.optionalCatchAllSegmentCount - right.optionalCatchAllSegmentCount;
+  }
+  if (left.segments.length !== right.segments.length) {
+    return right.segments.length - left.segments.length;
+  }
+  return left.pathname.localeCompare(right.pathname);
+}
+
+function collectRuntimeDynamicMatchers(
+  runtimeFunctionOutputs: readonly BunRuntimeFunctionOutput[]
+): BunRuntimeDynamicMatcher[] {
+  const outputsBySourcePage = new Map<string, BunRuntimeFunctionOutput[]>();
+  for (const output of runtimeFunctionOutputs) {
+    const existing = outputsBySourcePage.get(output.sourcePage);
+    if (existing) {
+      existing.push(output);
+    } else {
+      outputsBySourcePage.set(output.sourcePage, [output]);
+    }
+  }
+
+  const matchers: BunRuntimeDynamicMatcher[] = [];
+  const seen = new Set<string>();
+  for (const [sourcePage, outputs] of outputsBySourcePage.entries()) {
+    for (const output of outputs) {
+      const matcherPathname = stripRscPathnameSuffix(output.pathname);
+      if (!matcherPathname.includes('[') || !matcherPathname.includes(']')) {
+        continue;
+      }
+
+      const matcherKey = `${sourcePage}:${matcherPathname}`;
+      if (seen.has(matcherKey)) {
+        continue;
+      }
+      seen.add(matcherKey);
+
+      const segments = toRuntimeDynamicMatcherSegments(matcherPathname);
+      let staticSegmentCount = 0;
+      let catchAllSegmentCount = 0;
+      let optionalCatchAllSegmentCount = 0;
+      for (const segment of segments) {
+        if (segment.type === 'static') {
+          staticSegmentCount += 1;
+        } else if (segment.type === 'catchall') {
+          catchAllSegmentCount += 1;
+        } else if (segment.type === 'optionalCatchall') {
+          optionalCatchAllSegmentCount += 1;
+          catchAllSegmentCount += 1;
+        }
+      }
+
+      matchers.push({
+        sourcePage,
+        pathname: matcherPathname,
+        segments,
+        staticSegmentCount,
+        catchAllSegmentCount,
+        optionalCatchAllSegmentCount,
+      });
+    }
+  }
+
+  matchers.sort(compareRuntimeDynamicMatchers);
+  return matchers;
+}
+
+interface MiddlewareManifestEntry {
+  name?: string;
+  page?: string;
+  matchers?: BunRuntimeMiddlewareRouteMatcher[];
+}
+
+interface MiddlewareManifestFile {
+  middleware?: Record<string, MiddlewareManifestEntry>;
+  functions?: Record<string, MiddlewareManifestEntry>;
+}
+
+interface FunctionsConfigManifestEntry {
+  runtime?: string;
+  matchers?: BunRuntimeMiddlewareRouteMatcher[];
+}
+
+interface FunctionsConfigManifestFile {
+  functions?: Record<string, FunctionsConfigManifestEntry>;
+}
+
+function toRuntimeMiddlewareRouteMatcherHas(
+  value: unknown
+): BunRuntimeMiddlewareRouteMatcherHas | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const type = value.type;
+  if (
+    type !== 'header' &&
+    type !== 'cookie' &&
+    type !== 'query' &&
+    type !== 'host'
+  ) {
+    return null;
+  }
+
+  const key = typeof value.key === 'string' && value.key.length > 0 ? value.key : undefined;
+  const hasValue =
+    typeof value.value === 'string' && value.value.length > 0
+      ? value.value
+      : undefined;
+  if (type !== 'host' && !key) {
+    return null;
+  }
+
+  return {
+    type,
+    ...(key ? { key } : {}),
+    ...(hasValue ? { value: hasValue } : {}),
+  };
+}
+
+function toRuntimeMiddlewareRouteMatcher(
+  value: unknown
+): BunRuntimeMiddlewareRouteMatcher | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const regexp = value.regexp;
+  if (typeof regexp !== 'string' || regexp.length === 0) {
+    return null;
+  }
+
+  const has = Array.isArray(value.has)
+    ? value.has
+        .map((entry) => toRuntimeMiddlewareRouteMatcherHas(entry))
+        .filter((entry): entry is BunRuntimeMiddlewareRouteMatcherHas => Boolean(entry))
+    : [];
+  const missing = Array.isArray(value.missing)
+    ? value.missing
+        .map((entry) => toRuntimeMiddlewareRouteMatcherHas(entry))
+        .filter((entry): entry is BunRuntimeMiddlewareRouteMatcherHas => Boolean(entry))
+    : [];
+
+  return {
+    regexp,
+    ...(has.length > 0 ? { has } : {}),
+    ...(missing.length > 0 ? { missing } : {}),
+  };
+}
+
+function normalizeRuntimeMiddlewareMatchers(value: unknown): BunRuntimeMiddlewareRouteMatcher[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const matchers = value
+    .map((entry) => toRuntimeMiddlewareRouteMatcher(entry))
+    .filter((entry): entry is BunRuntimeMiddlewareRouteMatcher => Boolean(entry));
+
+  return matchers;
+}
+
+function findMiddlewareManifestEntry(
+  manifestValue: MiddlewareManifestFile | null,
+  middleware: BunRuntimeFunctionOutput
+): MiddlewareManifestEntry | null {
+  if (!manifestValue) {
+    return null;
+  }
+
+  const manifestSections = [manifestValue.middleware, manifestValue.functions];
+  for (const section of manifestSections) {
+    if (!section) {
+      continue;
+    }
+
+    const directCandidates = [
+      section[middleware.sourcePage],
+      section[middleware.pathname],
+      section[middleware.id],
+      section['/'],
+    ];
+    for (const candidate of directCandidates) {
+      if (candidate?.matchers && candidate.matchers.length > 0) {
+        return candidate;
+      }
+    }
+
+    for (const candidate of Object.values(section)) {
+      if (!candidate?.matchers || candidate.matchers.length === 0) {
+        continue;
+      }
+      if (
+        candidate.name === middleware.id ||
+        candidate.page === middleware.sourcePage ||
+        candidate.page === middleware.pathname
+      ) {
+        return candidate;
+      }
+    }
+  }
+
+  return null;
+}
+
+function findFunctionsConfigManifestEntry(
+  manifestValue: FunctionsConfigManifestFile | null,
+  middleware: BunRuntimeFunctionOutput
+): FunctionsConfigManifestEntry | null {
+  if (!manifestValue?.functions) {
+    return null;
+  }
+
+  const directCandidates = [
+    manifestValue.functions[middleware.sourcePage],
+    manifestValue.functions[middleware.pathname],
+    manifestValue.functions[middleware.id],
+    manifestValue.functions['/_middleware'],
+    manifestValue.functions['/'],
+  ];
+  for (const candidate of directCandidates) {
+    if (candidate?.matchers && candidate.matchers.length > 0) {
+      return candidate;
+    }
+  }
+
+  for (const candidate of Object.values(manifestValue.functions)) {
+    if (!candidate?.matchers || candidate.matchers.length === 0) {
+      continue;
+    }
+    return candidate;
+  }
+
+  return null;
+}
+
+async function collectRuntimeMiddlewareMatchers({
+  ctx,
+  middleware,
+}: {
+  ctx: BuildCompleteContext;
+  middleware: BunRuntimeFunctionOutput | undefined;
+}): Promise<BunRuntimeMiddlewareRouteMatcher[] | null> {
+  if (!middleware) {
+    return null;
+  }
+
+  const absoluteDistDir = path.isAbsolute(ctx.distDir)
+    ? ctx.distDir
+    : path.join(ctx.projectDir, ctx.distDir);
+  const middlewareManifestPath = path.join(
+    absoluteDistDir,
+    'server',
+    'middleware-manifest.json'
+  );
+  if (existsSync(middlewareManifestPath)) {
+    try {
+      const parsed = (await Bun.file(middlewareManifestPath).json()) as unknown;
+      const middlewareManifest = isObjectRecord(parsed)
+        ? (parsed as MiddlewareManifestFile)
+        : null;
+      const entry = findMiddlewareManifestEntry(middlewareManifest, middleware);
+      const matchers = normalizeRuntimeMiddlewareMatchers(entry?.matchers);
+      if (matchers.length > 0) {
+        return matchers;
+      }
+    } catch {
+      // Fall through to functions-config-manifest.
+    }
+  }
+
+  const functionsConfigManifestPath = path.join(
+    absoluteDistDir,
+    'server',
+    'functions-config-manifest.json'
+  );
+  if (!existsSync(functionsConfigManifestPath)) {
+    return null;
+  }
+
+  try {
+    const parsed = (await Bun.file(functionsConfigManifestPath).json()) as unknown;
+    const manifestValue = isObjectRecord(parsed)
+      ? (parsed as FunctionsConfigManifestFile)
+      : null;
+    const entry = findFunctionsConfigManifestEntry(manifestValue, middleware);
+    const matchers = normalizeRuntimeMiddlewareMatchers(entry?.matchers);
+    return matchers.length > 0 ? matchers : null;
+  } catch {
+    return null;
+  }
+}
+
+function toSortedRecord(map: Map<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    [...map.entries()].sort(([left], [right]) => left.localeCompare(right))
+  );
+}
+
+function toSortedArrayRecord(
+  map: Map<string, Set<string>>
+): Record<string, string[]> {
+  return Object.fromEntries(
+    [...map.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, values]) => [key, [...values].sort((a, b) => a.localeCompare(b))])
+  );
+}
+
+async function buildRuntimeLookup({
+  ctx,
+  pathnames,
+  staticAssets,
+  runtimeFunctionOutputs,
+  resolvedPathnameToSourcePage,
+  runtimeMiddleware,
+}: {
+  ctx: BuildCompleteContext;
+  pathnames: readonly string[];
+  staticAssets: ReadonlyArray<{ pathname: string }>;
+  runtimeFunctionOutputs: readonly BunRuntimeFunctionOutput[];
+  resolvedPathnameToSourcePage: BunResolvedPathnameSourcePageMap;
+  runtimeMiddleware: BunRuntimeFunctionOutput | undefined;
+}): Promise<RuntimeLookupConfig> {
+  const pathnameAliasToCanonical = new Map<string, string>();
+  const functionPathnameToOutputPathname = new Map<string, string>();
+  const rscFunctionPathnameToOutputPathname = new Map<string, string>();
+  const sourcePageByPathname = new Map<string, string>();
+  const outputPathnamesBySourcePage = new Map<string, Set<string>>();
+  const staticAssetPathnameToAssetPathname = new Map<string, string>();
+
+  const routingPathnameCandidates = new Set<string>();
+
+  for (const pathname of pathnames) {
+    addLookupAliases(pathnameAliasToCanonical, pathname);
+    addManifestPathnameCandidates(routingPathnameCandidates, pathname);
+  }
+
+  for (const asset of staticAssets) {
+    addLookupAliases(pathnameAliasToCanonical, asset.pathname);
+    addLookupAliases(staticAssetPathnameToAssetPathname, asset.pathname);
+    addManifestPathnameCandidates(routingPathnameCandidates, asset.pathname);
+  }
+
+  for (const output of runtimeFunctionOutputs) {
+    addLookupAliases(pathnameAliasToCanonical, output.pathname);
+    addLookupAliases(functionPathnameToOutputPathname, output.pathname);
+    if (output.pathname.endsWith(RSC_SUFFIX)) {
+      addLookupAliases(rscFunctionPathnameToOutputPathname, output.pathname);
+    }
+    addManifestPathnameCandidates(routingPathnameCandidates, output.pathname);
+    const existing = outputPathnamesBySourcePage.get(output.sourcePage);
+    if (existing) {
+      existing.add(output.pathname);
+    } else {
+      outputPathnamesBySourcePage.set(output.sourcePage, new Set([output.pathname]));
+    }
+  }
+
+  for (const [pathname, sourcePage] of Object.entries(resolvedPathnameToSourcePage)) {
+    if (!pathname || !sourcePage) {
+      continue;
+    }
+    const aliases = new Set<string>();
+    addManifestPathnameCandidates(aliases, pathname);
+    for (const alias of aliases) {
+      addLookupAlias(sourcePageByPathname, alias, sourcePage);
+    }
+  }
+
+  const dynamicMatchers = collectRuntimeDynamicMatchers(runtimeFunctionOutputs);
+  const middlewareMatchers = await collectRuntimeMiddlewareMatchers({
+    ctx,
+    middleware: runtimeMiddleware,
+  });
+
+  return {
+    routingPathnames: [...routingPathnameCandidates].sort((a, b) => a.localeCompare(b)),
+    pathnameAliasToCanonical: toSortedRecord(pathnameAliasToCanonical),
+    functionPathnameToOutputPathname: toSortedRecord(functionPathnameToOutputPathname),
+    rscFunctionPathnameToOutputPathname: toSortedRecord(rscFunctionPathnameToOutputPathname),
+    sourcePageByPathname: toSortedRecord(sourcePageByPathname),
+    outputPathnamesBySourcePage: toSortedArrayRecord(outputPathnamesBySourcePage),
+    staticAssetPathnameToAssetPathname: toSortedRecord(staticAssetPathnameToAssetPathname),
+    dynamicMatchers,
+    middlewareMatchers,
+  };
+}
+
 function isStaticMetadataRoutePathname(pathname: string): boolean {
   return (
     pathname.endsWith('/robots.txt') ||
@@ -1038,6 +1668,14 @@ async function onBuildComplete(
     outputs: ctx.outputs,
     runtimeFunctionOutputs,
   });
+  const runtimeLookup = await buildRuntimeLookup({
+    ctx,
+    pathnames,
+    staticAssets,
+    runtimeFunctionOutputs,
+    resolvedPathnameToSourcePage,
+    runtimeMiddleware,
+  });
 
   const deploymentManifest = buildDeploymentManifest({
     adapterName: ADAPTER_NAME,
@@ -1054,6 +1692,7 @@ async function onBuildComplete(
     middlewareOutput: runtimeMiddleware,
     functionOutputs: runtimeFunctionOutputs,
     resolvedPathnameToSourcePage,
+    lookup: runtimeLookup,
   });
 
   await writeJsonFile(
