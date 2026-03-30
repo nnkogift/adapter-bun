@@ -3257,8 +3257,14 @@ function resolveFunctionOutput(
     ) {
       continue;
     }
+    if (!isApiPathname(candidatePathname, basePath, runtimeI18n)) {
+      continue;
+    }
 
     for (const matcher of dynamicOutputMatchers) {
+      if (!isApiRoutePathname(matcher.pathname)) {
+        continue;
+      }
       const dynamicParams = matchDynamicOutputPathname(
         candidatePathname,
         matcher
