@@ -3307,6 +3307,48 @@ function resolveFunctionOutput(
     }
   }
 
+  for (const candidatePathname of candidatePathnames) {
+    const candidateWithoutBasePath = getPathnameWithoutBasePath(
+      candidatePathname,
+      basePath
+    );
+    if (
+      isNextInternalPathname(
+        removePathnameTrailingSlash(candidateWithoutBasePath)
+      )
+    ) {
+      continue;
+    }
+
+    for (const matcher of dynamicOutputMatchers) {
+      const dynamicParams = matchDynamicOutputPathname(
+        candidatePathname,
+        matcher
+      );
+      if (!dynamicParams) {
+        continue;
+      }
+
+      const mappedOutput = resolveFunctionOutputBySourcePage({
+        sourcePage: matcher.sourcePage,
+        matchedPathname: matcher.pathname,
+        requestPathname: candidatePathname,
+        rscSuffix,
+        preferRscOutput,
+      });
+      if (!mappedOutput) {
+        continue;
+      }
+
+      return Object.keys(dynamicParams).length > 0
+        ? {
+            ...mappedOutput,
+            params: dynamicParams,
+          }
+        : mappedOutput;
+    }
+  }
+
   return null;
 }
 
