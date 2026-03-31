@@ -3387,7 +3387,18 @@ const server = http.createServer(async (req, res) => {
       if (routeHeaders) {
         applyResponseHeaders(res, routeHeaders);
       }
-      const redirectLocation = routeLocationHeader;
+      let redirectLocation = routeLocationHeader;
+      if (
+        requestUrl.search.length > 0 &&
+        routeLocationHeader.startsWith('/') &&
+        !routeLocationHeader.includes('?')
+      ) {
+        const locationHashIndex = routeLocationHeader.indexOf('#');
+        redirectLocation =
+          locationHashIndex >= 0
+            ? `${routeLocationHeader.slice(0, locationHashIndex)}${requestUrl.search}${routeLocationHeader.slice(locationHashIndex)}`
+            : `${routeLocationHeader}${requestUrl.search}`;
+      }
       res.setHeader('location', redirectLocation);
       const redirectStatus = routeStatus as number;
       res.statusCode = redirectStatus;
