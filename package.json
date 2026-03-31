@@ -24,7 +24,7 @@
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {
-    "@next/routing": "https://vercel-packages.vercel.app/next/commits/bb7b38f31a24aad2cf5893a81bfe900e8356c9be/@next/routing",
+    "@next/routing": "https://vercel-packages.vercel.app/next/commits/387b8f200f15e620d4b2ef2e2cfe7cb115f40e6e/@next/routing",
     "sharp": "^0.33.0"
   },
   "devDependencies": {
