@@ -3258,7 +3258,6 @@ const server = http.createServer(async (req, res) => {
       req.headers['x-nextjs-data'] = '1';
     }
     const routingUrl = new URL(routingBaseUrl);
-    const resolveRoutesUrl = new URL(routingBaseUrl);
     if (nextDataRoutePathname) {
       routingUrl.pathname = nextDataRoutePathname;
     }
@@ -3278,7 +3277,7 @@ const server = http.createServer(async (req, res) => {
     if (runtimeRouting) {
       resolvedRoutingResult = normalizeResolveRoutesResultShape(
         await resolveRoutes({
-          url: resolveRoutesUrl,
+          url: routingUrl,
           buildId,
           basePath,
           requestBody: createBodyStream(requestBody),
@@ -3323,7 +3322,7 @@ const server = http.createServer(async (req, res) => {
             return middlewareResult;
           },
         }),
-        resolveRoutesUrl
+        routingUrl
       );
     }
     replaceRequestHeaders(req, resolvedRequestHeaders);
