@@ -5,7 +5,7 @@
     "": {
       "name": "adapter-bun",
       "dependencies": {
-        "@next/routing": "https://vercel-packages.vercel.app/next/commits/ee24b1f71fa389da62fc7dd200a452892e2bd49c/@next/routing",
+        "@next/routing": "https://vercel-packages.vercel.app/next/commits/304b160a5833aea46aebeaee611388136279639a/@next/routing",
         "sharp": "^0.33.0",
       },
       "devDependencies": {
@@ -72,7 +72,7 @@
 
     "@next/env": ["@next/env@16.2.0", "", {}, "sha512-OZIbODWWAi0epQRCRjNe1VO45LOFBzgiyqmTLzIqWq6u1wrxKnAyz1HH6tgY/Mc81YzIjRPoYsPAEr4QV4l9TA=="],
 
-    "@next/routing": ["@next/routing@https://vercel-packages.vercel.app/next/commits/ee24b1f71fa389da62fc7dd200a452892e2bd49c/@next/routing", {}, "sha512-WWOCgUNGU62E4nZaRL1+MBcNsoLUIXifBqfaNO83VuvMfc8KhRryRgKetIhem4E2yKx3R4utwTQA3lgvK3noQA=="],
+    "@next/routing": ["@next/routing@https://vercel-packages.vercel.app/next/commits/304b160a5833aea46aebeaee611388136279639a/@next/routing", {}, "sha512-wllRGivPB04K3CoVJKnL9tiFOQ3NL41PyiD7or5VEjXP/fLTFVnb9JTTKOCe9QLkb7vGUihMfx1KKAzZ1QYOZQ=="],
 
     "@next/swc-darwin-arm64": ["@next/swc-darwin-arm64@16.2.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-/JZsqKzKt01IFoiLLAzlNqys7qk2F3JkcUhj50zuRhKDQkZNOz9E5N6wAQWprXdsvjRP4lTFj+/+36NSv5AwhQ=="],
 

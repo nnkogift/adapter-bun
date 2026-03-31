@@ -118,6 +118,7 @@ interface RuntimeI18nConfig {
 }
 interface RuntimeRoutingConfig {
   i18n?: RuntimeI18nConfig | null;
+  caseSensitive?: boolean;
   beforeMiddleware: RuntimeRoute[];
   beforeFiles: RuntimeRoute[];
   afterFiles: RuntimeRoute[];
@@ -1526,7 +1527,7 @@ function addManifestPathnameCandidates(candidates: Set<string>, pathname: string
     addPathnameEncodingVariants(candidates, indexAlias);
   }
 }
-const routingPathnames =
+const baseRoutingPathnames =
   runtimeLookupRoutingPathnames.length > 0
     ? runtimeLookupRoutingPathnames
     : [...new Set([
@@ -1534,6 +1535,10 @@ const routingPathnames =
         ...manifest.staticAssets.map((asset) => asset.pathname),
         ...runtimeFunctionOutputs.map((output) => output.pathname),
       ])];
+const routingPathnames = [...new Set([
+  ...baseRoutingPathnames,
+  ...Object.keys(runtimeLookupPathnameAliasToCanonical),
+])];
 function getFunctionOutputByPathname(pathname: string): RuntimeFunctionOutput | undefined {
   const lookupPathnameAlias =
     runtimeLookupPathnameAliasToCanonical[pathname] ?? pathname;
@@ -3256,7 +3261,6 @@ const server = http.createServer(async (req, res) => {
     const resolveRoutesUrl = new URL(routingBaseUrl);
     if (nextDataRoutePathname) {
       routingUrl.pathname = nextDataRoutePathname;
-      resolveRoutesUrl.pathname = nextDataRoutePathname;
     }
     const requestBody = await getBufferedRequestBody(req);
     let resolvedRoutingResult: ResolveRoutesResult = {
@@ -3384,14 +3388,26 @@ const server = http.createServer(async (req, res) => {
       if (routeHeaders) {
         applyResponseHeaders(res, routeHeaders);
       }
-      res.setHeader('location', routeLocationHeader);
+      let redirectLocation = routeLocationHeader;
+      if (
+        requestUrl.search.length > 0 &&
+        routeLocationHeader.startsWith('/') &&
+        !routeLocationHeader.includes('?')
+      ) {
+        const locationHashIndex = routeLocationHeader.indexOf('#');
+        redirectLocation =
+          locationHashIndex >= 0
+            ? `${routeLocationHeader.slice(0, locationHashIndex)}${requestUrl.search}${routeLocationHeader.slice(locationHashIndex)}`
+            : `${routeLocationHeader}${requestUrl.search}`;
+      }
+      res.setHeader('location', redirectLocation);
       const redirectStatus = routeStatus as number;
       res.statusCode = redirectStatus;
       if (redirectStatus === 308) {
-        res.setHeader('refresh', `0;url=${routeLocationHeader}`);
+        res.setHeader('refresh', `0;url=${redirectLocation}`);
       }
       markConnectionClose(res);
-      res.end(routeLocationHeader);
+      res.end(redirectLocation);
       return;
     }
     let matchedPathname = resolvedRoutingResult.resolvedPathname;

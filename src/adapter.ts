@@ -513,6 +513,7 @@ function toRuntimeI18nConfig(
 function toRuntimeRoutingConfig(ctx: BuildCompleteContext): RuntimeRoutingConfig {
   return {
     i18n: toRuntimeI18nConfig(ctx.config.i18n),
+    caseSensitive: Boolean(ctx.config.experimental?.caseSensitiveRoutes),
     beforeMiddleware: ctx.routing.beforeMiddleware.map(cloneRoute),
     beforeFiles: ctx.routing.beforeFiles.map(cloneRoute),
     afterFiles: ctx.routing.afterFiles.map(cloneRoute),

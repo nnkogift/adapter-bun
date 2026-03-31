@@ -86,6 +86,7 @@ export interface BunRuntimeI18nConfig {
 
 export interface BunRuntimeRouting {
   i18n?: BunRuntimeI18nConfig | null;
+  caseSensitive?: boolean;
   beforeMiddleware: BunRuntimeRoute[];
   beforeFiles: BunRuntimeRoute[];
   afterFiles: BunRuntimeRoute[];
