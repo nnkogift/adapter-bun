@@ -2069,7 +2069,6 @@ function patchSetTimeoutForBunAtomicGroups(): void {
     // Best effort.
   }
 }
-patchSetTimeoutForBunAtomicGroups();
 function getImageOptimizerModule(): RuntimeImageOptimizerModule {
   if (runtimeImageOptimizerModule) {
     return runtimeImageOptimizerModule;
@@ -2624,9 +2623,9 @@ const server = http.createServer(async (req, res) => {
       if (routeHeaders) {
         applyResponseHeaders(res, routeHeaders);
       }
+      const redirectStatus = routeStatus as number;
       const redirectLocation = routeLocationHeader;
       res.setHeader('location', redirectLocation);
-      const redirectStatus = routeStatus as number;
       res.statusCode = redirectStatus;
       if (redirectStatus === 308) {
         res.setHeader('refresh', `0;url=${redirectLocation}`);

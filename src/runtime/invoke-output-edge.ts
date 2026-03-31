@@ -2,7 +2,6 @@ import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import { pathToFileURL } from 'node:url';
 import type {
   AppendMutableHeader,
   RuntimeBuildConfig,
@@ -57,24 +56,6 @@ function deriveEdgeEntryKey(output: RuntimeFunctionOutput): string {
 }
 
 const require = createRequire(import.meta.url);
-const edgeChunkLoadPromises = new Map<string, Promise<void>>();
-
-async function importEdgeChunk(filePath: string): Promise<void> {
-  const normalizedPath = path.resolve(filePath);
-  const existingLoadPromise = edgeChunkLoadPromises.get(normalizedPath);
-  if (existingLoadPromise) {
-    await existingLoadPromise;
-    return;
-  }
-  const loadPromise = import(pathToFileURL(normalizedPath).href).then(() => undefined);
-  edgeChunkLoadPromises.set(normalizedPath, loadPromise);
-  try {
-    await loadPromise;
-  } catch (error) {
-    edgeChunkLoadPromises.delete(normalizedPath);
-    throw error;
-  }
-}
 
 async function readReadableStreamBody(
   body: ReadableStream<Uint8Array> | null | undefined
@@ -331,7 +312,6 @@ export function createEdgeOutputInvoker(options: CreateEdgeOutputInvokerOptions)
       }
       seenEdgePaths.add(normalizedAssetPath);
       edgePaths.push(normalizedAssetPath);
-      await importEdgeChunk(normalizedAssetPath);
     }
     if (!sandboxRun) {
       const sandboxModule = require('next/dist/server/web/sandbox') as {
