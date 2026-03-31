@@ -51,6 +51,10 @@ const CACHE_RUNTIME_MODULES = [
   'cache-store.js',
   'sqlite-cache.js',
   'isr.js',
+  'invoke-output.js',
+  'invoke-output-node.js',
+  'invoke-output-edge.js',
+  'invoke-output-types.js',
 ];
 
 type PreviewProps = NonNullable<
@@ -215,6 +219,10 @@ async function writeServerEntry(outDir: string): Promise<void> {
   const sourceCode = await Bun.file(sourcePath).text();
   const runtimeServerCode = sourceCode
     .replace("import './early-timers.js';", "import './runtime/early-timers.js';")
+    .replace(
+      "from './invoke-output.js';",
+      "from './runtime/invoke-output.js';"
+    )
     .replace("from './cache-store.js';", "from './runtime/cache-store.js';")
     .replace(
       "from './cache-http-server.js';",
