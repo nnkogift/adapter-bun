@@ -16,11 +16,11 @@
   "type": "module",
   "scripts": {
     "clean": "rm -rf ./dist",
-    "build:src": "bunx tsc -p ./tsconfig.build.json",
-    "build": "bun run clean && bun run build:src",
-    "prepare": "bun run build:src",
-    "test": "bun test",
-    "typecheck": "bunx tsc --noEmit"
+    "build:src": "tsc -p ./tsconfig.build.json",
+    "build": "npm run clean && bun run build:src",
+    "prepare": "npm run build:src",
+    "test": "npm test",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "sharp": "^0.34.5"
