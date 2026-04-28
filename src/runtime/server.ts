@@ -221,6 +221,19 @@ function patchCacheControlHeader(req: IncomingMessage, res: ServerResponse): voi
   };
 }
 
+function stripContextPath(url: string, contextPath: string): string {
+  const qIndex = url.indexOf('?');
+  const pathname = qIndex >= 0 ? url.slice(0, qIndex) : url;
+  const query = qIndex >= 0 ? url.slice(qIndex) : '';
+
+  if (pathname !== contextPath && !pathname.startsWith(`${contextPath}/`)) {
+    return url;
+  }
+
+  const stripped = pathname.slice(contextPath.length) || '/';
+  return stripped + query;
+}
+
 async function prepareActionRequestBodyForBun(req: IncomingMessage): Promise<void> {
   if (req.method !== 'POST') {
     return;
@@ -311,11 +324,28 @@ const manifest = (await Bun.file(manifestPath).json()) as DeploymentManifest;
 // conflict with this standalone server entry.
 delete process.env.NEXT_ADAPTER_PATH;
 
+// When launched via start.js, the server runs from bun-dist/live/ and a
+// .context-path marker is present. Without start.js, adapterDir is bun-dist/
+// itself and the marker is absent — context path stripping is a no-op.
+const contextPathMarkerPath = path.join(adapterDir, '.context-path');
+let runtimeContextPath = '';
+let isLiveDir = false;
+try {
+  const markerContent = await Bun.file(contextPathMarkerPath).text();
+  runtimeContextPath = markerContent.trim();
+  isLiveDir = true;
+} catch {
+  // Not running via start.js
+}
+
 // Tell the cache handler where to find cache.db.
 process.env.BUN_ADAPTER_CACHE_DB_PATH = path.join(adapterDir, 'cache.db');
 
-// Resolve project directory (parent of bun-dist/).
-const projectDir = process.env.NEXT_PROJECT_DIR || path.resolve(adapterDir, '..');
+// Resolve project directory. When running from bun-dist/live/ (via start.js)
+// go up two levels; otherwise one level from bun-dist/.
+const projectDir =
+  process.env.NEXT_PROJECT_DIR ||
+  path.resolve(adapterDir, isLiveDir ? '../..' : '..');
 
 const requestedPort = Number.parseInt(process.env.PORT || '', 10);
 const port =
@@ -413,6 +443,14 @@ const server = http.createServer(async (req, res) => {
   (req as IncomingMessage & { headers: IncomingHttpHeaders }).headers = {
     ...req.headers,
   };
+
+  // Strip runtime context path prefix before any routing decision.
+  if (runtimeContextPath && typeof req.url === 'string') {
+    (req as IncomingMessage & { url: string }).url = stripContextPath(
+      req.url,
+      runtimeContextPath
+    );
+  }
 
   if (cacheRuntime.handlerMode === 'http') {
     const requestUrl = new URL(req.url || '/', process.env.__NEXT_PRIVATE_ORIGIN);

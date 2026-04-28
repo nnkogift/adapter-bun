@@ -5,6 +5,11 @@ import { Database } from 'bun:sqlite';
 import type { NextAdapter } from 'next';
 import type { AdapterOutput } from 'next';
 import {
+  generateStartScript,
+  resolveContextPathPlaceholder,
+  stageTemplateDir,
+} from './context-path.ts';
+import {
   buildDeploymentManifest,
   collectOutputPathnames,
 } from './manifest.ts';
@@ -423,6 +428,7 @@ async function onBuildComplete(
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
   const previewProps = await readPreviewProps(ctx);
   const cacheRuntime = createRuntimeCacheConfig(options);
+  const resolvedPlaceholder = resolveContextPathPlaceholder(options.contextPathPlaceholder);
 
   const deploymentManifest = buildDeploymentManifest({
     adapterName: ADAPTER_NAME,
@@ -435,6 +441,7 @@ async function onBuildComplete(
     hostname,
     previewProps,
     cacheRuntime,
+    contextPathPlaceholder: resolvedPlaceholder === false ? null : resolvedPlaceholder,
   });
 
   await writeJsonFile(
@@ -450,6 +457,14 @@ async function onBuildComplete(
   });
   await writeRuntimeNextConfig(outDir, ctx.config);
   await writeServerEntry(outDir);
+
+  if (resolvedPlaceholder !== false) {
+    await stageTemplateDir(outDir);
+    await Bun.write(
+      path.join(outDir, 'start.js'),
+      generateStartScript(resolvedPlaceholder)
+    );
+  }
 }
 
 export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
@@ -464,6 +479,26 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
     name: ADAPTER_NAME,
     modifyConfig(config) {
       const configRecord = config as unknown as Record<string, unknown>;
+
+      const placeholder = resolveContextPathPlaceholder(options.contextPathPlaceholder);
+      let injectBasePath = false;
+      if (placeholder !== false) {
+        const existingBasePath = configRecord.basePath;
+        if (
+          typeof existingBasePath === 'string' &&
+          existingBasePath.length > 0 &&
+          existingBasePath !== placeholder
+        ) {
+          console.warn(
+            `[adapter-bun] User-set basePath "${existingBasePath}" will not be overridden by contextPath. ` +
+              `Runtime context path replacement will not apply. ` +
+              `Set contextPathPlaceholder: false to suppress this warning.`
+          );
+        } else {
+          injectBasePath = true;
+        }
+      }
+
       const existingServerActionsRaw = configRecord.serverActions;
       const existingServerActions =
         existingServerActionsRaw && typeof existingServerActionsRaw === 'object'
@@ -505,6 +540,9 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
 
       return {
         ...config,
+        ...(injectBasePath && placeholder !== false
+          ? { basePath: placeholder, assetPrefix: placeholder }
+          : {}),
         ...(existingServerActions || allowedOrigins.length > 0
           ? {
               serverActions: {

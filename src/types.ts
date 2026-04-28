@@ -38,6 +38,16 @@ export interface BunAdapterOptions {
    * runtime environment for the cache handlers.
    */
   cacheAuthToken?: string;
+  /**
+   * Sentinel string embedded into `basePath` and `assetPrefix` at build time.
+   * `start.js` replaces every occurrence with the runtime `CONTEXT_PATH` env
+   * variable before booting the server, enabling a single build to serve under
+   * different URL sub-paths without rebuilding.
+   *
+   * Defaults to `DEFAULT_CONTEXT_PATH_PLACEHOLDER` when omitted.
+   * Set to `false` to opt out of context path support entirely.
+   */
+  contextPathPlaceholder?: string | false;
 }
 
 export interface BunStaticAsset {
@@ -58,6 +68,7 @@ export interface BunDeploymentManifest {
     name: string;
     outDir: string;
   };
+  contextPathPlaceholder: string | null;
   build: {
     buildId: string;
     nextVersion: string;

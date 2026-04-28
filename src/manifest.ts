@@ -42,6 +42,7 @@ export function buildDeploymentManifest({
   hostname,
   previewProps,
   cacheRuntime,
+  contextPathPlaceholder,
 }: {
   adapterName: string;
   adapterOutDir: string;
@@ -53,6 +54,7 @@ export function buildDeploymentManifest({
   hostname: string;
   previewProps?: NonNullable<BunDeploymentManifest['runtime']>['previewProps'];
   cacheRuntime?: NonNullable<BunDeploymentManifest['runtime']>['cache'];
+  contextPathPlaceholder?: string | null;
 }): BunDeploymentManifest {
   return {
     schemaVersion: 1,
@@ -61,6 +63,7 @@ export function buildDeploymentManifest({
       name: adapterName,
       outDir: adapterOutDir,
     },
+    contextPathPlaceholder: contextPathPlaceholder ?? null,
     build: {
       buildId: ctx.buildId,
       nextVersion: ctx.nextVersion,
