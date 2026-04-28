@@ -15,7 +15,7 @@ export function resolveContextPathPlaceholder(
 
 export function generateStartScript(placeholder: string): string {
   const escapedPlaceholder = JSON.stringify(placeholder);
-  return `import { cp, rename } from 'node:fs/promises';
+  return `import { cp } from 'node:fs/promises';
 import path from 'node:path';
 
 const scriptDir = import.meta.dirname;
@@ -35,7 +35,6 @@ if (raw !== '' && !raw.startsWith('/')) {
 
 await cp(nextTemplateDir, nextDir, { recursive: true, force: true });
 await cp(templateDir, liveDir, { recursive: true, force: true });
-await rename(\`\${liveDir}/static/\${PLACEHOLDER}\`, \`\${liveDir}/static/\${raw}\`);
 
 for (const dir of [liveDir, nextDir]) {
   for (const pattern of ['**/*.js', '**/*.json', '**/*.html']) {
