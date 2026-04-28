@@ -231,12 +231,23 @@ import { CONTEXT_PATH_PLACEHOLDER } from 'adapter-bun';
 ### Docker example
 
 ```dockerfile
-FROM oven/bun:1
+FROM oven/bun:1 AS builder
 WORKDIR /app
 COPY . .
-ENV CONTEXT_PATH=
+RUN bun --bun next build
+
+FROM oven/bun:1 AS runner
+WORKDIR /app
+
+COPY --from=builder /app/bun-dist ./bun-dist
+COPY --from=builder /app/.next-template ./.next-template
+COPY --from=builder /app/public ./public
+
+ENV CONTEXT_PATH=""
 CMD ["bun", "bun-dist/start.js"]
 ```
+
+`.next/` is intentionally not copied — `start.js` regenerates it from `.next-template/` on every container start, ensuring the placeholder replacement always runs against the pristine build.
 
 ```bash
 docker run -e CONTEXT_PATH=/dashboard my-image

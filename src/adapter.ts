@@ -5,8 +5,10 @@ import { Database } from 'bun:sqlite';
 import type { NextAdapter } from 'next';
 import type { AdapterOutput } from 'next';
 import {
+  appendToIgnoreFiles,
   generateStartScript,
   resolveContextPathPlaceholder,
+  stageNextTemplate,
   stageTemplateDir,
 } from './context-path.ts';
 import {
@@ -460,6 +462,8 @@ async function onBuildComplete(
 
   if (resolvedPlaceholder !== false) {
     await stageTemplateDir(outDir);
+    await stageNextTemplate(ctx.projectDir, ctx.distDir);
+    await appendToIgnoreFiles(ctx.projectDir);
     await Bun.write(
       path.join(outDir, 'start.js'),
       generateStartScript(resolvedPlaceholder)
