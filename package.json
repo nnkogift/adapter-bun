@@ -17,7 +17,7 @@
   "scripts": {
     "clean": "rm -rf ./dist",
     "build:src": "tsc -p ./tsconfig.build.json",
-    "build": "npm run clean && bun run build:src",
+    "build": "npm run clean && npm run build:src",
     "prepare": "npm run build:src",
     "test": "npm test",
     "typecheck": "tsc --noEmit"
